@@ -36,6 +36,8 @@ jobs:
                       continue
                   rel = pathlib.Path(*parts[1:])
                   assert rel.parts[0] not in (".git",), "Unsafe target: " + name
+                  if rel.parts[:2] == (".github", "workflows"):
+                      rel = pathlib.Path("upstream-workflows", *rel.parts[2:])
                   assert not rel.exists(), "Existing destination: " + str(rel)
                   paths.append((item, rel))
               assert len(paths) > 1000, "Archive unexpectedly small"
@@ -45,7 +47,6 @@ jobs:
                       shutil.copyfileobj(source, target)
               print(f"Unpacked {len(paths)} files ({total} uncompressed bytes).")
           archive.unlink()
-          pathlib.Path(".github/workflows/unpack-leanetrm.yml").unlink()
           PY
       - name: Commit extracted source
         shell: bash
