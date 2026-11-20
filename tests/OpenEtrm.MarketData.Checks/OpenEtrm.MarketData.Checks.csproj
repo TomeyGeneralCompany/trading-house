@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../fixtures/SyntheticSideCalendars.cs" Link="SyntheticSideCalendars.cs" />
+    <None Include="../fixtures/d253-side-values.txt.gz" Link="fixtures/d253-side-values.txt.gz" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../fixtures/d253-side-values.txt.gz')" />
+    <None Include="../fixtures/futures-option-oracle.json" Link="fixtures/futures-option-oracle.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../fixtures/spread-option-oracle.json" Link="fixtures/spread-option-oracle.json" CopyToOutputDirectory="PreserveNewest" />
+    <ProjectReference Include="../../src/OpenEtrm.MarketData/OpenEtrm.MarketData.csproj" />
+    <ProjectReference Include="../../src/OpenEtrm.Shared/OpenEtrm.Shared.csproj" />
+    <ProjectReference Include="../../src/OpenEtrm.Security/OpenEtrm.Security.csproj" />
+    <None Include="../fixtures/risk-history-exact-close-v1.json" Link="fixtures/risk-history-exact-close-v1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

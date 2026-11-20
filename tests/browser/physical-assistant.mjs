@@ -1,0 +1,78 @@
+import {openPhysical} from './physical-workspace.mjs';
+import {openPhysicalTrade,openGasDelivery} from './physical-operations-grid.mjs';
+
+// Real delayed answer, explicit Go and Back, followed by a frameless facility question.
+export async function run({command,evaluate,wait,click,set,submit,persona,check,shot,idle,url,provider,fixture}){
+ const control=new URL(provider),agent=fixture.agent;
+ if(control.protocol!=='http:'||control.hostname!=='127.0.0.1'||!control.port)throw Error('Use the owned synthetic provider.');
+ const script=async responses=>{if(!(await fetch(new URL('/respond',control),{method:'POST',body:JSON.stringify(responses)})).ok)throw Error('Synthetic provider refused its script.');};
+ const open=page=>openPhysical({click,evaluate,wait},page);
+ await command('Page.enable');await command('Runtime.enable');
+ await command('Page.navigate',{url:url+'/'});await wait("document.querySelectorAll('.curve-button').length>0&&"+idle);await persona('trader');
+ await evaluate(`window.__physicalAsks=[];{const send=window.fetch;window.fetch=async(path,options)=>{if(String(path).endsWith('/assistant/turns/ask'))window.__physicalAsks.push(JSON.parse(options.body));return send(path,options);};}`);
+ const frames=await evaluate("(async()=>{const w=await(await window.workspaceFetch('/api/workspace/navigation')).json();return w.frames;})()");
+ const before=frames.find(f=>f.at.startsWith('2020-12-18')),after=frames.find(f=>f.at.startsWith('2021-01-15T08:'));
+ await open('gas-setup');
+ if(before.close){await set('#close-session',before.close.session);await wait(idle);}
+ await set('#snapshot',before.id);await wait(idle);
+ await click('#assistant-launcher');await wait("!document.querySelector('#assistant-panel').hidden");
+ await wait(`[...document.querySelector('#assistant-agent').options].some(o=>o.value===${JSON.stringify(agent.id+':1')})`);
+ await set('#assistant-agent',agent.id+':1');
+ await script([{hold:'physical_old_navigation',tools:[['physical_nav','navigate',{page:'gas_setup',target:null}]]},{text:'Synthetic earlier setup answer.'}]);
+ await set('#assistant-question','Open this gas setup.');await submit('#assistant-composer');await wait("!document.querySelector('#assistant-consent').hidden");await click('#assistant-allow');
+ await wait("document.querySelector('#assistant-send').textContent==='Stop answering'");
+ // A close of another session is offered once that session is chosen (D334).
+ if(after.close&&after.close.session!==before.close?.session){await set('#close-session',after.close.session);await wait(idle);}
+ await set('#snapshot',after.id);await wait(idle);await open('facilities');await set('#facility-ledger',fixture.ledgerId);await wait(idle);
+ await fetch(new URL('/release/physical_old_navigation',control),{method:'POST'});
+ await wait("document.querySelector('#assistant-turns').textContent.includes('Synthetic earlier setup answer.')&&document.querySelector('#assistant-send').textContent==='Send'");
+ await check('an older framed answer does not automatically replace the facility operating context',
+  "!document.querySelector('#facilities-page').hidden&&document.querySelector('#date-context-on').value==='2021-01-15'&&[...document.querySelectorAll('.assistant-target button')].some(b=>b.textContent==='Go')");
+ const go="[...document.querySelectorAll('.assistant-target button')].find(b=>b.textContent==='Go').click()";
+ const place="({date:document.querySelector('#date-context-on').value,ledger:document.querySelector('#facility-ledger').value})";
+ let origin={date:'2021-01-15',ledger:fixture.ledgerId};
+ if(before.close&&before.close.session!==after.close?.session){
+  // Go never changes the remembered session (D334): it names the one the answer used, and the person chooses it.
+  await evaluate(go);await wait(idle);
+  await check('Go to a close of another session names that session and leaves the facility context',
+   "!document.querySelector('#facilities-page').hidden&&document.querySelector('#error').textContent.includes('close session. Choose that session to open its As of date.')&&document.querySelector('#close-session').value==="+JSON.stringify(after.close.session));
+  // Choosing it opens that session's newest close, the place Back then returns to.
+  await set('#close-session',before.close.session);await wait(idle);await open('facilities');
+  origin=await evaluate(place);
+ }
+ await evaluate(go);
+ await wait("!document.querySelector('#gas-setup-page').hidden&&"+idle);
+ await check('explicit Go opens the earlier setup context',"document.querySelector('#date-context-on').value==='2020-12-18'&&[...document.querySelectorAll('.assistant-target button')].some(b=>b.textContent==='Back')");
+ await evaluate("[...document.querySelectorAll('.assistant-target button')].find(b=>b.textContent==='Back').click()");
+ await wait("!document.querySelector('#facilities-page').hidden&&"+idle);
+ await check('Back restores the operating date and selected ledger the move left, without selecting a pricing close',
+  `JSON.stringify(${place})===${JSON.stringify(JSON.stringify(origin))}&&document.querySelector('#snapshot').value===''&&document.querySelector('#error').hidden`,place);
+ if(origin.date!=='2021-01-15'){
+  // The facility questions below ask at the January operating date again.
+  await set('#close-session',after.close.session);await wait(idle);await set('#snapshot',after.id);await wait(idle);await open('facilities');await set('#facility-ledger',fixture.ledgerId);await wait(idle);
+ }
+ await check('Looking at describes the facility date as an askable context',"document.querySelector('#assistant-looking-context').textContent.includes('Operating date 2021-01-15')");
+ await check('the restored facility question uses its selected quantity ledger workspace',"document.querySelector('[data-facilities-view=quantities]').getAttribute('aria-selected')==='true'&&!document.querySelector('#facility-quantities-workspace').hidden&&document.querySelector('#assistant-looking-page').textContent==='Facilities'","({tab:document.querySelector('[data-facilities-view][aria-selected=true]')?.dataset.facilitiesView,lookingPage:document.querySelector('#assistant-looking-page').textContent,lookingContext:document.querySelector('#assistant-looking-context').textContent,sendDisabled:document.querySelector('#assistant-send').disabled,agent:document.querySelector('#assistant-agent').value,question:document.querySelector('#assistant-question').value,note:document.querySelector('#assistant-composer-note').textContent})");
+ await script([{tools:[['physical_read','read_workspace_page',{page:'facility_quantities'}]]},{text:'Synthetic facility quantities read at the operating context.'}]);
+ await set('#assistant-question','Explain this facility allocation.');await wait("!document.querySelector('#assistant-send').disabled");await submit('#assistant-composer');
+ await wait("document.querySelector('#assistant-turns').textContent.includes('Synthetic facility quantities read at the operating context.')&&document.querySelector('#assistant-send').textContent==='Send'");
+ await check('facility questions send the explicit date and ledger with no hidden pricing frame',
+  `(()=>{const ask=window.__physicalAsks.at(-1);return ask.pageReport.businessDate==='2021-01-15'&&ask.pageReport.selection.ledgerId===${JSON.stringify(fixture.ledgerId)}&&ask.knowledge.mode==='current'&&ask.knowledge.frameId===null;})()`);
+ await check('the native facility read finishes without a tool refusal',"!document.querySelector('#assistant-turns').textContent.includes('refused')&&document.querySelector('#error').hidden");
+ await shot('physical-assistant-operating-context');
+
+ // Physical operations reports the gas day and stage it shows, and Looking at names them.
+ const actions={command,evaluate,wait,click,set,idle};
+ if(after.close){await set('#close-session',after.close.session);await wait(idle);}
+ await set('#snapshot',after.id);await wait(idle);await click('#nav-physical-operations');await openPhysicalTrade(actions,fixture.trades[0]);
+ await click('#physical-operations-tabs-delivery');await wait("!!document.querySelector('[data-ops=rows] .tabulator-row')&&"+idle);
+ const day=await evaluate("document.querySelector('[data-ops=rows] .tabulator-row').dataset.rowKey.split(':').at(-1)");
+ await openGasDelivery(actions,day);await click('[data-stage="1"]');await wait(idle);
+ await check('Looking at names the selected gas day and stage',`document.querySelector('#assistant-looking-shows').textContent.includes(${JSON.stringify('Gas day '+day+' · Scheduling stage')})`,"document.querySelector('#assistant-looking-shows').textContent");
+ await script([{text:'Synthetic gas day read.'}]);
+ await set('#assistant-question','What is scheduled for this gas day?');await wait("!document.querySelector('#assistant-send').disabled");await submit('#assistant-composer');
+ await wait("document.querySelector('#assistant-turns').textContent.includes('Synthetic gas day read.')&&document.querySelector('#assistant-send').textContent==='Send'");
+ await check('an ask from a selected gas day sends its trade, day, delivery side and stage',
+  `(()=>{const s=window.__physicalAsks.at(-1).pageReport.selection;return s.tradeId===${JSON.stringify(fixture.trades[0])}&&s.instrumentType==='physical_gas'&&s.tab==='delivery'&&s.day===${JSON.stringify(day)}&&!!s.obligationId&&s.stage===1;})()`,
+  "JSON.stringify(window.__physicalAsks.at(-1).pageReport)");
+}

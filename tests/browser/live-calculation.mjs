@@ -1,0 +1,283 @@
+import {inspectPositionSide} from './position-schedules.mjs';
+import {visibleCurveCellsReady} from './curve-cells.mjs';
+import {workspaceProbeScript} from './workspace-probe.mjs';
+import {sideSession} from './side-session.mjs';
+import {popOut,press} from './blotter-window.mjs';
+
+export async function run({command,evaluate,wait,click,persona,set,submit,check,shot,idle,url,tab}){
+ // Coalescing can defer a refresh for ten seconds before its backend reads start.
+ const waitForRefresh=(condition,milliseconds=30000)=>wait(condition,milliseconds);
+ await command('Runtime.enable');await command('Page.enable');await command('Network.enable');
+ await command('Emulation.setDeviceMetricsOverride',{width:1440,height:1050,deviceScaleFactor:1,mobile:false});
+ await command('Page.addScriptToEvaluateOnNewDocument',{source:workspaceProbeScript+`window.liveResponses=[];window.liveRequests=[];window.liveInputs=[];window.liveTasks=[];new PerformanceObserver(list=>window.liveTasks.push(...list.getEntries().map(e=>e.duration))).observe({type:'longtask',buffered:true});{const fetch=window.fetch;window.fetch=window.__workspaceProbe(fetch,async(path,init,fetch)=>{window.liveRequests.push(String(path));if(init?.body){try{const b=JSON.parse(init.body),r=b.body??b;window.liveInputs.push({path:String(path),operation:b.operation,snapshotId:r.snapshotId??r.context?.snapshotId,curve:r.curve,contextId:r.context?.contextId});if(window.liveInputs.length>32)window.liveInputs.shift();}catch{}}if(window.holdShapes&&String(path)==='/api/market/input-curve-shapes'){window.holdShapes=false;await new Promise(resolve=>window.releaseShapes=resolve);}if(window.failLiveWorkspace&&String(path)==='/api/trading/workspace'){window.failLiveWorkspace=false;return new Response(JSON.stringify({code:'request_failed'}),{status:503,headers:{'Content-Type':'application/json'}});}if((window.failLivePreview&&String(path)==='/api/custom-curves/preview')||(window.failLiveEditor&&['/api/swaps/editor','/api/futures/editor'].includes(String(path)))){window.failLivePreview=false;window.failLiveEditor=false;return new Response(JSON.stringify({code:'request_failed'}),{status:503,headers:{'Content-Type':'application/json'}});}let response=await fetch(path,init);if(window.loseRiskJob&&String(path)==='/api/portfolio/risk/jobs'&&init?.method==='POST'&&response.ok){window.loseRiskJob=false;throw new TypeError('Synthetic lost risk job reply');}if(window.dropRiskTarget&&String(path)==='/api/portfolio/risk/catalog'&&response.ok){const data=await response.json(),id=window.dropRiskTarget;window.dropRiskTarget=undefined;data.scenarioTargets=data.scenarioTargets.filter(t=>t.id!==id);response=new Response(JSON.stringify(data),{status:200,headers:{'Content-Type':'application/json'}});}if(window.refuseDesk&&String(path)==='/api/trading/workspace'&&response.ok){window.refuseDesk=false;const data=await response.json(),market=data.summaries[3],swap=market.groups.find(g=>g.instrumentType==='financial_swap');market.groups.push({...swap,quantitySpecification:{...swap.quantitySpecification,code:'other_quantity'},unit:'other unit'});for(const group of data.summaries[0].groups)if(group.instrumentType==='future')group.executionPnl='4242.5';for(const holding of data.blotter.holdings)if(holding.instrumentType==='future')holding.executionPrice='9.995';response=new Response(JSON.stringify(data),{status:200,headers:{'Content-Type':'application/json'}});}if(response.headers.get('content-type')?.includes('application/json'))window.liveResponses.push({path:String(path),data:await response.clone().json()});return response;});}`});
+ await command('Page.navigate',{url:url+'/'});await wait("document.querySelectorAll('.curve-button').length>0&&"+idle);
+ // A risk analyst opens on the Blotter, and a live correction refreshes the page that is showing, so start on Curves & prices.
+ await persona('risk');await click('#nav-market');await click('#example');await click('#contracts tbody tr:first-child');
+ await click('#follow-live');await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ // A live view's history samples its working data; the built-in inputs are recorded closes, which live mode does not offer (D334).
+ await check('live mode preserves the shared header and open price history',"document.querySelector('#workspace-mode-label').textContent.includes('Live corrections')&&!document.querySelector('#contract-panel').hidden&&document.querySelectorAll('#history-values tbody tr').length===window.liveResponses.filter(r=>r.path==='/api/history').at(-1).data.points.length&&document.querySelectorAll('#history-values tbody tr').length>=1&&document.querySelector('#error').hidden",
+  "({mode:document.querySelector('#workspace-mode-label').textContent,panel:!document.querySelector('#contract-panel').hidden,rows:document.querySelectorAll('#history-values tbody tr').length,points:window.liveResponses.filter(r=>r.path==='/api/history').at(-1)?.data?.points?.length,error:document.querySelector('#error').textContent})");
+ const actor=await sideSession(url,'editor');
+ async function correct(series,value){
+  const data=await actor.call('workspace');let frame=data.frames.find(f=>f.at.startsWith('2020-12-18')&&data.initialFrameIds.includes(f.id));
+  const seriesId=series==='base'?'60000000-0000-0000-0000-000000000001':data.definitions.series.find(s=>s.code===series).id;
+  let fact=data.observations.find(o=>o.series_id===seriesId&&frame.observationIds.includes(o.id));
+  if(!fact&&series==='base')fact=data.observations.find(o=>o.id==='70000000-0000-0000-0000-000000000001');
+  while(data.observations.some(o=>o.corrects_id===fact.id))fact=data.observations.find(o=>o.corrects_id===fact.id);
+  if(!frame.observationIds.includes(fact.id))frame=(await actor.call('select-observation',{snapshotId:frame.id,observationId:fact.id})).frame;
+  return actor.call('corrections',{snapshotId:frame.id,observationId:fact.id,value});
+ }
+ const started=performance.now();await correct('base','3.3');
+ await waitForRefresh("window.liveResponses.filter(r=>r.path==='/api/evaluate').at(-1)?.data.points?.[0].value==='31.2'&&document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ console.log('LIVE synthetic correction to rendered dependent curve milliseconds:',Math.round(performance.now()-started));
+ const corrected="document.querySelector('#error').hidden&&document.querySelector('#contracts').textContent.includes('31.2')&&window.liveResponses.filter(r=>r.path==='/api/history').at(-1)?.data.points?.at(-1)?.value==='31.2'&&!document.querySelector('#contract-panel').hidden&&document.querySelector('#history-values tbody tr:last-child td:nth-child(2)')?.textContent.startsWith('31.2')&&document.querySelector('#live-status').textContent.includes('last refreshed')";
+ await check('a correction updates dependent prices and history without browser polling',corrected,
+  "({error:document.querySelector('#error').textContent,history:window.liveResponses.filter(r=>r.path==='/api/history').at(-1)?.data,table:document.querySelector('#history-values tbody tr:last-child td:nth-child(2)')?.textContent,status:document.querySelector('#live-status').textContent})");
+ await click('#nav-custom-curves');await click('#nav-market');
+ try{await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&document.querySelector('#contracts').textContent.includes('31.2')&&"+idle);}
+ catch(error){console.error('Owned returning live curve state',JSON.stringify(await evaluate("({live:document.querySelector('#live-status').dataset.state,liveText:document.querySelector('#live-status').textContent,error:document.querySelector('#error').textContent,curve:document.querySelector('#contracts').textContent,snapshot:document.querySelector('#snapshot').value,busy:document.body.getAttribute('aria-busy'),pending:[...document.querySelectorAll('[aria-busy=true]')].map(node=>node.id),inputs:window.liveInputs,reads:window.liveResponses.slice(-15).map(item=>({path:item.path,code:item.data?.code,context:item.data?.context??item.data?.blotter?.context,curve:item.data?.curve,snapshotId:item.data?.snapshotId}))})").catch(cause=>({diagnosticFailure:cause.message}))));throw error;}
+ await check('returning to a live market screen refreshes its displayed generation',"document.querySelector('#error').hidden&&document.querySelector('#contracts').textContent.includes('31.2')");
+ // A failed presentation refresh before a live read must release the workspace for Retry.
+ await evaluate(`(()=>{const control=document.querySelector('#profile-open'),disabled=Object.getOwnPropertyDescriptor(HTMLButtonElement.prototype,'disabled');
+  Object.defineProperty(control,'disabled',{configurable:true,get(){return disabled.get.call(this);},set(value){delete this.disabled;throw Error('Synthetic live control refresh failure');}});})()`);
+ await correct('base','3.31');await waitForRefresh("document.querySelector('#live-status').dataset.state==='stale'");
+ await check('a failed live control refresh releases the workspace for Retry',"document.body.getAttribute('aria-busy')==='false'&&!document.querySelector('#nav-market').disabled&&!document.querySelector('#live-retry').hidden");
+ await click('#live-retry');await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ await check('Retry completes a live read after a presentation failure',"!document.querySelector('#nav-market').disabled&&document.querySelector('#error').hidden");
+ await click('#current-view-context');await persona('editor');await click('#example');await click('#nav-custom-curves');await set('#custom-curves-template','ng_prompt');await click('#custom-curves-preview');
+ const nodes=await evaluate("document.querySelectorAll('.custom-curve-node').length");
+ await click('#follow-live');await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ await check('entering live preserves the selected unsaved custom graph and its preview',`document.querySelectorAll('.custom-curve-node').length===${nodes}&&!document.querySelector('#custom-curves-result').hidden&&document.querySelector('#error').hidden`);
+ await correct('custom_ng_monthly_2','3.18');
+ await waitForRefresh("window.liveResponses.filter(r=>r.path==='/api/custom-curves/preview').at(-1)?.data.rows?.[0]?.[1]==='3.18'&&document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ await evaluate('window.failLivePreview=true');await correct('custom_ng_monthly_2','3.28');
+ await waitForRefresh("document.querySelector('#live-status').dataset.state==='stale'&&"+idle);
+ await check('a failed update stays visibly stale with its last successful value and time',"document.querySelector('#live-status').textContent.includes('last refreshed')&&!document.querySelector('#live-retry').hidden&&document.querySelector('#custom-curves-values').textContent.includes('3.18')");
+ await shot('live-calculation-stale');await click('#live-retry');
+ await waitForRefresh("window.liveResponses.filter(r=>r.path==='/api/custom-curves/preview').at(-1)?.data.rows?.[0]?.[1]==='3.28'&&document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ await check('Retry runs the failed backend preview before marking it live',"document.querySelector('#custom-curves-values').textContent.includes('3.28')");
+ const before=await evaluate("window.liveResponses.filter(r=>r.path==='/api/workspace/navigation').at(-1).data.context.knownAt");
+ await correct('custom_ng_monthly_2','3.38');await click('#nav-schedules');
+ // The template's graph is an unsaved edit, which the question asks about before the page is left.
+ await click('#custom-curves-page-prompt button:not(.secondary)');
+ await check('pausing pins the displayed cutoff in both server and header before other screens read',`window.liveResponses.filter(r=>r.path==='/api/workspace/navigation').at(-1).data.context.knownAt===${JSON.stringify(before)}&&window.liveResponses.filter(r=>r.path==='/api/workspace/navigation').at(-1).data.live===null&&document.querySelector('#live-status').textContent.includes('Paused')&&document.querySelector('#error').hidden`);
+ await persona('risk');await click('#example');await click('#nav-futures');await click('#follow-live');
+ await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ // A refresh that fails while a curve read is still waiting must not leave the kept desk loading for ever.
+ const shapesLoading="document.querySelectorAll('#desk-positions .sparkline-loading,#desk-positions .curve-updating').length";
+ await evaluate('window.holdShapes=true');await correct('base','3.35');
+ // The correction is recomputed on the server before the page reads the curves again, which on a shared runner can take longer than
+ // an ordinary action's wait.
+ await waitForRefresh(`typeof window.releaseShapes==='function'&&${shapesLoading}>0&&document.querySelector('#live-status').dataset.state==='live'&&`+idle,30000);
+ const completedShapes=await evaluate("Object.fromEntries([...document.querySelectorAll('#desk-positions .tabulator-row:not(.tabulator-group)')].flatMap(row=>{const line=row.querySelector('svg.sparkline');return line?[[row.dataset.rowKey,line.outerHTML]]:[];}))");
+ await evaluate('window.failLiveWorkspace=true');await correct('base','3.36');
+ await waitForRefresh("document.querySelector('#live-status').dataset.state==='stale'&&"+idle);
+ const failedShapes=`(()=>{const completed=${JSON.stringify(completedShapes)},rows=[...document.querySelectorAll('#desk-positions .tabulator-row:not(.tabulator-group)')];return rows.length>0&&document.querySelectorAll('#desk-positions .sparkline-loading').length===0&&rows.every(row=>{const line=row.querySelector('svg.sparkline'),previous=completed[row.dataset.rowKey];return line&&(previous?line.outerHTML===previous:line.classList.contains('sparkline-unavailable')&&line.querySelector('title').textContent.includes('refresh'));});})()`;
+ await check('a failed refresh ends unresolved curve waits with a reason and preserves completed curves',failedShapes);
+ const shapeReplies=await evaluate("window.liveResponses.filter(r=>r.path==='/api/market/input-curve-shapes').length");
+ await evaluate('window.releaseShapes()');await wait(`window.liveResponses.filter(r=>r.path==='/api/market/input-curve-shapes').length>${shapeReplies}`);
+ await check('an interrupted curve reply cannot replace the failed refresh state',`document.querySelector('#live-status').dataset.state==='stale'&&${failedShapes}`);
+ await click('#live-retry');await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ // Hidden rows wait for demand; every visible curve cell must finish its retry.
+ await wait(`document.querySelectorAll('#desk-positions svg.sparkline:not(.sparkline-unavailable)').length>0&&${visibleCurveCellsReady}`);
+ await check('Retry reads the curves again',"document.querySelectorAll('#desk-positions svg.sparkline:not(.sparkline-unavailable)').length>0");
+ // A read the desk refuses leaves the desk it had: its new totals and rows do not appear beside its old charts.
+ // The injected read has new futures totals and prices, and a swap market held in a second quantity specification, which the charts refuse.
+ const deskNow="JSON.stringify({strip:[...document.querySelectorAll('#blotter-strip .strip-item')].map(i=>i.textContent),prices:[...document.querySelectorAll('#desk-positions [tabulator-field=c3] .desk-figure')].map(n=>n.textContent),charts:document.querySelectorAll('#desk-chart-pv canvas,#desk-chart-position canvas').length,curves:document.querySelectorAll('#desk-positions svg.sparkline:not(.sparkline-unavailable)').length})";
+ const deskBefore=await evaluate(deskNow);
+ await evaluate('window.refuseDesk=true');await correct('base','3.37');
+ await waitForRefresh("document.querySelector('#live-status').dataset.state==='stale'&&"+idle);
+ await check('a read the desk refuses leaves the desk it had whole, with no new totals or rows beside its old charts',`${deskNow}===${JSON.stringify(deskBefore)}&&!document.querySelector('#desk').textContent.includes('4,242.500')&&!document.querySelector('#desk-positions').textContent.includes('9.995')`,deskNow);
+ await click('#live-retry');await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ // A swap's Terms are read in the live context too, with its valuation and schedules, as a form of its amendment would be read in working data.
+ const swapReference=await evaluate("window.liveResponses.filter(r=>r.path==='/api/trading/workspace').at(-1).data.blotter.holdings.find(h=>h.instrumentType==='financial_swap').tradeReference");
+ await set('#blotter-filters .table-search',swapReference);await click('#desk-positions .tabulator-row:not(.tabulator-group)');
+ await click('#position-details-tabs-terms');await wait("!!document.querySelector('#position-details-view .side-panel-section')&&"+idle);
+ await check('a swap\'s Terms are read in a live context: its structure and each side, with no error',
+  `(()=>{const titles=[...document.querySelectorAll('#position-details-view .side-panel-section>h3')].map(n=>n.textContent);return titles[0]==='Trade'&&titles[1]==='Structure'&&!document.querySelector('#position-details-view .side-panel-error')&&document.querySelector('#error').hidden;})()`,
+  "[document.querySelector('#position-details-view').innerText.slice(0,300),document.querySelector('#error').textContent]");
+ await click('#position-details-tabs-schedules');
+ for(const slot of [0,1]){
+  await inspectPositionSide({evaluate,wait,set},slot);
+  await check('the live swap exposes each native Side through the shared pricing and payment inspector',"document.querySelector('#position-details-view .inspection-rows tbody tr')&&document.querySelector('#position-details-view .inspection-rows').textContent.includes('PV')&&!document.querySelector('#position-details-view .side-panel-error')");
+ }
+ await click('#details-collapse');await set('#blotter-filters .table-search','');
+ // A position in a market Curves & prices lists, so that its Open curve is available to hold focus below.
+ const reference=await evaluate("(async()=>{const listed=new Set((await(await window.workspaceFetch('/api/workspace/navigation')).json()).curves.map(c=>c.code));return window.liveResponses.filter(r=>r.path==='/api/trading/workspace').at(-1).data.blotter.holdings.find(h=>listed.has(h.curve)).tradeReference;})()");
+ await set('#blotter-filters .table-search',reference);await click('#desk-positions .tabulator-row:not(.tabulator-group)');
+ // A risk analyst cannot amend: the panel offers no Amend and says why, in words, where Amend would be.
+ await check('an account that cannot amend is not offered Amend, and the panel says in words why',
+  "(()=>{const amend=document.querySelector('#side-panel-amend'),note=document.querySelector('#side-panel-amend-note');return amend.hidden&&amend.getClientRects().length===0&&!note.hidden&&note.getClientRects().length>0&&note.textContent==='This account cannot amend trades in this market context.';})()",
+  "document.querySelector('#position-details-head').innerText");
+ // The panel's Terms are read once, in the live context, and a live correction reads them again with the rest of the desk.
+ await click('#position-details-tabs-terms');await wait("!!document.querySelector('#position-details-view .side-panel-section')&&"+idle);
+ const editorReads="window.liveRequests.filter(p=>['/api/swaps/editor','/api/futures/editor'].includes(p)).length",readsAtOpen=await evaluate("window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length"),termsRead=await evaluate(editorReads);
+ await correct('base','3.39');
+ await waitForRefresh(`window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length>${readsAtOpen}&&document.querySelector('#live-status').dataset.state==='live'&&`+idle);
+ await check('a live correction reads the panel\'s terms again, with the desk, since the person has no edits in it',`${editorReads}===${termsRead}+1&&!!document.querySelector('#position-details-view .side-panel-section')&&!document.querySelector('#position-details-view .side-panel-error')&&document.querySelector('#notice').hidden`,`[${editorReads},${termsRead},document.querySelector('#notice').textContent]`);
+ await evaluate('window.failLiveEditor=true');await correct('base','3.4');
+ await waitForRefresh("document.querySelector('#live-status').dataset.state==='stale'&&"+idle);
+ await check('a refresh whose read of the panel\'s terms fails leaves the page stale, and the panel says what failed, with Retry',"!!document.querySelector('#position-details-view .side-panel-error')&&!!document.querySelector('#side-panel-retry')&&!document.querySelector('#live-retry').hidden");
+ await click('#live-retry');
+ await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ await check('Retry reads the panel\'s terms again before reporting Live',`${editorReads}===${termsRead}+3&&!!document.querySelector('#position-details-view .side-panel-section')&&!document.querySelector('#position-details-view .side-panel-error')`,`[${editorReads},${termsRead}]`);
+ // The side panel follows the live refresh: it shows its position from the newest read of the desk.
+ await check('the side panel is drawn again from the newest read when a live correction refreshes the desk',`(()=>{const reads=window.liveResponses.filter(r=>r.path==='/api/trading/workspace'),h=reads.at(-1).data.blotter.holdings.find(h=>h.tradeReference===${JSON.stringify(reference)});return reads.length>${readsAtOpen}&&document.querySelector('#position-details')?.hidden===false&&document.querySelector('#position-details-head .side-panel-reference').textContent===${JSON.stringify(reference)}&&document.querySelector('#position-details .side-panel-value .kpi-value').title===(h.instrumentType==='financial_swap'?h.presentValue:h.executionPnl)+' '+h.currency;})()`);
+ // A live refresh holds the page busy, which disables the panel's controls while it is drawn again: focus on one comes back with it.
+ // The profile dialog of the persona switches may still be open, and it is modal: the panel can take focus once it is closed.
+ if(await evaluate("document.querySelector('#profile-dialog').open"))await click('#profile-close');
+ // Each correction below is one more refresh of the desk, waited for from the reads there were before it.
+ const workspaceReads="window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length";
+ const refreshedBy=async value=>{const before=await evaluate(workspaceReads);await correct('base',value);await waitForRefresh(`${workspaceReads}>${before}&&document.querySelector('#live-status').dataset.state==='live'&&`+idle);};
+ await evaluate("document.querySelector('#position-details-tabs-terms').focus()");
+ await refreshedBy('3.41');
+ await check('keyboard focus on a tab of the panel survives a live refresh, which disables it while the page is busy and draws the panel again',
+  "document.activeElement.id==='position-details-tabs-terms'",
+  "[document.activeElement.id,document.activeElement.tagName]");
+ // Open curve is the head's own button, enabled for this market, and keeps focus the same way.
+ await check('Open curve is available for the position, so that focus can be held on a button of the panel\'s head',"!document.querySelector('#side-panel-open-curve').disabled","document.querySelector('#position-details-head').innerText");
+ await evaluate("document.querySelector('#side-panel-open-curve').focus()");
+ await refreshedBy('3.415');
+ await check('and so does keyboard focus on a button of the panel\'s head',"document.activeElement.id==='side-panel-open-curve'&&!document.querySelector('#side-panel-open-curve').disabled","[document.activeElement.id,document.activeElement.tagName]");
+ // Focus the person has moved off the panel is not taken back by a refresh.
+ await evaluate("(()=>{const title=document.querySelector('#page-title');title.tabIndex=-1;title.focus();})()");
+ await refreshedBy('3.43');
+ await check('while focus that is elsewhere stays there: a refresh does not take it back to the panel',
+  "document.activeElement.id==='page-title'",
+  "[document.activeElement.id,document.activeElement.tagName]");
+ // A risk run belongs to the inputs it was made on: a live correction clears it and says so, and a refresh that then fails keeps the note.
+ // The report is in the panel's Risk report mode, whose setup a correction reads again, as the catalog it offers may change.
+ const riskNote='Risk results cleared · live corrections changed the inputs';
+ const catalogs="window.liveResponses.filter(r=>r.path==='/api/portfolio/risk/catalog')";
+ const reportOpen="document.querySelector('#position-details').dataset.mode==='risk'&&!document.querySelector('#risk-fields').disabled";
+ const futureRiskTarget=()=>evaluate(`(()=>{const c=${catalogs}.at(-1).data,source=c.factors.find(f=>f.curves.includes('future')&&f.deliveryFrom==='2021-01-01');return c.scenarioTargets.find(t=>t.id===source.id&&JSON.stringify(t.factor)===JSON.stringify(source.factor)).id;})()`);
+ const runRisk=async()=>{
+  await click('#blotter-risk');await wait(reportOpen+"&&"+idle);await click('input[name=risk-choice][value=custom]');
+  await set('#risk-factor',await futureRiskTarget());await set('#risk-bump','0.1');await submit('#risk-form');await wait("!document.querySelector('#desk-run').hidden&&"+idle);
+ };
+ await runRisk();
+ const catalogsBefore=await evaluate(catalogs+'.length');
+ // A slow completed refresh reaches the page's ten-second coalescing delay.
+ // Hold one real catalog reply so the following correction exercises that path.
+ await evaluate(`(()=>{const fetch=window.fetch;window.fetch=async(...args)=>{
+  if(String(args[0])!=='/api/portfolio/risk/catalog')return fetch(...args);
+  window.fetch=fetch;const response=await fetch(...args),started=performance.now();
+  await new Promise(resolve=>setTimeout(resolve,5500));window.slowRiskReply=performance.now()-started;return response;
+ };})()`);
+ await correct('base','3.371');
+ try{await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&document.querySelector('#desk-run').hidden&&"+reportOpen+"&&"+idle,30000);}
+ catch(error){console.error('Owned live Risk refresh state',JSON.stringify(await evaluate("({live:document.querySelector('#live-status').dataset.state,liveText:document.querySelector('#live-status').textContent,error:document.querySelector('#error').textContent,busy:document.body.getAttribute('aria-busy'),pending:[...document.querySelectorAll('[aria-busy=true]')].map(node=>node.id),riskFieldsDisabled:document.querySelector('#risk-fields').disabled,riskStatus:document.querySelector('#risk-status').textContent,riskProgress:document.querySelector('#risk-progress').textContent,deskRunHidden:document.querySelector('#desk-run').hidden,slowReply:window.slowRiskReply,probe:window.__asyncReadProbeErrors,reads:window.liveResponses.filter(item=>/risk|workspace|async-reads/.test(item.path)).slice(-12).map(item=>({path:item.path,code:item.data?.code,context:item.data?.context??item.data?.blotter?.context,state:item.data?.state}))})").catch(cause=>({diagnosticFailure:cause.message}))));throw error;}
+ await check('a slow real risk catalog reply completes before the next correction',"window.slowRiskReply>5000");
+ await check('a live correction clears a risk run, whose inputs it changed, and the page says so',`!document.querySelector('#notice').hidden&&document.querySelector('#notice').textContent.includes(${JSON.stringify(riskNote)})&&[...document.querySelectorAll('#blotter-strip .strip-item')].filter(i=>i.querySelector('.strip-label').textContent.startsWith('Risk'))[0].querySelector('.strip-value').textContent==='Set up in the panel'`,"[document.querySelector('#notice').textContent,[...document.querySelectorAll('#blotter-strip .strip-item')].filter(i=>i.querySelector('.strip-label').textContent.startsWith('Risk')).map(i=>i.textContent).join(' ')]");
+ await check('and reads the risk setup open in the panel again, for the context the correction made',
+  `${catalogs}.length===${catalogsBefore}+1&&${catalogs}.at(-1).data.context.contextId!==${catalogs}.at(-2).data.context.contextId&&${catalogs}.at(-1).data.context.contextId===window.liveResponses.filter(r=>r.path==='/api/trading/workspace').at(-1).data.blotter.context.contextId&&[...document.querySelectorAll('input[name=risk-choice]')].every(c=>!c.checked)`,
+  `[${catalogs}.length,${catalogsBefore}]`);
+ // A setup that holds the person's own edits is read again at the corrected inputs, with the person's choice and sizes, and a run of it is
+ // made at the context on screen, never at the inputs it was first read at (D188).
+ const workspaceContext="window.liveResponses.filter(r=>r.path==='/api/trading/workspace').at(-1).data.blotter.context.contextId";
+ await click('input[name=risk-choice][value=held]');
+ await evaluate("(()=>{const n=document.querySelector('#risk-size-0');n.focus();n.select();})()");await command('Input.insertText',{text:'0.25'});
+ const unit=await evaluate("document.querySelector('#risk-size-0').dataset.unit");
+ const catalogsKept=await evaluate(catalogs+'.length'),readsKept=await evaluate("window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length");
+ await correct('base','3.373');
+ await waitForRefresh(`window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length>${readsKept}&&document.querySelector('#live-status').dataset.state==='live'&&`+idle);
+ await check('a live correction reads a setup that holds the person\'s edits again at the corrected inputs, with the person\'s choice and sizes',
+  `${catalogs}.length>${catalogsKept}&&${catalogs}.at(-1).data.context.contextId===${workspaceContext}&&document.querySelector('#position-details').dataset.mode==='risk'&&document.querySelector('input[name=risk-choice][value=held]').checked&&document.querySelector('#risk-size-0').value==='0.25'&&document.querySelector('#risk-size-0').dataset.unit===${JSON.stringify(unit)}&&document.querySelector('#risk-size-0-note').hidden&&!document.querySelector('#risk-carried').hidden&&document.querySelector('#risk-carried').textContent.startsWith('The inputs on screen changed, so this setup was read again for them with your choices.')&&${catalogs}.at(-1).data.context.contextId!==${catalogs}.at(${catalogsKept}-1).data.context.contextId`,
+  "[document.querySelector('input[name=risk-choice][value=held]').checked,document.querySelector('#risk-size-0')?.value,document.querySelector('#risk-carried').textContent]");
+ const reportsBefore=await evaluate("window.liveResponses.filter(r=>r.path==='/api/portfolio/risk').length");
+ const sizes=await evaluate("document.querySelectorAll('#risk-sizes input').length");
+ for(let index=1;index<sizes;index++)if(!await evaluate(`document.querySelector('#risk-size-${index}').value`))await set(`#risk-size-${index}`,'0.05');
+ await submit('#risk-form',60000);await wait("!document.querySelector('#desk-run').hidden&&"+idle,60000);
+ await check('a run of it is made at the context on screen, which the correction made, with the size the person typed',
+  `(()=>{const reports=window.liveResponses.filter(r=>r.path==='/api/portfolio/risk').slice(${reportsBefore}).map(r=>r.data),typed=reports.flatMap(r=>r.factors).filter(f=>f.factor.unit===${JSON.stringify(unit)});return reports.length>0&&reports.every(r=>r.context.contextId===${workspaceContext}&&r.context.contextId===${catalogs}.at(-1).data.context.contextId)&&typed.length>0&&typed.every(f=>Number(f.bump)===0.25);})()`,
+  `window.liveResponses.filter(r=>r.path==='/api/portfolio/risk').slice(${reportsBefore}).map(r=>[r.data.context.contextId,r.data.factors.map(f=>f.bump)])`);
+ // A carried choice that the catalog read at the corrected inputs no longer offers is named and left out; the person's other entries stay.
+ // The catalog read after this correction is given without one scenario target, which the custom scenario has chosen.
+ await click('input[name=risk-choice][value=custom]');
+ const dropped=await evaluate(`(()=>{const c=${catalogs}.at(-1).data,t=c.scenarioTargets.find(t=>t.kind!=='delivery_bucket'&&!c.heldContractTargets.includes(t.id)&&!c.heldCurveTargets.includes(t.id));return {id:t.id,label:t.label};})()`);
+ await set('#risk-factor',dropped.id);
+ await evaluate("(()=>{const n=document.querySelector('#risk-bump');n.focus();n.select();})()");await command('Input.insertText',{text:'0.2'});
+ const readsDropped=await evaluate("window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length");
+ await evaluate(`window.dropRiskTarget=${JSON.stringify(dropped.id)}`);await correct('base','3.375');
+ await waitForRefresh(`window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length>${readsDropped}&&document.querySelector('#live-status').dataset.state==='live'&&`+idle);
+ await check('a carried choice the catalog read at the corrected inputs no longer offers is named and left out, and the person\'s other entries stay',
+  `document.querySelector('input[name=risk-choice][value=custom]').checked&&document.querySelector('#risk-factor').value===''&&document.querySelector('#risk-bump').value==='0.2'&&document.querySelector('#risk-carried').textContent.endsWith('No longer offered, so left out: '+${JSON.stringify(dropped.label)}+'.')`,
+  "[document.querySelector('#risk-factor').value,document.querySelector('#risk-bump').value,document.querySelector('#risk-carried').textContent]");
+ // Use one explicit shock so this exercises the single-job recovery panel even when the held-contract preset needs several parts.
+ await click('input[name=risk-choice][value=custom]');await set('#risk-factor',await futureRiskTarget());await set('#risk-bump','0.1');
+ // An unconfirmed queued submission is shown again after a correction, under the inputs it was captured at, and the page says so rather than
+ // that its results were cleared.
+ await evaluate('window.loseRiskJob=true');await click('#risk-queue',60000);await wait("!document.querySelector('#risk-job-retry').hidden&&"+idle);
+ const readsBeforeRetained=await evaluate("window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length");
+ await correct('base','3.374');
+ await waitForRefresh(`window.liveResponses.filter(r=>r.path==='/api/trading/workspace').length>${readsBeforeRetained}&&document.querySelector('#live-status').dataset.state==='live'&&!document.querySelector('#risk-job').hidden&&`+idle);
+ await check('a correction says an unconfirmed risk submission keeps the inputs it was captured at, under which the panel shows it again, and not that it was cleared',
+  "document.querySelector('#notice').textContent.includes('Live corrections changed the inputs · the unconfirmed risk submission keeps the inputs it was captured at')&&!document.querySelector('#notice').textContent.includes('Risk results cleared')&&document.querySelector('#position-details').dataset.mode==='risk'&&!document.querySelector('#risk-job').hidden&&document.querySelector('#risk-job-context').textContent.startsWith('Captured market time')",
+  "[document.querySelector('#notice').textContent,document.querySelector('#risk-job-context').textContent]");
+ // Reopened, the report found the lost reply's job in the history; either way it returns to a setup at the inputs on screen.
+ await click(await evaluate("document.querySelector('#risk-job-discard').hidden")?'#risk-job-return':'#risk-job-discard');
+ await wait("!document.querySelector('#risk-fields').disabled&&"+idle);
+ await runRisk();
+ await evaluate('window.failLiveWorkspace=true');await correct('base','3.372');
+ await waitForRefresh("document.querySelector('#live-status').dataset.state==='stale'&&"+idle);
+ await check('a refresh that fails after it cleared a risk run keeps the note that says so',`document.querySelector('#desk-run').hidden&&!document.querySelector('#notice').hidden&&document.querySelector('#notice').textContent.includes(${JSON.stringify(riskNote)})`,"[document.querySelector('#notice').hidden,document.querySelector('#notice').textContent,document.querySelector('#desk-run').hidden]");
+ await click('#live-retry');await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&"+idle);
+ await click('#details-collapse');
+ // New trade follows the backend: a live view cannot book, as a historical one cannot, so a trader there is not offered it and is told why, in the
+ // backend's words, which say that the view is live. No form of a new trade is open there, and none is held while corrections arrive.
+ await persona('trader');await click('#example');await click('#nav-futures');
+ if(await evaluate("!document.querySelector('#follow-live').hidden"))await click('#follow-live');
+ try{await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&!!document.querySelector('#desk-positions .tabulator-row:not(.tabulator-group)')&&"+idle);}
+ catch(error){console.error('Owned trader live refresh state',JSON.stringify(await evaluate("({profile:document.querySelector('#profile').value,live:document.querySelector('#live-status').dataset.state,liveText:document.querySelector('#live-status').textContent,error:document.querySelector('#error').textContent,errorHidden:document.querySelector('#error').hidden,busy:document.body.getAttribute('aria-busy'),pending:[...document.querySelectorAll('[aria-busy=true]')].map(node=>node.id),pricing:document.querySelector('#futures-page').dataset.pricingState,rows:document.querySelectorAll('#desk-positions .tabulator-row:not(.tabulator-group)').length,blotter:document.querySelector('#blotter-load-status').textContent,probe:window.__asyncReadProbeErrors,reads:window.liveResponses.filter(item=>/workspace|async-reads|trading/.test(item.path)).slice(-12).map(item=>({path:item.path,code:item.data?.code,context:item.data?.context??item.data?.blotter?.context,state:item.data?.state}))})").catch(cause=>({diagnosticFailure:cause.message}))));throw error;}
+ await check('a trader in a live view is not offered New trade, and is told in words under the toolbar that the view is live',"document.querySelector('#workspace-mode-label').textContent.includes('Live corrections')&&document.querySelector('#futures-new').disabled&&!document.querySelector('#new-trade-availability').hidden&&document.querySelector('#new-trade-availability').getClientRects().length>0&&document.querySelector('#new-trade-availability').textContent==='Live view is read-only. Return to working data, then select an As of date.'&&document.querySelector('#futures-new').getAttribute('aria-describedby')==='new-trade-availability'&&!document.querySelector('#futures-new').title&&document.querySelector('#position-details').hidden&&document.querySelector('#futures-new-trade').hidden&&document.querySelector('#swap-editing').hidden","[document.querySelector('#workspace-mode-label').textContent,document.querySelector('#new-trade-availability').textContent,document.querySelector('#futures-new').disabled]");
+ // Refresh reads the cheap directory and the count of booked positions before valuation. A failed valuation keeps that backend's live
+ // refusal, rather than substituting the fallback used before any catalog has been read.
+ const directoryReads="window.liveResponses.filter(r=>r.path==='/api/trading/directory')";
+ const factReads="window.liveResponses.filter(r=>r.path==='/api/trading/positions')";
+ const directoriesBefore=await evaluate(directoryReads+'.length');
+ const factsBefore=await evaluate(factReads+'.length');
+ const liveBookingReason=await evaluate("window.liveResponses.filter(r=>r.path==='/api/trading/workspace').at(-1).data.catalog.bookingUnavailableReason");
+ await evaluate('window.failLiveWorkspace=true');await click('#futures-refresh');
+ await wait(`${directoryReads}.length>${directoriesBefore}&&${factReads}.length>${factsBefore}&&document.querySelector('#futures-page').dataset.pricingState==='failed'&&`+idle);
+ await check('a failed valuation keeps the previous rows marked stale, the backend booking refusal, and no current totals or edit form',
+  `(()=>{const directory=${directoryReads}.at(-1).data,facts=${factReads}.at(-1).data,note=document.querySelector('#new-trade-availability');
+   return directory.kind==='directory'&&directory.canBook===false&&directory.canAmendTrades===false&&directory.bookingUnavailableReason===${JSON.stringify(liveBookingReason)}&&note.textContent===directory.bookingUnavailableReason&&!note.hidden&&facts.context.contextId===directory.context.contextId&&facts.context.knownAt===directory.context.knownAt&&facts.asOf===directory.asOf&&!!document.querySelector('#desk-positions .tabulator-row:not(.tabulator-group)')&&document.querySelector('#desk-positions .standard-data-grid').classList.contains('stale')&&!document.querySelector('#blotter-retry').hidden&&!document.querySelector('#error').hidden&&document.querySelector('#futures-new').disabled&&document.querySelector('#futures-new').getAttribute('aria-describedby')==='new-trade-availability'&&[...document.querySelectorAll('#blotter-strip .strip-item')].find(i=>i.querySelector('.strip-label').textContent==='Swap PV')?.querySelector('.strip-stale')?.textContent==='Stale'&&document.querySelector('#position-details').hidden&&document.querySelector('#futures-new-trade').hidden&&document.querySelector('#swap-editing').hidden;})()`,
+  `[${directoryReads}.at(-1).data,${factReads}.at(-1).data,document.querySelector('#error').textContent,document.querySelector('#new-trade-availability').textContent,document.querySelector('#blotter-load-status').textContent]`);
+ await click('#futures-refresh');await wait("!!document.querySelector('#desk-positions .tabulator-row:not(.tabulator-group)')&&"+idle);
+ console.log('LIVE browser synthetic workload:',JSON.stringify(await evaluate("({requests:window.liveRequests.length,longTasks:window.liveTasks.length,maxLongTaskMilliseconds:Math.max(0,...window.liveTasks),heapBytes:performance.memory?.usedJSHeapSize})")));
+ // The pop-out Blotter follows live corrections as the main window reads them: a new generation is read again keeping what its details hold (D222).
+ await persona('risk');await click('#example');await click('#nav-futures');
+ if(await evaluate("!document.querySelector('#follow-live').hidden"))await click('#follow-live');
+ await waitForRefresh("document.querySelector('#live-status').dataset.state==='live'&&!!document.querySelector('#desk-positions .tabulator-row[data-row-key]')&&"+idle,60000);
+ const popup=await popOut({command,evaluate,url,tab});
+ await popup.evaluate(`(()=>{const control=document.querySelector('#blotter-window-close'),disabled=Object.getOwnPropertyDescriptor(HTMLButtonElement.prototype,'disabled');
+  Object.defineProperty(control,'disabled',{configurable:true,get(){return disabled.get.call(this);},set(value){if(!value){disabled.set.call(this,value);return;}delete this.disabled;window.__popupControlRefreshThrown=true;throw Error('Synthetic pop-out control refresh failure');}});})()`);
+ await press(popup,'#futures-refresh');await popup.evaluate('new Promise(resolve=>setTimeout(resolve,100))');
+ await check('a pop-out control refresh failure releases its busy state and reports the reason',JSON.stringify(await popup.evaluate("window.__popupControlRefreshThrown===true&&document.body.getAttribute('aria-busy')==='false'&&!document.querySelector('#futures-refresh').disabled&&!document.querySelector('#error').hidden&&document.querySelector('#error').textContent.includes('Synthetic pop-out control refresh failure')")));
+ await popup.click('#futures-refresh');await popup.wait(idle);
+ await check('the pop-out remains usable after a failed presentation refresh',JSON.stringify(await popup.evaluate("document.querySelector('#error').hidden&&!document.querySelector('#futures-refresh').disabled")));
+ await popup.click('#blotter-risk');await popup.wait(reportOpen+'&&'+idle,30000);
+ await popup.click('input[name=risk-choice][value=held]');await popup.wait("!!document.querySelector('#risk-size-0')&&"+idle,30000);
+ await popup.evaluate("(()=>{const n=document.querySelector('#risk-size-0');n.focus();n.select();})()");await popup.command('Input.insertText',{text:'0.25'});
+ const popupReads="performance.getEntriesByType('resource').filter(r=>new URL(r.name).pathname==='/api/trading/workspace').length",popupBefore=await popup.evaluate(popupReads);
+ await correct('base','3.391');
+ await popup.wait(`${popupReads}>${popupBefore}&&`+idle,60000);
+ await check('a live correction reads the pop-out Blotter again as the main window reads one, keeping the edits its details hold',
+  JSON.stringify(await popup.evaluate("document.querySelector('#position-details').dataset.mode==='risk'&&document.querySelector('input[name=risk-choice][value=held]').checked&&document.querySelector('#risk-size-0').value==='0.25'&&!document.querySelector('#notice').textContent.includes('given up')")));
+ const prompt="document.querySelector('#blotter-window-question-prompt')";
+ // A risk submission the pop-out queued whose outcome is not known goes back with the Blotter, under its first identity.
+ const popupSizes=await popup.evaluate("document.querySelectorAll('#risk-sizes input').length");
+ for(let index=1;index<popupSizes;index++)if(!await popup.evaluate(`document.querySelector('#risk-size-${index}').value`))await popup.set(`#risk-size-${index}`,'0.05');
+ await popup.evaluate("(()=>{const send=window.fetch;window.__riskSent=[];window.fetch=async(input,init)=>{if(String(input).endsWith('/portfolio/risk/jobs')&&init?.method==='POST'){window.__riskSent.push(JSON.parse(init.body).requestId);throw new TypeError('Synthetic lost connection');}return send(input,init);};document.querySelector('#risk-queue').click();})()");
+ await popup.wait("window.__riskSent.length>0&&"+idle,60000);
+ const riskHeld=await popup.evaluate('[...new Set(window.__riskSent)].sort()');
+ await evaluate("(()=>{const send=window.fetch;window.__riskJobs=[];window.fetch=async(input,init)=>{if(String(input).endsWith('/portfolio/risk/jobs')&&init?.method==='POST')window.__riskJobs.push(JSON.parse(init.body).requestId);return send(input,init);};})()");
+ // A queued run is no edit: Bring back asks nothing, as the submission goes with the Blotter.
+ await click('#blotter-bring-back');
+ await wait("document.querySelector('#blotter-away').hidden&&!!document.querySelector('#desk-positions .tabulator-row[data-row-key]')&&"+idle,60000);
+ await check('Bring back asks nothing of a pop-out holding only an unconfirmed submission',`${prompt}.hidden`);
+ await click('#blotter-risk');await wait("!document.querySelector('#risk-job-retry').hidden&&"+idle,30000);
+ await click('#risk-job-retry',60000);
+ await check('Bring back hands the pop-out\'s unconfirmed risk submission to the main window, whose Retry sends each part under its first identity',
+  `JSON.stringify([...new Set(window.__riskJobs)].sort())===${JSON.stringify(JSON.stringify(riskHeld))}`,'window.__riskJobs');
+}

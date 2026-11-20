@@ -1,0 +1,793 @@
+# Deal ticket
+
+Status: the description-driven ticket is implemented for physical gas. The local
+manual-entry update (D285) gives PPAs, native swaps, heat-rate swaps and physical
+crude the shared side-card presentation and removes PPA wizard navigation. These
+products still use their native booking contracts; moving them to the gas ticket's
+versioned description and joint schedule remains work. The later gas service
+workflows are documented under [Transport](gas-transport-financial.md),
+[Park and Loan](gas-park-loan.md) and [gas storage](gas-storage-contract.md).
+The original ticket decisions are D278–D281 and D285 in [decisions.md](decisions.md).
+
+## Why
+
+Every sided product has its own hand-built entry screen today: the swap editor,
+the scheduled-swap editor, the physical gas editor and the PPA editor. Each
+looks and behaves differently, the PPA entry has never been intuitive, and the
+next products (physical crude, LNG cargoes, freight, battery, gas storage) would
+each bring another. Traders cannot compare the sides of a trade at a glance, and
+reference choices and looked-up values are filled differently on each screen.
+
+The deal ticket is one way to enter and read every sided trade. The backend
+describes each product; the browser draws any product from that description in
+one layout. A new product is backend work plus its description, with no new
+screen. The same ticket shows a new trade, a booked trade opened from the
+Blotter, an amendment and a close-out, and it shows the trade's schedules as the
+person edits.
+
+The ticket also leads product work. A product's ticket shows every field the
+product will have. Fields the backend does not use yet are drawn as
+*coming soon* (below), so each product's remaining work is visible on screen.
+
+## Goals
+
+1. One ticket for every sided product: physical gas, financial gas and power
+   swaps (including scheduled swaps), heat-rate swaps and PPAs move onto it in
+   this project.
+2. Sides read side by side. Fields that every side has line up across the
+   sides; each side's own fields follow.
+3. Drop-downs list exactly the eligible reference data for the field, filtered
+   by the choices already made. Values the backend can look up (prices, tariff
+   rates, payment dates, gas-day starts, asset nodes) are filled in and say
+   where they came from.
+4. The trade's schedules are visible while editing and update after each change.
+   The joint instrument schedule is the main view; each side has its own.
+5. A booked trade shows what is settled fact and what is still forward: every
+   value says where it came from.
+6. New products plug in through their description. Coming-soon fields make a
+   product demonstrable before all of its fields are implemented, without
+   pretending they are.
+7. A table widget that renders every grid in the ticket beautifully, reusable by
+   other pages.
+
+## Non-goals
+
+- New product backends (crude, LNG, freight, battery, storage, pipeline crude).
+  Each is its own later project that starts from its ticket.
+- Futures entry. A future has no sides and gets no artificial one (architecture,
+  §Instruments). Its tables take the new grid look only.
+- The Blotter's panes, docking, row menu and pop-out. The
+  [Blotter workbench](blotter-workbench.md) owns them; this ticket is what its
+  Details pane shows for a sided position.
+- Changing what a product books, values or settles. Moving a product onto the
+  ticket keeps its booking contract, preview, idempotency and refusals.
+
+## Anti-goals
+
+These would make the work a failure even if the screens looked right.
+
+- **Business rules in the browser.** Totals, net cash, spark spreads, quantity
+  derivations, TOU evaluation, schedules, payment dates and lookups come from
+  the backend. The browser formats exact decimal strings and never computes an
+  amount.
+- **Silent defaults.** A looked-up value is a visible, labelled proposal the
+  person can see and change. A missing lookup is an empty field with the
+  backend's reason, never a guess. Nothing is filled from a previous trade,
+  another side or a product-wide default unless the description declares that
+  lookup.
+- **Fields that pretend.** A field that is shown as a term is captured, used by
+  a backend consumer and tested (the field admission rule in
+  [physical gas terms](physical-gas-field-contract.md)). A field that is not
+  yet used is drawn as coming soon and is never sent.
+- **A second set of booking paths.** The ticket calls the same authorized
+  operations as the API, imports and agents.
+- **One-off product screens creeping back.** A product that does not fit the
+  description is a gap in the description, solved there.
+
+## Constraints
+
+From [AGENTS.md](../AGENTS.md) and the architecture, restated where the ticket
+touches them:
+
+- TypeScript is presentation only. The product description, lookups, previews,
+  schedules and summaries are backend operations.
+- Missing, ambiguous or conflicting behavior raises a structured error, shown on
+  the field or side it concerns, with its reason.
+- Reference choices are exact-version references, not names.
+- Historical context (business time and knowledge cutoff) applies to every
+  description, drop-down, lookup and preview read. A booked trade opened as of
+  an earlier date shows the choices and values of that context.
+- Every write is idempotent (D238). Previews are reads; booking keeps its
+  request id and first outcome.
+- UI and agents use the same operations. An agent can read a product's
+  description and fill a ticket through the same contract.
+- No new dependency. The grid uses Tabulator 6.6.1, already in `web/package.json`.
+- Synthetic data in examples, fixtures and checks.
+
+## Layout
+
+Decided with the owner. Mockups were reviewed in the brainstorming session; this
+section describes them.
+
+### Trade strip
+
+Across the top: the product and the trade's state (Draft, Booked · forward,
+Booked · in delivery), then trade-level fields: trade date, book, counterparty,
+agreement and the other trade facts the product's description lists. In
+delivery, the strip adds a progress bar (for example, "Day 20 of 31 · 61%
+delivered") and the delivered and remaining figures the backend reports.
+
+### Side cards
+
+One card per side, side by side, in instrument order. A card has a coloured top
+edge and a pill for its kind (Physical, Payment, Floating, Fee, Cargo, Freight,
+Attributes), its name, then two bands:
+
+1. **Common to all sides** (accent band). The same rows in every card, in the
+   same order, at the same height: Direction, Start, End, Product / TOU,
+   Quantity, Price, Payment. Labels may differ per side ("Price per
+   MMBtu", "Rate per MMBtu"); the row is the same kind of field. The cards share
+   one row grid so these rows line up exactly. Each row holds the term in the
+   shape the booking contract admits: Payment holds the payment rule
+   ("Month end + 20 business days"), not a date; the dates it produces appear in
+   the schedule.
+2. **Side details** (grey band). The side's own fields, at their natural height:
+   pipeline, zone and point; index and pricing window; heat rate and unit
+   conversion; asset, node and meter; tariff; route and vessel class.
+
+Where a side cannot take a common field, its slot holds read-only information
+on a grey background instead of an empty hole, so the row still lines up:
+
+- a physical side's Price slot shows the market price at its point, with the
+  curve and close it came from;
+- a physical side's Payment slot shows which cash sides pay for it;
+- a derived quantity shows its rule ("Power MWh × 7.50 · from heat rate").
+
+Where a card ends before its neighbours, the space holds a **side summary** from
+the latest preview: billed quantity, amount, and contract against market. After
+the cards, a dashed **Add side** card offers the side kinds the product admits.
+
+Clicking a card selects it and selects that side's schedule tab.
+
+### Schedule panel
+
+Below the cards, one grid with tabs:
+
+- **Instrument** (first, open by default): the joint schedule of the whole trade.
+  Each side is a column group in its card's colour; a final **Trade** group
+  holds net cash, payment date and product-specific trade measures (spark
+  spread for a heat-rate swap). All values come from the backend.
+- One tab per side with that side's full schedule.
+
+A toolbar holds the row level, a row filter, a column picker, CSV export and the
+preview status ("Up to date · previewed after your last change", "Updating…",
+"Preview refused: <reason>"). A totals row is pinned at the bottom.
+
+**Mixed granularity.** Sides may run on different periods (daily delivery,
+monthly payment; hourly generation, monthly payment). The Instrument schedule is
+a tree whose levels are the product's periods. Each side shows its values on the
+rows of its own granularity and on every coarser row as the backend's
+aggregate; on a finer row a coarser side's cells are blank. Net cash and other
+trade measures sit on the rows the backend reports them for (payment periods)
+and aggregate upward. (Design call.)
+
+**Additional tabs.** Views the current editors offer beyond terms and
+schedules (draft risk, PPA break-even, swap observation and fixing inspection,
+technical lineage) become further tabs after the side tabs, shown only for the
+products whose backend offers them. They keep their existing operations.
+(Design call.)
+
+**Per-period inputs.** Inputs entered per period rather than per side (a
+scheduled swap's explicit period quantities, physical gas daily quantity
+records, PPA profiles) are editable cells in that side's tab, drawn with the
+same field states as card fields. The description marks which schedule columns
+are inputs. (Design call.)
+
+**Row shapes.** The description declares one of two:
+
+- **Flow-shaped** (gas, pipeline crude, swaps, heat rates, PPAs, power): rows are
+  delivery periods. The row level switches Month / Day / Hour, offering only
+  the levels the product's granularity has, and a month opens in place to its
+  days and a day to its hours. Fifteen hourly years stay usable because only
+  opened groups are loaded.
+- **Cargo-shaped** (crude cargoes, LNG, freight): one row per lift, with laycan,
+  bill-of-lading date, quantity with tolerance, pricing window, price and
+  amount. The row level switches Lift / Pricing day. A pricing window shows its
+  days as small squares, filled once fixed, with the anchor day outlined.
+  No product in this project is cargo-shaped, so the cargo shape is designed
+  here and built with the first cargo product, which is its consumer (AGENTS.md:
+  no addition without a current consumer). The description schema leaves room
+  for it. (Design call.)
+
+**Changes.** After an edit, cells whose values moved carry a small amber marker
+until the next edit.
+
+**Sources.** Every value carries a small tag naming where it came from, as the
+backend reports it: Contract, Fwd, Fixed, Settled, Actual, Meter, Nominated,
+Estimated, Nominal, "3 of 5 fixed". In delivery, a line marks the valuation
+date, delivered rows are dimmed, and the totals split into delivered, remaining
+and total. The ticket shows a tag only when the backend supplies it; it never
+infers that a value is actual from its date.
+
+**Ended gas days.** Every day of the term is shown. A gas day that the
+`whole_gas_day_delivery_v1` lifecycle took out of the physical side's measure
+because it ended shows its latest recorded quantity when it has one, tagged with
+the record's kind and Delivered (for example Allocated and Delivered); otherwise
+it shows its retained contract quantity under the booked scale and signed
+membership, tagged Contract and Delivered. Either way it has no market price or
+amount; none is synthesized. Quantity totals sum the shown quantity of every day
+of the term; amount totals and net cash hold only priced days, and a month with
+delivered days shows no single price. The cash side keeps its amounts. Any other unresolved cell, including one
+on a day that has not ended, still refuses the schedule.
+
+### Footer
+
+Preview and Book (or Save amendment, Book close-out), with the note that
+highlighted fields were filled from a lookup.
+
+### Pane width
+
+The ticket lays out by the width of its container, not the window:
+
+- **Wide** (the New trade page, a wide Details pane, the pop-out): cards side by
+  side over the grid, as above.
+- **Narrow** (a narrow Details pane): cards stack. A strip of side chips at the
+  top jumps between them and selects the side's tab. The grid keeps the
+  Instrument tab and scrolls sideways.
+
+## Field states
+
+Every field in the description has exactly one state. The ticket draws each the
+same way on every product.
+
+| State | Drawn as | Sent with the trade |
+| --- | --- | --- |
+| Editable | Input or drop-down | Yes |
+| Looked up | Accent-tinted field with a chip naming the source ("Close 30 Oct", "Tariff T-2", "Calendar", "Asset") | Yes, as the value shown |
+| Derived | Read-only value with its rule | No; the backend derives it |
+| Information | Grey read-only slot | No; not a term |
+| Coming soon | Greyed, hatched, dashed, with a *Coming soon* tag; hover explains what it will do | No; holds no value |
+
+Rules:
+
+- A lookup proposes the value in the shape the booking contract admits (a
+  payment rule, an exact reference, a decimal string), never a derived form the
+  contract does not take.
+- Lookup chips are an entry aid. Booking stores the value, not where it was
+  looked up, so a booked trade's fields show no chips; its schedule shows the
+  value sources the backend reports. (Design call.)
+- A looked-up value is a proposal made by a backend lookup the description
+  declares for that field. Editing it removes the chip; the value is then the
+  person's and is never re-filled. A later change upstream (a new point, a new
+  close) offers the lookup again on that field instead of overwriting it.
+- A lookup that cannot resolve leaves the field empty with the backend's reason.
+- A drop-down lists the eligible exact-version references for the field under
+  the ticket's context, filtered by the choices it depends on (a point by its
+  zone, an index by its commodity). Changing a parent choice clears dependent
+  choices that are no longer eligible and says so; it does not pick a
+  replacement.
+- A coming-soon field cannot be focused for entry, has no value, and is omitted
+  from preview and booking requests. Its hover text comes from the description.
+  When the backend admits the field, its description changes its state; no
+  screen code changes.
+
+## Product description
+
+The backend serves, per product and version, a description the ticket draws.
+Its exact schema is left to the builder (below); it must express:
+
+- the product, its version and its row shape (flow or cargo);
+- trade-level fields;
+- the side kinds the product admits, with minimum, initial and maximum counts, and for
+  each kind: its pill, colour role, name, common-band fields and detail fields;
+- for each field: its business meaning, type, unit, required condition, state,
+  the reference read that lists its choices and the choices it depends on, and
+  any lookup that proposes its value;
+- the schedule columns for the Instrument tab and each side tab, by column
+  group, with units;
+- the operations for preview, book, amend and close-out, which are the
+  product's existing authorized operations.
+
+The description carries no business rule. It names operations and fields; the
+operations hold the rules. Its fields are the same fields the booking
+contract admits, so the description and the contract cannot disagree: a field
+in the description that the contract does not admit is a check failure, unless
+it is coming soon.
+
+Products whose sides follow the [D253 side model](decisions.md#d253--one-side-model-parameters-a-whole-term-schedule-rows-read-from-the-graph)
+describe its parameters directly (delivery terms, quantity rule, price term,
+observation rule, payment rule). Physical gas keeps its own side families
+([physical gas](physical-gas-side.md)) and describes them the same way.
+
+## Live preview
+
+After an edit, once the edit settles, the ticket sends the whole draft to the
+product's preview operation and redraws the side summaries and the schedule from
+the result. Only the latest preview's result is drawn; an older response that
+arrives late is discarded. A refused preview keeps the last good schedule on
+screen marked stale, with the refusal's reason on the fields it names. A
+preview never books and never writes.
+
+## Modes
+
+| Mode | Opened from | Editable |
+| --- | --- | --- |
+| New | New trade's page (D421), from the sidebar or the Blotter's New trade | All editable fields |
+| Booked | A Blotter row (Details pane), its pop-out | None; the Amend action opens the amendment mode |
+| Amend | Amend… in the row menu or the ticket | The fields the amendment operation admits at the valuation date; others show a lock with the reason |
+| Close-out | Close out… in the row menu | The close-out draft's fields, pre-filled by the backend close-out draft |
+
+A mode is offered only where the product has the operation. Physical gas supports
+the future composition replacement profile below. The Blotter workbench's
+close-out draft refuses heat-rate swaps and PPAs; the ticket shows those actions
+unavailable with the backend's reason rather than building new operations.
+Product-specific actions the backend offers (PPA terminate) appear as their own
+actions. (Design call.)
+
+The unsaved-edit guard of the Blotter workbench applies before the ticket shows
+another position or closes.
+
+## Table widget
+
+The grid is the existing Tabulator wrapper (`data-grid.ts`, as the Blotter
+workbench leaves it) with a new theme and the features the schedule panel needs:
+
+- grouped column headers coloured by side;
+- tree rows (Month → Day → Hour; Lift → Pricing day) opening in place, loading
+  children on demand;
+- a pinned totals row;
+- source tags, change markers and the valuation-date line as cell decorations;
+- tabular figures, units in headers, right-aligned numbers, dimmed past rows,
+  hover highlight;
+- the toolbar above (row level, filter, columns, CSV, status).
+
+Other pages may adopt the theme; moving them is not part of this project.
+
+## Products in this project
+
+| Product | Sides | Row shape | Notes |
+| --- | --- | --- | --- |
+| Physical gas | Physical delivery, fixed payment, fees; independent and linked physical sides | Flow (day) | Both today's templates; fuel links show as derived quantities |
+| Financial gas swap | Fixed and floating | Flow (month, day) | Includes scheduled swaps |
+| Financial power swap | Fixed and floating | Flow (month, day, hour) | Product / TOU in the common band |
+| Heat-rate swap | Power leg and fuel leg, both floating | Flow (month, day, hour) | Fuel quantity derived from the heat rate factor |
+| PPA | Physical generation, payment, attributes | Flow (month, day, hour) | Meter and estimate sources; certificate fields coming soon where not admitted |
+
+Each move keeps the product's booking contract and removes its old editor
+(no backwards compatibility: there is one entry screen per product, the ticket).
+
+## Current implementation
+
+### Manual entry across native products (D285)
+
+PPA entry is one editable ticket: ownership, delivery, side terms, preview and
+booking are visible together. The plus control offers only the selected backend
+template's absent optional roles. Removing a supported optional side invalidates
+the preview; booking retains its exact role, ordinal, direction and quantity link.
+An unbooked pricing draft has no booking action. Exact PPA market inputs are
+selected in the visible workbench, including when several bundles share a time;
+the actuals policy stays visible in the shared workbench for both entry and
+inspection. Neither required choice is hidden under Context.
+
+Ordinary swaps begin with plus controls for fixed and floating sides. The backend
+catalog names the two admitted structures: fixed/floating and floating/floating.
+Each side card contains its own delivery, observations and payment terms. Once
+the two sides are present, adding another side is unavailable. Changing the pair
+requires explicitly clearing both sides and their terms, including discarded
+close-out price provenance. There is no implicit remapping between floating slots.
+Scheduled and heat-rate entry offer the supported pairs together and retain
+independent period editors and explicit factor units. Crude has physical and
+consideration cards plus one optional, independently directed handling fee.
+
+Futures remain a distinct ticket. Commodity, exchange and product filter the
+available dated contracts. A delivery-start calendar is an optional filter; the
+contract label includes its exact series, delivery range and pricing curve. The
+read-only mark states its selected context time and quote units and never fills
+the execution price. A catalog refresh clears an unavailable date filter before
+rendering the remaining contracts.
+
+The shared headers and add controls are presentation only. Native managed
+operations continue to decide eligibility, quantities, schedules, valuation,
+authorization and request reconciliation. This is a bounded UI update; the
+common versioned description and joint schedule for these products remain planned.
+
+Owned-browser qualification exercises preview, booking and retained reopening for
+physical and virtual PPAs (including a third charge side), both ordinary swap
+pairs, independent scheduled swaps, typed heat-rate swaps and crude with a handling
+fee. Checks retain independent PV oracles, exact submitted terms, lost-response
+reconciliation, stale-preview rejection and current authorization. Futures checks
+book an explicitly selected contract while keeping its curve mark separate from
+the execution price. These are synthetic disposable-database checks.
+
+### Physical gas
+
+Physical gas has a description (`physical_gas` v1) and returns a schedule view
+from its preview and booked read. It is the one gas entry screen: New trade lists
+one Physical gas entry, which opens the ticket, and every gas trade, composed or
+single-point, opens in it read-only from the Blotter's Details pane, its pop-out
+and the trade window. The composition editor, the single-point template and the
+page's separate daily quantity panel are removed (D281); so are the single-point
+operations (`gas/preview`, `gas/instructions`, `gas/book`, `gas/status`,
+`gas/directory` and `gas/editor`). Stored single-point trades stay readable.
+
+D347 permits one composition physical Side to span up to 1200 operating days,
+with exactly one compatible native monthly contract and fixing for every day.
+The native monthly assignments can share one persisted location mapping key;
+the exact period is also part of their identity. Daily/monthly forecast cutovers
+do not split economic Sides. A selected published curve must cover the complete
+delivery term. Preview, booking and retained reads use the same Side programs.
+Whole-term scalar cash appears only at the **Whole term** level and in totals,
+with its explicit payment date. No monthly/day cash allocation is inferred.
+One-month schedules keep their existing levels and keys. The future-delivery
+profile's lifecycle and explicit no-discounting policy are unchanged.
+
+- Coming soon (D279) is declared by the description: a field, a side kind, a side
+  column or a tab may carry `soon` hover text. Validation refuses one without it,
+  a required soon field, a soon field naming choices or a lookup, a soon side kind
+  that opens or admits a side or has fields, columns or a side limit, a soon column
+  that takes entries or names a unit, and a soon trade column. A soon column is not
+  a schedule view column. D346 groups these items in one closed **Coming soon**
+  disclosure below the working schedule. Planned fields, side kinds and views
+  remain disabled and tagged with explanatory hover text. Planned columns appear
+  as descriptions there, without blank columns in the live schedule. Opening the
+  disclosure performs no read or business action. None holds a value or is sent,
+  and booking refuses a soon side or a value for a soon field.
+  Physical gas declares the owner's set: on the physical side, swing (daily minimum
+  and maximum, swing range as a percentage of the base quantity, swing notice
+  deadline), nomination (cycle, nominating party), heat content in Btu per cubic
+  foot and quality specification. The strip shows the planned master agreement
+  force majeure and credit terms. The schedule lists a planned Volume column and
+  an Imbalance tab for nominated and actual quantities, cash-out price and amount.
+  **New trade → Structured** opens dedicated tickets for
+  [Gas storage](gas-storage-contract.md) and [Heat-rate call option](heat-rate-call-option.md).
+
+- The schedule grid (`web/src/schedule-grid.ts`) turns a schedule view into the
+  Instrument and side tabs: side-coloured header groups and a Trade group, the
+  rows of the chosen level and coarser as a tree, source tags, change markers
+  against the previous view, dimmed delivered rows and the view's own totals as
+  a pinned row. Exact decimals are shown with digit grouping only; an `a/b`
+  ratio is shown exact. Instants are shown in the person's chosen time zone,
+  by the formatter the rest of the workbench uses. In delivery the pinned row holds the view's delivered,
+  remaining and total lines, in that order.
+- The ticket view (`web/src/deal-ticket.ts`) draws the trade strip (state,
+  trade fields, delivered count, status and the model's notices), one card per
+  side whose common band rows share one row grid, the Add side card, the
+  schedule panel and the footer. A side is named by its kind's pill and code;
+  no description declares a side name field yet. Below a container width of
+  640px the cards stack and side chips select a side. Booked mode shows Amend
+  and Close out disabled with the backend's reasons.
+
+- Quantities and amounts carry the side's direction: delivered gas and paid
+  cash are negative. Clients show them as reported and never re-sign them or
+  take absolute values. Prices are not signed.
+- A numeric cell is an exact decimal, or an exact `a/b` ratio when the value
+  has no exact decimal at the working scale (a fuel-linked delivery, for
+  example). `trade.payment_at` is an ISO-8601 UTC instant. A blank cell means
+  the level has no value there; it is never zero.
+- When a view cannot be built, the result keeps its valuation and sides, with
+  `schedule: null`, `summaries: null` and `scheduleRefusal: {code, message}`;
+  for example, physical sides on different gas-day clocks.
+- `summaries[].againstMarket` is not defined yet and is always null, so no
+  "vs market" line is drawn.
+- Units are reference data. A description field or column names the unit it
+  is in by kind, never by symbol: `quantity` is the trade's quantity unit. The
+  preview and the booked read return `quantityUnit`, the symbol of the one
+  quantity specification every side's gas path is quoted in. Sides quoted in
+  different specifications refuse with `gas_composition_input`; a
+  specification without a unit refuses with `ambiguous_reference`. The ticket
+  shows the unit its latest preview resolved beside quantities and in the
+  schedule headers, and none before a preview.
+- The description reads its side caps from the composition contract
+  (`GasCompositionInstrument`): one to four physical sides, and up to four
+  fixed cash, fee and indexed payment sides together.
+- Current gas limits: a started delivery is refused at booking (an in-term
+  trade is loaded by an administrator and shows its delivered days in the
+  schedule), up to 1200 operating days with exact monthly source coverage, and
+  fixed-offset gas-day clocks.
+- The preview and the booked read (`trade`) return `schedule`, `summaries`,
+  `scheduleRefusal` and `quantityUnit` at the top level. The composition
+  editor read (`gas/composition/editor`) nests them under `valuation`, beside
+  `terms`.
+- The ticket operations are `POST /api/tickets/description`, `choices`,
+  `lookup`, `preview`, `book`, `status` and `trade`. Each runs the gas operation
+  it delegates to, with that operation's permission and context handling; booking
+  in a historical context refuses with `historical_read_only`.
+- A choices or lookup request names a side by its code (`null` for a trade
+  field) and a field by its description id. Catalog choices come from the gas
+  catalog under the request's context and need their parent values: a zone
+  needs its side's pipeline, a point its zone, a usage tariff a delivery-stage
+  fee whose source side has a valued path and delivery term. A side answer
+  refuses (`ticket_input`) when the draft's `gas_setup` is not the one the
+  context resolves; `gas_setup` is empty where the context resolves none.
+  Preview and booking are held to the same setup, naming the `gas_setup`
+  field: a draft priced under a setup since superseded, or under none where
+  one resolves, neither previews nor books, while a retried booking still
+  receives its first outcome. A
+  setup has no name, so its choice is labelled by its publication order
+  (`Published setup <n>`).
+- Party choices are `<id>@<revision>`. `market_price` is the single price the
+  side's schedule shows at the read's frame, labelled `"<point> · close <date>"`;
+  `eligible_tariff` (on `fee_tariff`) proposes the code of the one tariff
+  eligible for a delivery-stage fee without a manual price; the booking resolves
+  and pins the rate. No lookup fills a price field. A lookup that cannot resolve
+  refuses with `ticket_lookup`.
+- Party and book choices are trading records read under the request's bound
+  context, so a historical context lists the revisions it knows.
+- Booking takes working data only: a selected historical context, retained
+  knowledge or a captured `contextId` refuses with `historical_read_only`, and
+  another convention refuses.
+- `trade` opens a booked gas trade by trade, binding and revision as a draft
+  (refusing `ticket_input` when that draft does not map back to exactly the
+  stored terms), with `schedule`, `summaries`, `scheduleRefusal`,
+  `quantityUnit`, `links`, `definitionRevisionId` and `quantityPolicy` at the top level.
+  `actions.amend` reports the future composition replacement rule; close-out
+  remains unavailable with a reason. `actions.record` says whether the
+  person may record day quantities here, by the record operation's own rule: a
+  composed trade, on working data, to a role the trading authority lets amend
+  trades, else not allowed with that rule's reason. A composed trade opens as
+  the draft that booked it.
+- `amend-preview` and `amend` accept the exact selected trade/binding/revision,
+  retained definition revision, reason and explicit
+  `future_gas_composition_replace_v1` policy alongside the draft and working
+  context. Save adds its operation ID. Both original and replacement delivery
+  terms must be wholly future; legacy single-point trades and trades with daily
+  quantity or facility references refuse. Changed terms append an immutable
+  revision and new owned physical occurrences. Original booking facts remain
+  intact. Unchanged terms return `unchanged:true` without a business revision or
+  publication. The original request ID recovers its first outcome after later
+  amendments. The main-window Blotter opens this mode through Amend and follows
+  the saved revision; pending requests retain Check/Retry even when metadata
+  cannot load. Other trade windows inspect gas read-only.
+- There is one gas ticket. A single-point trade opens as the composition of one
+  physical side it is: `physical-1` with its retained path, term, direction,
+  quantity and basis; `cash-1`, paid by the side that receives the gas; and,
+  with a fee, `fee-1` with its own direction and its price or tariff. The
+  single-point profile charges both on the side's contractual delivery
+  quantity, so each takes the `delivery` stage, and pays them at its one
+  payment instant. Every side is a whole membership of the booked quantity. The
+  schedule is built by the composition's own view assembly from the trade's
+  retained programs, so it equals the preview of that draft exactly. A fee
+  direction without a fee, a fee with both a price and a tariff, or a direction
+  other than receive or deliver refuses with `ticket_input`. Single-point trades
+  record no daily quantities: `quantityPolicy` is null, `actions.record` is not
+  allowed, and their day cells are not entries.
+- A refusal of one draft value names it: the error body adds `side` (null for a
+  trade field) and `field`. Missing, blank, unknown and non-editable values, a
+  decimal field that is not a plain decimal, a quantity against the link rule
+  and a source naming no physical side are named this way.
+- The ticket controller (`web/src/ticket-controller.ts`) opens a new ticket with
+  each side kind's initial count from the description: one physical and one
+  payment side for gas. After an edit it reads
+  the choices of the fields that depend on it and of the lists that refused;
+  adding or removing a side, or editing a trade field, reads every list.
+  Removed sides and closed tickets start no queued reads. Cancelled reads are
+  not backend refusals. A
+  side is coded `<kind>-<n>` with the lowest number not yet used in the
+  ticket, so a removed side's code is never given to a later side; removing a
+  side clears every choice that named it, and that choice's dependents, each
+  with a notice. Once
+  edits settle (300 ms) it previews the whole draft and reads every lookup
+  again; a lookup that fills a term previews the draft in turn. Field reads
+  dispatch one at a time, with at most one separate current preview. Replaced
+  choice reads and superseded previews/lookups are cancelled, and closing the
+  ticket cancels its reads. Queued fields start their transport deadline only
+  when dispatched. Late answers remain subject to generation and draft checks,
+  including returning to the same draft after an intervening edit. Booking and
+  quantity-write reconciliation are not cancelled with reads. Only the latest
+  preview is drawn. A refused preview keeps the last schedule, marked stale,
+  with the reason on the field the refusal names; lookup and choice refusals
+  show on their fields. A side added since the last preview is left out of the
+  grid until a preview holds it. Book is taken only for the draft last previewed
+  without refusal, and sends `tickets/book` as a retained request: an unknown
+  outcome locks the ticket with Check and Retry, and survives a reload, where
+  the Blotter offers to reconcile it.
+- A booked trade's schedule shows each physical day's quantity under the
+  operations projection (`operational_projection_v1`, returned as
+  `quantityPolicy`): the day's latest allocated, scheduled, confirmed or
+  nominated record, tagged with its kind, else the contract's. Amounts stay the
+  contract's; a recorded quantity does not revalue the trade. The amount's
+  sources are the evaluated contract's (`contract` with its price's), so on a
+  recorded day the grid tags the quantity with the record's kind and the amount
+  as Contract, and quantity times price need not equal the amount.
+  An ended gas day (see Ended gas days above) is the exception: it has no amount,
+  and its quantity, recorded or contractual, also carries the Delivered tag.
+- The native ticket contract may describe day-entry capabilities, but Blotter
+  and separate trade windows mount booked tickets read-only. Side schedules
+  contains schedule inspection only. Daily quantity entry, current source-head
+  review and retained-command recovery belong in **Scheduling → Physical
+  operations → Delivery**. The native `gas/quantities` operations retain
+  their explicit revision, kind, status, evidence and historical-write checks.
+- The preview and the booked read return `links`: for each linked physical
+  side its source, target, formula, fraction and the receipt, delivery and fuel
+  totals as exact text. The Quantity links tab draws them.
+- The controller draws the ticket again only when what it shows has changed, so
+  an answer that changes nothing keeps the person's place in the schedule.
+  Late labels for editable fields update in place, preserving their value and focus. The read-only Quantity links grid still redraws when
+  its formula labels change.
+  The page's busy sweep, which disables and re-enables every control, leaves the
+  ticket's controls as the ticket drew them (`data-own-controls`), so a read-only,
+  refused or coming-soon control never becomes enabled.
+- Not yet: tree rows load with their view rather than on demand; a quantity
+  command awaiting its outcome is kept while the page is open, not across a
+  reload; the billing selection and the revision history of day quantities are
+  not drawn; the trade date
+  lookup is declared but not served; a usage tariff list read earlier is not
+  read again when its source side's path changes (the booking still checks it).
+
+## Dependencies and order
+
+1. The [Blotter workbench](blotter-workbench.md) merges first. The ticket builds
+   on its grid wrapper and appears in its Details pane.
+2. The shared trading workflow admits physical gas (pull request 152, "Unify
+   physical gas and existing instruments in the shared trading workflow")
+   before the physical gas move, so booked gas trades open from the Blotter
+   like every other product. The gas move is planned against that workflow.
+3. Products whose sides are moving to the D253 model describe the model that is
+   implemented when they move. Where D253 is not yet qualified for a product,
+   the description follows that product's current booking contract, and
+   changes when D253 lands.
+4. Before each product moves, the owner supplies its coming-soon field
+   inventory: the fields the product needs beyond what today's screens
+   capture, each with its business meaning and hover text, written in this
+   project's own words. Physical gas starts from
+   [physical gas terms](physical-gas-field-contract.md). A product with no
+   inventory yet moves with only its supported fields.
+5. Build order: the description contract and table widget; then physical gas
+   (the richest current product); then swaps and heat rates; then PPAs.
+
+## Verification
+
+- Behaviour tests first for each piece (TDD): description validity, field
+  states, dependent drop-down clearing, lookup chips and their removal on edit,
+  coming-soon omission from requests, late preview responses discarded, and
+  each product's booking unchanged through the ticket.
+- A check that each description agrees with its booking contract.
+- Browser checks for each product: enter, preview, book, reopen, and each mode
+  the product offers; wide and narrow panes.
+- Independent adversarial review before publication (temporal context on
+  lookups and drop-downs, async preview ordering).
+
+## Left to the builder
+
+- The description's schema, transport and versioning.
+- Colours for side kinds within the existing theme tokens.
+- Debounce timing for live preview.
+- Narrow and wide breakpoints of the container.
+- How many rows of a level load at a time.
+
+## Decisions to record
+
+Recorded as D278 (deal ticket), D279 (field states), D280 (schedule panel) and
+D281 (one gas ticket).
+
+- **Deal ticket.** One description-driven ticket draws every sided product for
+  new, booked, amend and close-out; product editors are removed as products
+  move.
+- **Field states.** Editable, looked up, derived, information and coming soon,
+  with the rules above; coming-soon fields are never sent.
+- **Schedule panel.** Joint Instrument schedule first, a tab per side, flow and
+  cargo row shapes, backend-reported value sources.
+
+### Independent PPA sides and reference selection (D286)
+
+New PPA tickets offer **Build from sides**, initially empty, with plus controls
+for Power, REC, Capacity, Fixed price, Index price and Fee sides. REC price
+and Capacity price identify the corresponding priced terms. Direction is selected
+separately on each side. Each side selects its quantity source and payment convention.
+A linked payment selects its delivery sides explicitly; a referenced side cannot
+be removed until those links change. Native presets remain explicit choices for
+their existing pricing workflows. Saved amendments retain their original
+composition version and exact quantity relationships.
+
+The composed contract uses two to eight sides. Shared normalization assets are
+required for volume/accredited quantities, and every such side must use the full
+selected set. A capacity side requires whole operating months for the binding.
+REC sides still consume generation sources with explicit conversion and holding
+policies. The ticket disables break-even for compositions that are not qualified
+for that operation.
+
+Crude uses separate commodity, grade, facility, custody point, volume
+specification, valuation curve and clock selectors. Their options come from the
+current authorized catalog's exact configured assignment tuples. Clear reference
+selections starts another combination; the ticket never picks an assignment from
+an incomplete or ambiguous selection. Grade, locations, volume specifications
+and valuation assignments are separately configured versioned objects.
+
+Datetime inputs and displayed instants use the timezone in user preferences;
+UTC is available there. Delivery clocks and operating-date fields remain
+contractual terms. A display-zone change keeps the ticket and resolved instants,
+invalidates the draft review, and preserves an unconfirmed command's exact UTC
+payload. A repeated local hour requires an offset selection; a nonexistent local
+time refuses. Operational crude ledgers and invoice due dates follow the same
+presentation timezone.
+
+Local verification: 1,164 frontend checks, 656 managed core checks and the API
+checks pass. Disposable-database qualification includes the legacy PPA numerical,
+revision and authorization suites, the composed four-side oracle and capacity
+shock, 53 PPA browser checks and 46 crude lifecycle browser checks. Separate
+local smoke tests book and reopen both products and switch Chicago/UTC in entry,
+the common Blotter and retained detail. Independent review covered version
+admission, direct-write parity, normalization, ordered links, current authority,
+async responses and pending-command recovery. This is bounded local evidence,
+not production activation.
+
+## Facility allocation plan on a booked physical Side
+
+A booked gas Side with a [facility allocation](facility-quantity-ledger.md) shows a
+read-only delivery-day track in Physical operations → Delivery → After flow,
+including when post-delivery contractual PV is unavailable. It projects the Side's own planned
+quantity and unit from the shared facility ledger, with explicit removal/null
+state. It does not expose shared pool totals, residuals, other counterparties or
+source/plan head identifiers. Changing another target's allocation alone does not
+change this response. This operational plan stays separate from direct daily
+quantity inputs and contractual billing/valuation.
+
+## Aligned side entry
+
+Native swap, scheduled swap, PPA, crude and LNG entry cards use shared comparison
+rows for direction, dates, quantity, pricing and payment terms. Matching dated
+periods in scheduled swaps align across sides even when their contract ranges
+differ. The existing described gas ticket retains its common field bands.
+Wide panels place sides alongside each other; panels narrower than 600 pixels
+stack native cards, preserving their controls and entries. Additional sides can
+scroll horizontally without compressing their fields.
+
+### Explicit schedule calendars (D403)
+
+Each Side has one versioned calendar policy with separate delivery,
+observation/reset and payment bindings. Applicable purposes require an exact
+published calendar even for all-days observations or unadjusted payments.
+Inapplicable purposes are recorded explicitly. All periods of a purpose share
+that binding; independent Sides keep their own policies.
+
+“Use one calendar for all applicable schedules” copies an explicitly selected
+calendar into the applicable bindings. There is no automatic first selection.
+The controls show differing versions and expose coverage, weekend rules and dated
+open/closed exceptions. Selecting a published product locks its contractual
+calendar and clock. Linked quantity schedules and published fixing events retain
+their source terms; a consuming Side cannot override them.
+
+Changing a calendar, product, clock, rule or payment term invalidates dependent
+qualification and preview evidence. An unavailable version remains visible and
+requires repair under the selected context. Missing or conflicting bindings are
+refused by the same managed operations used by agents and the browser.
+
+Standard payments display the contractual UTC date without converting it to the
+user's zone. Actual invoices, payments and publication events still display their
+instants in that zone. Same-day unpaid cash remains valued; it becomes overdue
+on the next UTC date. Stored incompatible contracts require reviewed migration
+of their terms, exact relationships, identities and retained programs before
+execution under the single supported contract.
+
+Booking is an open form. All supported instrument types are discoverable before
+ownership or counterparties are entered. Instrument terms precede ownership and
+parties, with prerequisite market and reference selectors ahead of dependent
+inputs. Described gas tickets keep their pricing setup above the sides and order
+side details by their declared field dependencies. Required choices, validation,
+authorization and protection of pending submissions still apply.
+
+## Indexed consideration and refreshed entry fields
+
+D350 adds **Index payment**, an independent existing FloatingSide linked to one
+physical Side's quantity/stage. Its selected index has exact daily published
+fixing definitions. Its forecast curve is independently selected from eligible
+published whole-interval outputs; a stitched daily/monthly output is eligible
+when it covers the selected term and matches units. An explicit additional trade
+spread is separate from basis already embedded in the curve. Payment day 1–28
+means that UTC day in the following month, without a holiday adjustment.
+
+The future-delivery composition reports physical market value plus signed
+consideration, rather than gross unpaid cash alone. Equal forecasts with zero
+additional spread offset. Started delivery and the separate paid/unpaid cash
+lifecycle are not admitted by this profile.
+
+D351 shares dependency refresh and choice reconciliation across described tickets.
+A valid manual selection survives a parent refresh, a prior suggestion follows
+its new source, and the backend can supply a sole eligible required choice or
+labelled starting value. Optional quantity links stay empty. Entry suggestions
+include native quantity, first available future delivery dates, zero additional
+index spread, monthly payment day and a quote-precision market price for blank
+fixed consideration. Each is visible and editable. Existing valid terms and
+explicit clears survive refreshes; imports and pricing still require explicit
+terms. A selected curve is filtered by coverage and units; the current picker
+does not impose an additional location whitelist.

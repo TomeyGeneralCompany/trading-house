@@ -1,0 +1,71 @@
+import {createServer} from 'node:http';
+import {readFile,mkdtemp,rm,access} from 'node:fs/promises';
+import {spawn} from 'node:child_process';
+import {tmpdir} from 'node:os';
+import {join,resolve,extname} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {waitForBrowserPage,stopOwnedBrowserGroup,connect} from '../../tests/browser/owned-browser.mjs';
+
+const browser=process.env.CHROME_BIN??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+// A browser test's limit covers the owned browser's 60 s startup deadline, so a slow start fails with that deadline's own reason
+// rather than as a test timeout.
+export const browserTestTimeout=90000;
+// What a page may take to load and draw its first frame: with the startup deadline it stays inside a test's limit, so a page that is
+// not ready fails with that reason.
+const pageReadyDeadline=20000;
+export const browserAvailable=await access(browser).then(()=>true,()=>false);
+
+// Presses a key in the page as a person does, by the `command` withBrowserPage hands its body. Enter carries its character, which is
+// what has the browser enter a text control's value.
+const keyCodes={Enter:13,Tab:9};
+export async function pressKey(command,key){
+ if(!(key in keyCodes))throw Error(`No key code is listed for ${key}.`);
+ for(const type of ['keyDown','keyUp'])await command('Input.dispatchKeyEvent',{type,key,code:key,windowsVirtualKeyCode:keyCodes[key],...type==='keyDown'&&key==='Enter'?{text:'\r'}:{}});
+}
+
+// A disposable headless browser and a static server of web/dist draw `page`; `body` evaluates expressions in it.
+// No application runtime, account or database is attached.
+export async function withBrowserPage(page,body){
+ // The profile is made before anything that has to be closed, so a call that cannot make it leaves nothing open.
+ const directory=await mkdtemp(join(tmpdir(),'openetrm-page-'));
+ const root=fileURLToPath(new URL('../dist/',import.meta.url));
+ const server=createServer(async(req,res)=>{
+  try{
+   if(req.url==='/'){res.setHeader('Content-Type','text/html; charset=utf-8');res.end(page);return;}
+   const file=resolve(root,'.'+new URL(req.url,'http://localhost').pathname);
+   if(!file.startsWith(root)){res.writeHead(404).end();return;}
+   res.setHeader('Content-Type',extname(file)==='.js'?'text/javascript':extname(file)==='.css'?'text/css':'application/octet-stream');res.end(await readFile(file));
+  }catch{res.writeHead(404).end();}
+ });
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ const chrome=spawn(browser,['--headless=new','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${directory}`,'about:blank'],{stdio:'ignore',detached:true});
+ let ws,failure;
+ try{
+  ws=new WebSocket(await waitForBrowserPage(directory,chrome));
+  // The connection bounds its opening and each command, so a browser that stops answering fails the test with that reason and the
+  // cleanup below still runs. This page's uncaught exceptions are not collected.
+  const {command,evaluate}=await connect(ws);
+  await command('Page.enable');
+  await command('Emulation.setFocusEmulationEnabled',{enabled:true});
+  const address=`http://127.0.0.1:${server.address().port}/`;
+  await command('Page.navigate',{url:address});
+  // The body starts on a page that has loaded, its stylesheets included, and drawn a frame. A stylesheet still arriving moves what the
+  // body has measured when it lands, and nothing a frame drives happens before the first one, which a busy machine draws late.
+  const loaded=`location.href===${JSON.stringify(address)}&&document.readyState==='complete'`,until=performance.now()+pageReadyDeadline;
+  while(!await evaluate(loaded)){
+   if(performance.now()>until)throw Error('The test page did not finish loading.');
+   await new Promise(r=>setTimeout(r,20));
+  }
+  if(!await evaluate(`new Promise(resolve=>{requestAnimationFrame(()=>resolve(true));setTimeout(()=>resolve(false),${Math.max(0,Math.round(until-performance.now()))});})`))
+   throw Error('The test page did not draw a frame.');
+  await body(evaluate,command);
+ }catch(error){failure=error;throw error;}
+ finally{
+  ws?.close();
+  // A cleanup failure is reported beside the test's own failure, never in its place. A browser that cannot be confirmed stopped
+  // keeps its profile. The server closes either way, so it does not keep the test file's process alive.
+  try{await stopOwnedBrowserGroup(chrome);await rm(directory,{recursive:true,force:true});}
+  catch(error){throw failure?new AggregateError([failure,error],'The browser test failed, and so did its cleanup.',{cause:failure}):error;}
+  finally{await new Promise(r=>server.close(r));}
+ }
+}

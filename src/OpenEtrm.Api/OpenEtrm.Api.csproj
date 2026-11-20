@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../OpenEtrm.Automation/OpenEtrm.Automation.csproj" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <ProjectReference Include="../OpenEtrm.MarketData/OpenEtrm.MarketData.csproj" />
+    <ProjectReference Include="../OpenEtrm.Shared/OpenEtrm.Shared.csproj" />
+    <ProjectReference Include="../OpenEtrm.Rates/OpenEtrm.Rates.csproj" />
+  </ItemGroup>
+</Project>

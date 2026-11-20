@@ -1,0 +1,1909 @@
+#!/usr/bin/env python3
+"""Run a disposable, loopback-only synthetic workbench. Never uses an existing DB."""
+import argparse
+import json
+import os
+from pathlib import Path
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+from urllib.request import urlopen
+from uuid import uuid4
+from preview_fixture import fixture
+from owned_process import stop_owned_group
+from preview_diagnostics import print_failure_identifiers
+
+ROOT = Path(__file__).resolve().parents[1]
+# The sessions of the 64 a scope keeps that this process leaves free once the page-assistant checks have run: the
+# browser checks' own and later suites'.
+SESSION_MARGIN = 10
+
+
+def main():
+    from check_standalone import main as check_standalone
+    check_standalone()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--ephemeral-context-check',action='store_true',help='Qualify runtime contexts, historical reads and worker reconstruction')
+    parser.add_argument('--async-workbench-check',action='store_true',help='Qualify concurrent main-workbench SSE reads')
+    parser.add_argument('--page-read-benchmark',action='store_true',help='Time covered page reads over ordinary HTTP and the response channel in the async workbench fixture and print a JSON report')
+    parser.add_argument('--side-calendar-check', action='store_true', help='Qualify explicit Side calendar authoring, retention and replay')
+    parser.add_argument('--parametric-risk-check',action='store_true',help='Qualify retained parametric VaR/ES with aligned dated-factor history')
+    parser.add_argument('--monte-carlo-risk-check',action='store_true',help='Qualify full-PV Monte Carlo, seeded replay and retained custody')
+    parser.add_argument('--historical-risk-check',action='store_true',help='Qualify retained full-PV historical simulation and exact empirical VaR/ES')
+    parser.add_argument('--factor-history-check',action='store_true',help='Qualify aligned dated-factor history under the retained risk context')
+    parser.add_argument('--unified-trading-check',action='store_true',help='Verify the common trading workflow across futures, swaps, PPAs and gas')
+    parser.add_argument('--with-gas-basis-demo',action='store_true',help='Seed an owned pipeline-gas basis, history and facility allocation example')
+    parser.add_argument('--gas-basis-demo-check',action='store_true',help='Qualify the complete synthetic gas basis and final allocation example')
+    parser.add_argument('--with-gas-quantity-dates',action='store_true',help='Include synthetic January working frames for daily gas quantity exploration')
+    parser.add_argument('--gas-quantity-benchmark',action='store_true',help='Measure owned daily gas quantity grids with authorized revision history')
+    parser.add_argument('--with-gas-operations-demo',action='store_true',help='Seed the synthetic basis example plus manual scheduling and imbalance records')
+    parser.add_argument('--gas-operations-check',action='store_true',help='Qualify manual gas requests, acknowledgments and imbalance transfers')
+    parser.add_argument('--gas-billing-check',action='store_true',help='Qualify final daily gas cash and retained corrections')
+    parser.add_argument('--gas-daily-quantity-check',action='store_true',help='Qualify daily trade-owned quantities, temporal selection and corrections')
+    parser.add_argument('--facility-quantity-check',action='store_true',help='Qualify shared facility quantity storage and explicit gas allocations')
+    parser.add_argument('--gas-composition-check',action='store_true',help='Qualify multiple gas sides and explicit quantity links')
+    parser.add_argument('--gas-amendments-check',action='store_true',help='Qualify retained physical gas trade amendments')
+    parser.add_argument('--gas-indexed-check',action='store_true',help='Qualify separate physical and daily indexed payment Sides')
+    parser.add_argument('--gas-in-term-check',action='store_true',help='Qualify in-term gas admission, recorded payments and the administrator in-term load')
+    parser.add_argument('--deal-ticket-check',action='store_true',help='Qualify the deal ticket schedule view of composed gas trades')
+    parser.add_argument('--crude-setup-check',action='store_true',help='Qualify exact crude delivery-to-market bindings')
+    parser.add_argument('--gas-setup-check',action='store_true',help='Qualify versioned gas setup authoring and trade pins')
+    parser.add_argument('--crude-lifecycle-check',action='store_true',help='Qualify crude receipts, inventory disposition and delivery-to-cash operations')
+    parser.add_argument('--physical-crude-check',action='store_true',help='Qualify native fixed-volume crude booking and retained execution')
+    parser.add_argument('--lng-cargo-check',action='store_true',help='Qualify native LNG cargo booking, exact references and saved Incoterms')
+    parser.add_argument('--physical-gas-check',action='store_true',help='Qualify physical gas preview, durable schedules and booking UI operations')
+    parser.add_argument('--demo-instruments-check',action='store_true',help='Verify mixed synthetic PPA and heat-rate bookings, blotter and risk')
+    parser.add_argument('--pg-bin', type=Path, required=True, help='Installed stock PostgreSQL 18 binaries')
+    parser.add_argument('--dotnet', type=Path, required=True, help='Installed .NET SDK matching global.json')
+    parser.add_argument('--port', type=int, default=0, help='Loopback HTTP port; 0 chooses an unused port')
+    parser.add_argument('--no-build', action='store_true', help='Use already-built assets')
+    parser.add_argument('--check', action='store_true', help='Run HTTP integration checks, then clean up')
+    parser.add_argument('--structured-power-check',action='store_true',help='Qualify saved operating facilities and supplied-plan power previews in an owned database')
+    parser.add_argument('--power-actual-check',action='store_true',help='Qualify exact collected-price interval settlement sources')
+    parser.add_argument('--interval-series-check',action='store_true',help='Qualify audited interval series storage and API')
+    parser.add_argument('--close-risk-lease-check',action='store_true',help='Qualify renewable risk ownership, real long completion and recovery faults')
+    parser.add_argument('--close-risk-check',action='store_true',help='Qualify read-only existing-close PPA risk with actual fenced workers')
+    parser.add_argument('--ppa-bookings-check',action='store_true',help='Qualify durable PPA bookings and bounded HTTP valuation')
+    parser.add_argument('--ppa-http-benchmark',action='store_true',help='Also measure owned twenty-year hourly and ten-year quarter-hour PPA HTTP previews')
+    parser.add_argument('--settlement-quarter-check',action='store_true',help='Qualify one full quarter-hour gross preview in a fresh owned context budget')
+    parser.add_argument('--with-ppa',action='store_true',help='Load synthetic PPA references and pricing inputs for interactive exploration')
+    parser.add_argument('--ppa-check',action='store_true',help='Qualify isolated PPA quantity, normalization and location-reference consumers')
+    parser.add_argument('--interval-curves-check',action='store_true',help='Qualify interval curves, shaping and resolution: storage, API and, with --browser-check, the screen')
+    parser.add_argument('--interval-series-benchmark',action='store_true',help='Measure twenty-year interval series workloads in an owned fixture and print a JSON report')
+    parser.add_argument('--blotter-stream-benchmark',action='store_true',help='Time the streamed Blotter against trading/workspace in the seeded standard example, then with one twenty-year hourly PPA, and write a JSON report to --output')
+    parser.add_argument('--output',type=Path,help='The JSON report file of --blotter-stream-benchmark, outside the repository')
+    parser.add_argument('--usage-benchmark',action='store_true',help='Measure a year of page-assistant usage at a stated volume in an owned fixture and print a JSON report')
+    parser.add_argument('--index-fixing-check',action='store_true',help='Qualify published monthly and partially fixed daily index observations')
+    parser.add_argument('--contract-dates-check',action='store_true',help='Qualify the shared contract-date library')
+    parser.add_argument('--regional-closes-check',action='store_true',help='Qualify D334 regional close sessions, grants and the close in force')
+    parser.add_argument('--curve-eligibility-check',action='store_true',help='Qualify fresh live outputs and retained frozen dependencies in an owned fixture')
+    parser.add_argument('--pilot-close-check',action='store_true',help='Qualify explicitly generated pilot closes in an owned fixture')
+    parser.add_argument('--swap-risk-holdings-check',action='store_true',help='Qualify stored swap risk materialization in an owned fixture')
+    parser.add_argument('--close-out-drafts-check',action='store_true',help='Qualify Blotter close-out drafts of futures and swaps, settled periods and refusals in an owned fixture')
+    parser.add_argument('--side-observation-check',action='store_true',help='Qualify exact side observation schedules through draft and retained booking operations')
+    parser.add_argument('--live-calculation-check',action='store_true',help='Qualify committed live contexts and browser updates')
+    parser.add_argument('--connected-portfolio-check',action='store_true',help='Qualify published custom curves in booked portfolio risk and jobs')
+    parser.add_argument('--risk-jobs-check',action='store_true',help='Qualify nested risk and durable worker execution in a disposable database')
+    parser.add_argument('--factor-swap-check',action='store_true',help='Qualify typed contractual factors and cross-commodity scheduled swaps in an owned fixture')
+    parser.add_argument('--scheduled-swap-check',action='store_true',help='Qualify explicit recurring financial swap quantity schedules')
+    parser.add_argument('--lifecycle-swap-browser-check',action='store_true',help='Qualify shared swap lifecycle forms, exact recovery and current valuation invalidation in the real browser')
+    parser.add_argument('--retained-schedule-check',action='store_true',help='Qualify staged graphs and shared Side reuse across reverse effective boundaries')
+    parser.add_argument('--draft-check',action='store_true',help='Qualify temporary deal pricing and exposure')
+    parser.add_argument('--hosted-check',action='store_true',help='Qualify local credential persistence in an owned database')
+    parser.add_argument('--historical-pool-check',action='store_true',help='Farm out synthetic historical settlement scenarios across two actual managed workers')
+    parser.add_argument('--jobs-check',action='store_true',help='Qualify owned jobs and the shared infrastructure screen')
+    parser.add_argument('--reference-import-check',action='store_true',help='Qualify private inactive reference intake in an owned database')
+    parser.add_argument('--reference-demo-check',action='store_true',help='Qualify additive demo references and cross-version discounted swaps')
+    parser.add_argument('--reference-check',action='store_true',help='Qualify reference metadata authoring and reviewed display activation')
+    parser.add_argument('--booking-check',action='store_true',help='Qualify backend-owned immutable trade booking facts')
+    parser.add_argument('--unit-check', action='store_true', help='Run amount/unit integration checks in the owned standard fixture')
+    parser.add_argument('--execution-check',action='store_true',help='Qualify standard futures execution policies in an owned synthetic fixture')
+    parser.add_argument('--power-flat-check',action='store_true',help='Qualify flat forward power interval graphs in an owned fixture')
+    parser.add_argument('--power-context-check',action='store_true',help='Qualify exact non-primary power inputs and historical close admission')
+    parser.add_argument('--power-booked-roll-check',action='store_true',help='Qualify booked power and the in-term close-roll consumer in an owned fixture')
+    parser.add_argument('--custom-curves-check',action='store_true',help='Qualify custom curve definitions and calculations in an owned synthetic fixture')
+    parser.add_argument('--contract-observation-curve-check',action='store_true',help='Qualify stored contract observation terms and the synthetic crude formula curve in an owned synthetic fixture')
+    parser.add_argument('--price-authoring-check',action='store_true',help='Qualify publication schedules, final releases and contract price terms through authenticated HTTP')
+    parser.add_argument('--market-read-check',action='store_true',help='Qualify per-row market authority in the owned standard fixture')
+    parser.add_argument('--market-dates-check',action='store_true',help='Qualify scoped market-close availability and the calendar in an owned fixture')
+    parser.add_argument('--market-dates-reads-check',action='store_true',help='Measure calendar statement scaling and qualify gate release and authority expiry')
+    parser.add_argument('--market-dates-benchmark-only',action='store_true',help='Measure the identical calendar workload on a baseline reader; does not qualify scaling or disclosure')
+    parser.add_argument('--context-read-check',action='store_true',help='Qualify bounded historical context, close calendar and header recovery')
+    parser.add_argument('--valuation-status-check',action='store_true',help='Qualify Blotter reads and risk runs at closes that cannot value every seeded position')
+    parser.add_argument('--desk-fields-check',action='store_true',help='Qualify the commodity, swap direction and mark minus price of Blotter rows, commodity pivots, and the desk\'s summary groupings and curve shapes, in the seeded standard example')
+    parser.add_argument('--with-custom-curves',action='store_true',help='Load synthetic monthly and daily NG panels for the custom curve editor')
+    parser.add_argument('--exchange-check',action='store_true',help='Qualify the independent exchange futures dataset')
+    parser.add_argument('--cash-pnl-check',action='store_true',help='Qualify currency cash and two-close P&L in an owned exchange fixture')
+    parser.add_argument('--with-exchange',action='store_true',help='Publish the independent exchange futures dataset in this newly owned database')
+    parser.add_argument('--party-check', action='store_true', help='Run party-editor integration checks in an owned fixture')
+    parser.add_argument('--identity-check', action='store_true', help='Run economic-key integration checks in the owned standard fixture, then clean up')
+    parser.add_argument('--provider-adapters-check',action='store_true',help='Qualify additional provider routing and billing through HTTP Test in an owned fixture')
+    parser.add_argument('--assistant-browser-check',action='store_true',help='Run assistant settings and panel browser regressions with an owned provider fixture; requires --browser')
+    parser.add_argument('--assistant-runtime-check',action='store_true',help='Run assistant turn, tool, stream and usage regressions without provider-administration scenarios')
+    parser.add_argument('--physical-assistant-check',action='store_true',help='Qualify contextual physical assistant reads and approved native writes in an owned fixture')
+    parser.add_argument('--assistant-workspace-check',action='store_true',help='Qualify page operations, user-approved proposals and delegated page prompts in an owned fixture')
+    parser.add_argument('--assistant-check',action='store_true',help='Qualify page-assistant provider, model and price administration in an owned fixture')
+    parser.add_argument('--blotter-loading-check',action='store_true',help='Run owned Blotter progress, cancellation and admission browser checks')
+    parser.add_argument('--markets-desk-check',action='store_true',help='Run market and delivery desk browser checks in the owned standard fixture')
+    parser.add_argument('--browser-check',action='store_true',help='Run checked-in browser scenarios in the newly owned standard fixture')
+    parser.add_argument('--browser',type=Path,help='Installed Chromium-compatible executable; used only with --browser-check')
+    parser.add_argument('--authoring-browser-suite',choices=['curve-objects','contract-pricing-controls','publication-controls','price-authoring-recovery'],help='Run one focused authoring control suite in the owned authoring fixture')
+    parser.add_argument('--example', choices=['standard','mixed-gas'], default='standard', help='Explicit synthetic dataset')
+    args = parser.parse_args()
+    if args.ephemeral_context_check: args.check=True
+    if args.historical_pool_check: args.jobs_check=True
+    if args.market_dates_benchmark_only:args.market_dates_reads_check=True
+    if args.market_dates_reads_check:args.market_dates_check=True
+    if args.structured_power_check:
+        args.check=True
+        if args.example!='standard':parser.error('--structured-power-check requires the standard fixture')
+    # The benchmark reads the fixture the asynchronous workbench check owns.
+    if args.page_read_benchmark:args.async_workbench_check=True
+    if args.async_workbench_check:
+        args.check=True
+        if args.example!='standard':parser.error('--async-workbench-check requires the standard fixture')
+    if args.assistant_browser_check:args.browser_check=True
+    if args.physical_assistant_check or args.assistant_workspace_check or args.assistant_runtime_check or args.assistant_browser_check:
+        args.check=True
+        if args.example!='standard':parser.error('Assistant checks require the standard fixture')
+    if args.blotter_loading_check:
+        args.check=True
+        args.browser_check=True
+    if args.markets_desk_check:
+        if any(value for name,value in vars(args).items() if name.endswith(('_check','_benchmark')) and name not in ('markets_desk_check','browser_check')):
+            parser.error('--markets-desk-check runs alone; omit other named checks and benchmarks')
+        args.check=True
+        args.browser_check=True
+    if args.curve_eligibility_check:
+        args.check=True
+        if args.example!='standard' or args.browser_check:
+            parser.error('--curve-eligibility-check requires the standard fixture without browser checks')
+    if args.reference_import_check:
+        args.check=True
+        if args.example!='standard' or args.browser_check:
+            parser.error('--reference-import-check requires the standard fixture without browser checks')
+    if args.settlement_quarter_check:
+        args.ppa_check = True
+    if args.close_risk_lease_check:
+        args.close_risk_check = True
+    if args.close_risk_check:
+        args.ppa_bookings_check = True
+    if args.ppa_http_benchmark:
+        args.ppa_bookings_check = True
+    if args.unified_trading_check:
+        args.demo_instruments_check=True;args.physical_gas_check=True;args.with_gas_quantity_dates=True
+    if args.crude_lifecycle_check or args.crude_setup_check: args.physical_crude_check=True
+    if args.gas_quantity_benchmark: args.gas_daily_quantity_check=True
+    if args.with_gas_operations_demo: args.with_gas_basis_demo=True
+    if args.gas_billing_check or args.gas_operations_check: args.physical_gas_check=True
+    if args.gas_setup_check or args.gas_composition_check or args.gas_amendments_check or args.gas_indexed_check or args.gas_in_term_check or args.deal_ticket_check or args.gas_daily_quantity_check or args.facility_quantity_check: args.physical_gas_check=True
+    if args.gas_in_term_check and args.gas_indexed_check: parser.error('--gas-in-term-check and --gas-indexed-check use different fixtures; run them separately')
+    if args.demo_instruments_check or args.gas_indexed_check or args.gas_in_term_check: args.check=True
+
+    if args.retained_schedule_check or args.physical_gas_check or args.physical_crude_check or args.lng_cargo_check: args.check=True
+    if args.gas_basis_demo_check: args.check=True
+    gas_demo=args.with_gas_basis_demo or args.gas_basis_demo_check or args.physical_assistant_check
+    if gas_demo and (args.example!='standard' or any(name.endswith('_check') and value and name not in ('gas_basis_demo_check','physical_assistant_check','browser_check') for name,value in vars(args).items()) or args.check and not (args.gas_basis_demo_check or args.physical_assistant_check) or args.with_ppa or args.with_exchange or args.with_custom_curves):
+        parser.error('Run the gas basis demo separately in the standard fixture; use --gas-basis-demo-check for verification')
+    if args.price_authoring_check: args.custom_curves_check=True
+    if args.authoring_browser_suite and not(args.browser_check and args.custom_curves_check):
+        parser.error('--authoring-browser-suite requires --custom-curves-check or --price-authoring-check, and --browser-check')
+    if args.lifecycle_swap_browser_check and not args.browser_check: parser.error('--lifecycle-swap-browser-check requires --browser-check and --browser')
+    fixing_frames=args.lifecycle_swap_browser_check or args.price_authoring_check or args.gas_operations_check or args.gas_billing_check or gas_demo or args.physical_crude_check or args.lng_cargo_check or args.crude_lifecycle_check or args.with_gas_quantity_dates or args.gas_amendments_check or args.gas_indexed_check or args.gas_daily_quantity_check or args.facility_quantity_check or args.factor_swap_check or args.scheduled_swap_check or args.index_fixing_check or args.swap_risk_holdings_check or args.side_observation_check or args.close_out_drafts_check
+
+    if args.blotter_stream_benchmark and (args.output is None or args.output.resolve().is_relative_to(ROOT)):
+        parser.error('--blotter-stream-benchmark requires an --output file outside the repository')
+    if args.interval_series_benchmark or args.usage_benchmark or args.blotter_stream_benchmark:
+        if args.example != 'standard' or args.interval_series_benchmark+args.usage_benchmark+args.blotter_stream_benchmark>1 or any(name.endswith('_check') and value for name,value in vars(args).items()):
+            parser.error('Each --*-benchmark runs alone in the standard fixture, without another benchmark or any --*-check option')
+        args.check = True
+    if args.power_context_check:args.power_flat_check=True
+    if args.power_booked_roll_check:args.power_flat_check=True
+    if args.power_flat_check:
+        args.check=True
+    if args.cash_pnl_check:args.with_exchange=True
+    if args.context_read_check:
+        args.check=True
+        if args.example!='standard':parser.error('--context-read-check requires the standard fixture')
+    if args.side_calendar_check or args.lifecycle_swap_browser_check or args.factor_swap_check or args.scheduled_swap_check or args.side_observation_check or args.ppa_bookings_check or args.ppa_check or args.live_calculation_check or args.connected_portfolio_check or args.risk_jobs_check or args.async_workbench_check or args.factor_history_check or args.parametric_risk_check or args.historical_risk_check or args.monte_carlo_risk_check or args.power_actual_check or args.interval_series_check or args.interval_curves_check or args.index_fixing_check or args.swap_risk_holdings_check or args.close_out_drafts_check or args.pilot_close_check or args.regional_closes_check or args.contract_dates_check or args.identity_check or args.unit_check or args.party_check or args.exchange_check or args.cash_pnl_check or args.booking_check or args.draft_check or args.hosted_check or args.jobs_check or args.reference_check or args.execution_check or args.assistant_check or args.provider_adapters_check or args.custom_curves_check or args.contract_observation_curve_check or args.market_dates_check or args.market_read_check or args.reference_demo_check or args.valuation_status_check or args.desk_fields_check:
+        args.check = True
+        if args.example != 'standard' or args.identity_check and args.browser_check:
+            parser.error('--identity-check requires the standard fixture without --browser-check')
+        if args.market_read_check and args.browser_check:
+            parser.error('--market-read-check has no browser scenarios; omit --browser-check')
+        if args.desk_fields_check and args.browser_check:
+            parser.error('--desk-fields-check has no browser scenarios; omit --browser-check')
+    if not 0 <= args.port <= 65535:
+        parser.error('Port must be between 0 and 65535')
+    if args.browser_check and (not args.check or args.example!='standard' or args.browser is None or not args.browser.is_file()):
+        parser.error('--browser-check requires --check, --example standard and an installed --browser executable')
+    if args.with_ppa and (args.example!='standard' or args.check):
+        parser.error('--with-ppa is an interactive standard-fixture option; use --ppa-check for verification')
+    if args.with_custom_curves and args.example!='standard':
+        parser.error('--with-custom-curves requires the standard fixture')
+    # Interactive dates-first demos admit optional markets only when explicitly requested.
+    bins = {n: args.pg_bin.resolve()/n for n in ('initdb','pg_ctl','psql')}
+    dotnet = args.dotnet.resolve()
+    for binary in [dotnet,*bins.values()]:
+        if not binary.is_file():
+            parser.error(f'Missing installed binary: {binary}')
+    env = {k:v for k,v in os.environ.items() if not k.startswith(('PG','OPENETRM_PREVIEW_','ASPNETCORE_','DOTNET_'))}
+    env.update({'PGTZ':'UTC','DOTNET_CLI_TELEMETRY_OPTOUT':'1','DOTNET_NOLOGO':'1'})
+    if not args.no_build:
+        subprocess.run(['npm','ci','--prefix','web','--ignore-scripts'],cwd=ROOT,env=env,check=True,timeout=120)
+        subprocess.run(['npm','run','build','--prefix','web'],cwd=ROOT,env=env,check=True,timeout=60)
+        subprocess.run([str(dotnet),'restore','src/OpenEtrm.Api','--locked-mode'],cwd=ROOT,env=env,check=True,timeout=120)
+        subprocess.run([str(dotnet),'build','src/OpenEtrm.Api','--no-restore'],cwd=ROOT,env=env,check=True,timeout=120)
+    dll=ROOT/'src/OpenEtrm.Api/bin/Debug/net10.0/OpenEtrm.Api.dll'
+    if not dll.is_file() or not (ROOT/'web/dist/index.html').is_file():
+        parser.error('Build the API and web assets before using --no-build')
+    # Use a short socket path on systems with a small Unix-socket path limit.
+    temporary=Path(tempfile.mkdtemp(prefix='openetrm-preview-',dir='/tmp')).resolve()
+    os.chmod(temporary,0o700)
+    data=temporary/'data'
+    run_id=str(uuid4())
+    (temporary/'.openetrm-preview').write_text(run_id)
+    started=False
+    startup_attempted=False
+    safe_to_remove=True
+    child=None
+    browser_process=None
+    risk_worker_process=None
+    browser_cleanup_ok=True
+    log=None
+    def run(command,**kwargs):
+        return subprocess.run([str(v) for v in command],env=env,text=True,capture_output=True,timeout=30,**kwargs)
+    def stop_signal(signum,frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM,stop_signal)
+    try:
+        # Model-provider keys are sealed under two private keys made once per disposable database
+        # and passed to every API start (docs/ai-assistant.md §5.2); nothing is generated at API start.
+        credential_keys={}
+        for variable,name in (('OPENETRM_PREVIEW_CREDENTIAL_KEY','credential.key'),('OPENETRM_PREVIEW_CREDENTIAL_RETRY_KEY','credential-retry.key')):
+            with os.fdopen(os.open(temporary/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as key_file:
+                key_file.write(secrets.token_bytes(32))
+            credential_keys[variable]=str(temporary/name)
+        initialized=run([bins['initdb'],'-D',data,'--auth-local=trust','--auth-host=reject','--encoding=UTF8','--locale=C','--no-instructions','--username=preview_owner'])
+        if initialized.returncode:
+            raise RuntimeError(initialized.stderr)
+        startup_attempted=True
+        safe_to_remove=False
+        diagnostics=['-c','log_min_duration_statement=0','-c','log_line_prefix=%u %p '] if args.market_dates_reads_check or args.custom_curves_check else []
+        started_result=run([bins['pg_ctl'],'-D',data,'-w','-t','15','-l',temporary/'postgres.log','-o',shlex.join(['-k',str(temporary),'-h','','-p','55439','-c','track_commit_timestamp=on','-c','track_activity_query_size=16384',*diagnostics]),'start'])
+        if started_result.returncode:
+            raise RuntimeError(started_result.stderr)
+        started=True
+        psql=[bins['psql'],'-X','-h',temporary,'-p','55439','-U','preview_owner','-d','postgres','-qAt','-v','ON_ERROR_STOP=1']
+        transport=None
+        def raw_query(sql):
+            result=run(psql,input=sql)
+            if result.returncode:raise RuntimeError(result.stderr)
+            return result.stdout.strip()
+        def query(sql):
+            result=raw_query(transport.prepare(sql) if transport is not None else sql)
+            return transport.receive(result) if transport is not None else result
+        query.raw=raw_query
+        if Path(query('SHOW data_directory;')).resolve()!=data.resolve():
+            raise RuntimeError('Refusing to operate on a database outside the owned disposable cluster')
+        if args.example=='mixed-gas':
+            export=temporary/'mixed-inputs.json'
+            subprocess.run([str(dotnet),'run','--project','tests/OpenEtrm.MarketData.Checks','--',
+                            '--export-mixed-resolution',str(export)],cwd=ROOT,env=env,check=True,timeout=60)
+            from mixed_preview_fixture import fixture as mixed_fixture
+            reference,market,security,manifest=mixed_fixture(export)
+        else:
+            from demo_date_plan import compile_plan
+            date_plan=compile_plan(dotnet,dll,temporary) if not args.check and not gas_demo else None
+            reference,market,security,manifest=fixture(ROOT,fixing_frames=fixing_frames,date_plan=date_plan,window_frames=args.contract_dates_check,publish_clocks=False)
+            if args.curve_eligibility_check:
+                from check_curve_eligibility import prepare as prepare_curve_eligibility
+                reference,market,manifest=prepare_curve_eligibility(reference,market,manifest)
+            if args.gas_indexed_check:
+                from gas_indexed_fixture import add_fixture
+                reference,market,security,manifest=add_fixture(reference,market,security,manifest)
+            if args.gas_in_term_check:
+                from gas_in_term_fixture import add_fixture as add_in_term_fixture
+                reference,market,security,manifest=add_in_term_fixture(reference,market,security,manifest)
+        query((ROOT/'db/bootstrap.sql').read_text())
+        for migration in sorted((ROOT/'db/migrations').glob('[0-9][0-9][0-9][0-9]_*.sql')):
+            if migration.name=='0376_runtime_contexts.sql':
+                from check_runtime_context_reset import run_checks as check_context_reset
+                check_context_reset(query,migration)
+            if args.ephemeral_context_check:
+                # Runtime-context qualification installs the complete fresh chain.
+                query(migration.read_text())
+                continue
+            if args.market_dates_check and migration.name=='0373_ephemeral_calendar_context.sql':
+                from check_fact_anchor_upgrade import run_checks as check_calendar_scope_upgrade
+                check_calendar_scope_upgrade(query,migration,number=migration.name[:4],guard='ephemeral_context_upgrade',signatures=(
+                    'security.capture_date_context(uuid,date,timestamp with time zone)','security.market_fact_visible(uuid,uuid,uuid)'))
+            if args.jobs_check and migration.name=='0366_managed_risk_pool.sql':
+                from check_fact_anchor_upgrade import run_checks as check_pool_upgrade
+                check_pool_upgrade(query,migration,number='0366',guard='managed_pool_upgrade',signatures=(
+                    'risk.claim(integer,text)','risk.heartbeat(uuid,uuid,integer)','automation.observe_nodes(text,jsonb)'))
+            if migration.name in ('0363_batched_close_source_visibility.sql','0364_shared_hidden_day_admission.sql'):
+                from check_market_dates_upgrade import run_checks as check_market_dates_upgrade
+                check_market_dates_upgrade(query,migration)
+            if migration.name in ('0339_assistant_installation_prompts.sql','0340_assistant_requested_context.sql'):
+                from check_assistant_prompt_upgrade import run_checks as check_assistant_prompt_upgrade
+                check_assistant_prompt_upgrade(query,migration)
+            if args.scheduled_swap_check and migration.name=='0297_retained_swap_schedule_reads.sql':
+                from check_retained_swap_schedule_reads import predecessor_readers
+                predecessor_readers(query)
+            if migration.name.startswith(('0228_','0229_')):
+                from check_fact_anchor_upgrade import run_checks as check_point_upgrade
+                point_signatures=('security.materialize_gas_setup(uuid,uuid)','trading.require_gas_program_shape(uuid,uuid,integer,date,date,timestamptz,numeric,numeric,market_data.gas_valuation_assignments,ref_data.gas_delivery_conventions,timestamptz,jsonb)')
+                cash_signatures=('trading.require_gas_index_cash_shape(uuid,uuid,trading.gas_component_terms,market_data.gas_valuation_assignments,jsonb)',)
+                point=migration.name.startswith('0228_')
+                check_point_upgrade(query,migration,number='0228' if point else '0229',guard='gas_point_pricing_upgrade' if point else 'gas_point_cash_upgrade',signatures=point_signatures if point else cash_signatures)
+            if migration.name=='0238_selected_observation_event_probes.sql':
+                from check_fact_anchor_upgrade import run_checks as check_observation_event_upgrade
+                check_observation_event_upgrade(query,migration,number='0238',guard='observation_event_upgrade',
+                    signatures=('security.observation_visibility_scope(uuid,uuid,uuid[])',))
+            if migration.name=='0203_assistant_presentation_controls.sql':
+                from check_assistant_presentation_upgrade import run_checks as check_presentation_upgrade
+                check_presentation_upgrade(query,migration)
+            if migration.name=='0216_in_term_gas_lifecycle.sql':
+                from check_gas_in_term import upgrade_checks as check_in_term_upgrade
+                check_in_term_upgrade(query,migration)
+            if migration.name=='0221_facility_choices_set_based.sql':
+                from check_facility_quantity_ledger import upgrade_checks as check_facility_choices_upgrade
+                check_facility_choices_upgrade(query,migration)
+            if migration.name=='0210_indexed_gas_consideration.sql':
+                from check_gas_index_upgrade import run_checks as check_gas_index_upgrade
+                check_gas_index_upgrade(query,migration)
+            if migration.name=='0209_gas_trade_amendments.sql':
+                from check_gas_amendment_upgrade import run_checks as check_gas_amendment_upgrade
+                check_gas_amendment_upgrade(query,migration)
+            if migration.name=='0208_multimonth_gas_booking.sql':
+                from check_multimonth_gas_upgrade import run_checks as check_multimonth_gas_upgrade
+                check_multimonth_gas_upgrade(query,migration)
+            if migration.name=='0201_shared_curve_price_queries.sql':
+                from check_curve_binding_upgrade import run_checks as check_curve_binding_upgrade
+                check_curve_binding_upgrade(query,migration)
+            if migration.name=='0200_curve_delivery_splice.sql':
+                from check_curve_splice_upgrade import run_checks as check_curve_splice_upgrade
+                check_curve_splice_upgrade(query,migration)
+            if migration.name=='0252_contract_observation_nodes.sql':
+                from check_contract_observation_upgrade import run_checks as check_contract_observation_upgrade,populated_checks
+                check_contract_observation_upgrade(query,migration)
+                if args.contract_observation_curve_check:populated_checks(query,migration,manifest)
+            if migration.name=='0332_calendar_publication_certification.sql':
+                from check_fact_anchor_upgrade import run_checks as check_calendar_certification_upgrade
+                check_calendar_certification_upgrade(query,migration,number='0270',guard='calendar_certification_upgrade',signatures=('security.capture_market_and_schedule_context(uuid,date,timestamptz)','security.resolve_side_calendar(uuid,uuid,text,jsonb)','security.list_side_calendars()'))
+            if migration.name=='0333_collection_operating_clock.sql':
+                from check_fact_anchor_upgrade import run_checks as check_operating_clock_upgrade
+                check_operating_clock_upgrade(query,migration,number='0271',guard='operating_clock_upgrade',signatures=('power_data.begin_attempt(uuid,date,date)','power_data.finish_attempt(uuid,jsonb,text)'))
+            if migration.name=='0331_published_clock_consumers.sql':
+                from check_fact_anchor_upgrade import run_checks as check_clock_consumer_upgrade
+                check_clock_consumer_upgrade(query,migration,number='0269',guard='published_clock_consumer_upgrade',signatures=('power_data.source_config(uuid)',))
+            if args.lng_cargo_check and migration.name=='0176_lng_cargo_references.sql':
+                from check_lng_upgrade import run_checks as check_lng_upgrade
+                check_lng_upgrade(query,ROOT,manifest,[reference,market,security,trading_fixture(manifest['catalogId'])])
+            if migration.name.endswith(('_operating_policies.sql','_access_policy_consumers.sql')):
+                from check_settings_upgrade import run_checks as check_settings_upgrade
+                check_settings_upgrade(query,migration)
+            if (args.assistant_check or args.provider_adapters_check) and migration.name=='0105_model_identifier_policy.sql':
+                from check_model_versions import check_identifier_policy_upgrade
+                check_identifier_policy_upgrade(query,migration.read_text())
+            if args.connected_portfolio_check and migration.name in ('0080_connected_recipe_weights.sql','0081_connected_risk_axes.sql'):
+                from check_curve_cutover import run_checks as check_curve_cutover
+                check_curve_cutover(query,[reference,market,security],manifest,migration.read_text(),migration.name[:4])
+            if args.close_risk_check and migration.name=='0094_close_book_risk.sql':
+                from check_close_risk_upgrade import run_checks as check_risk_upgrade
+                check_risk_upgrade(query,[reference,market,security,trading_fixture(manifest['catalogId'])],manifest,migration.read_text())
+            if args.execution_check and migration.name=='0040_futures_execution_policies.sql':
+                from check_futures_policy_upgrade import run_checks as check_policy_upgrade
+                legacy_reference,legacy_market,_,legacy_manifest=fixture(ROOT)
+                check_policy_upgrade(query,legacy_reference,legacy_market,legacy_manifest,migration.read_text())
+            if args.assistant_check and migration.name=='0051_model_catalog.sql':
+                from check_model_catalog import check_upgrade as check_catalog_upgrade
+                check_catalog_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0053_model_cache_read_rule.sql':
+                from check_model_catalog import check_rule_upgrade
+                check_rule_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0058_provider_qualification.sql':
+                from check_model_qualification import check_upgrade as check_qualification_upgrade
+                check_qualification_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0059_model_display_name_rule.sql':
+                from check_model_catalog import check_name_rule_upgrade
+                check_name_rule_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0060_model_versions.sql':
+                from check_model_versions import check_upgrade as check_versions_upgrade
+                check_versions_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0061_directory_efforts.sql':
+                from check_model_versions import check_directory_upgrade
+                check_directory_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0062_provider_tests.sql':
+                from check_provider_tests import check_upgrade as check_tests_upgrade
+                check_tests_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0064_directory_tests.sql':
+                from check_provider_tests import check_directory_upgrade as check_tests_directory_upgrade
+                check_tests_directory_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0065_worker_start_time.sql':
+                from check_provider_tests import check_start_upgrade
+                check_start_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0066_agent_administration.sql':
+                from check_agent_administration import check_upgrade as check_agents_upgrade
+                check_agents_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0068_agent_grants.sql':
+                from check_agent_grants import check_upgrade as check_grants_upgrade
+                check_grants_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0069_agent_turns.sql':
+                from check_agent_turns import check_upgrade as check_turns_upgrade
+                check_turns_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0071_admitted_asks.sql':
+                from check_agent_turns import check_admitted_upgrade
+                check_admitted_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0072_tool_steps.sql':
+                from check_agent_turns import check_steps_upgrade
+                check_steps_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0075_model_usage.sql':
+                from check_model_usage import check_upgrade as check_usage_upgrade
+                check_usage_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0078_turn_stream.sql':
+                from check_agent_turns import check_stream_upgrade
+                check_stream_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0079_workspace_grants.sql':
+                from check_agent_grants import check_workspace_upgrade
+                check_workspace_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0089_curve_agent_proposals.sql':
+                from check_agent_turns import check_curve_proposals_upgrade
+                check_curve_proposals_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0119_agent_job_reads.sql':
+                from check_agent_turns import check_job_reads_upgrade
+                check_job_reads_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0086_navigation_targets.sql':
+                from check_agent_turns import check_navigation_upgrade
+                check_navigation_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0087_hosted_turn_sessions.sql':
+                from check_agent_turns import check_hosted_upgrade
+                check_hosted_upgrade(query,migration.read_text())
+            if args.check and args.example=='standard' and not (args.exchange_check or args.cash_pnl_check) and migration.name=='0052_unambiguous_discount_defaults.sql':
+                from check_discount_default_upgrade import run_checks as check_default_upgrade
+                from swap_fixture import fixture as swap_fixture
+                from preview_fixture import trading_fixture
+                check_default_upgrade(query,[reference,market,swap_fixture(fixing_frames=fixing_frames)[0],security,trading_fixture(manifest['catalogId'],swap_defaults=True)],migration.read_text())
+            if args.assistant_check and migration.name=='0120_agent_read_limit.sql':
+                from check_agent_administration import check_read_limit_upgrade
+                check_read_limit_upgrade(query,migration.read_text())
+            if args.monte_carlo_risk_check and migration.name=='0193_hybrid_monte_carlo.sql':
+                from check_hybrid_monte_carlo_risk import upgrade_checks as check_hybrid_upgrade
+                check_hybrid_upgrade(query,migration.read_text())
+            if args.monte_carlo_risk_check and migration.name=='0192_pca_hybrid_fallback_consent.sql':
+                from check_pca_hybrid_risk_db import upgrade_checks as check_pca_upgrade
+                check_pca_upgrade(query,migration.read_text(),consent=True)
+            if args.monte_carlo_risk_check and migration.name=='0191_pca_hybrid_risk.sql':
+                from check_pca_hybrid_risk_db import upgrade_checks as check_pca_upgrade
+                check_pca_upgrade(query,migration.read_text())
+            if args.monte_carlo_risk_check and migration.name=='0190_monte_carlo_risk.sql':
+                from check_monte_carlo_risk_db import upgrade_checks as check_monte_carlo_upgrade
+                check_monte_carlo_upgrade(query,migration.read_text())
+            if args.historical_risk_check and migration.name=='0189_historical_risk.sql':
+                from check_historical_risk_db import upgrade_checks as check_historical_upgrade
+                check_historical_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0121_agent_history_window.sql':
+                from check_agent_administration import check_history_window_upgrade
+                check_history_window_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0122_pin_turn_bound.sql':
+                from check_agent_turns import check_pin_bound_upgrade
+                check_pin_bound_upgrade(query,migration.read_text())
+            if args.assistant_check and migration.name=='0128_agent_curve_drafts.sql':
+                from check_agent_turns import check_curve_drafts_upgrade
+                check_curve_drafts_upgrade(query,migration.read_text())
+            if args.check and migration.name=='0116_remove_unused_cash_rounding.sql':
+                from check_cash_rounding_retirement import run_checks as check_cash_retirement
+                check_cash_retirement(query,migration.read_text())
+            if args.physical_gas_check and migration.name=='0142_physical_gas_bookings.sql':
+                from check_gas_upgrade import run_checks as check_gas_upgrade
+                check_gas_upgrade(query,ROOT,[reference,market,security,trading_fixture(manifest['catalogId'])])
+            if args.check and migration.name=='0204_exact_observation_reads.sql':
+                from check_exact_pin_upgrade import run_checks as check_exact_pin_upgrade
+                check_exact_pin_upgrade(query,migration)
+            if args.check and migration.name=='0211_selected_observation_facts.sql':
+                from check_observation_fact_upgrade import run_checks as check_observation_fact_upgrade
+                check_observation_fact_upgrade(query,migration)
+            if args.check and migration.name=='0215_rolling_rate_curves.sql':
+                from check_rate_cutover import run_checks as check_rate_cutover
+                check_rate_cutover(query,[reference,market,security],migration)
+            if args.check and migration.name=='0223_bounded_fact_anchor_reads.sql':
+                from check_fact_anchor_upgrade import run_checks as check_fact_anchor_upgrade
+                check_fact_anchor_upgrade(query,migration)
+            if args.check and migration.name=='0225_bounded_observation_matching.sql':
+                from check_fact_anchor_upgrade import run_checks as check_close_pin_upgrade
+                check_close_pin_upgrade(query,migration,number='0225',guard='close_pin_upgrade')
+            if args.check and migration.name=='0226_publication_price_resolution.sql':
+                from check_publication_resolution_upgrade import run_checks as check_publication_resolution_upgrade
+                check_publication_resolution_upgrade(query,migration)
+            query(migration.read_text())
+        from native_read_transport import NativeReadTransport
+        native_inputs=temporary/'native-read-inputs.json'
+        transport=NativeReadTransport(native_inputs)
+        env['OPENETRM_NATIVE_CHECK_INPUTS']=str(native_inputs)
+        query.read_sources=transport.sources
+        if args.ephemeral_context_check:
+            from check_ephemeral_contexts import check_schema
+            check_schema(query)
+        if args.example=='standard' and(args.structured_power_check or not args.check):
+            from rec_fixture import extend as extend_rec
+            reference,market,security,manifest=extend_rec(reference,market,security,manifest)
+        if args.check:
+            from check_whole_term_swap_schema import run_checks as check_whole_term_swap_schema
+            check_whole_term_swap_schema(query)
+            from check_ppa_side_schedule_schema import run_checks as check_ppa_side_schedule_schema
+            check_ppa_side_schedule_schema(query)
+            from check_retained_side_schedules import run_checks as check_retained_side_schedules
+            check_retained_side_schedules(query)
+            from check_booked_side_programs import run_schema_checks as check_booked_program_schema
+            check_booked_program_schema(query)
+        if args.physical_crude_check or args.physical_assistant_check:
+            from crude_fixture import prepare as prepare_crude
+            reference,market,manifest=prepare_crude(reference,market,manifest)
+            if args.crude_setup_check:
+                from crude_fixture import prepare_delivery
+                market,manifest=prepare_delivery(market,manifest)
+                from crude_fixture import DELIVERY_CATALOG,UNRELATED_CATALOG
+                from preview_fixture import TENANT, WORKSPACE
+                # These catalogs are created in the later delivery-market phase.
+                market+=f"\nINSERT INTO security.reference_catalog_scopes VALUES('{DELIVERY_CATALOG}','{TENANT}','{WORKSPACE}','owner');"
+                market+=f"\nINSERT INTO security.reference_catalog_scopes VALUES('{UNRELATED_CATALOG}','{TENANT}','{WORKSPACE}','owner');"
+        if args.lng_cargo_check:
+            from lng_fixture import prepare as prepare_lng
+            reference,market,manifest=prepare_lng(reference,market,manifest)
+        if args.execution_check:
+            from check_futures_execution import prepare as prepare_execution
+            reference,market,manifest=prepare_execution(reference,market,manifest)
+        if args.index_fixing_check:
+            from check_index_fixings import prepare as prepare_index_fixings
+            reference,market,manifest=prepare_index_fixings(reference,market,manifest)
+        if args.ephemeral_context_check or args.side_calendar_check or args.power_flat_check or args.interval_curves_check or args.ppa_check or args.ppa_bookings_check or args.with_ppa or args.demo_instruments_check or args.retained_schedule_check or args.blotter_stream_benchmark:
+            from interval_curve_fixture import prepare as prepare_interval_curves
+            reference,market,security,manifest=prepare_interval_curves(reference,market,security,manifest)
+        if args.power_flat_check:
+            from check_power_output_settlement import prepare as prepare_power_output_settlement
+            market=prepare_power_output_settlement(market,manifest)
+        if args.ephemeral_context_check or args.side_calendar_check or args.ppa_check or args.ppa_bookings_check or args.with_ppa or args.demo_instruments_check or args.retained_schedule_check or args.blotter_stream_benchmark:
+            from ppa_fixture import prepare as prepare_ppa
+            reference,market,security,manifest=prepare_ppa(reference,market,security,manifest)
+            if not args.check:
+                from seed_preview_positions import EXECUTIONS
+                demo_instants={day+'T16:00:00' for day,*_ in EXECUTIONS}
+                manifest['frames']=[frame for frame in manifest['frames'] if frame['at'][:19] in demo_instants or args.with_gas_quantity_dates and frame['at'][:10] in ('2021-01-01','2021-01-15','2021-01-31')]
+
+        if args.side_calendar_check or args.ppa_bookings_check or args.retained_schedule_check or args.blotter_stream_benchmark:
+            from ppa_bookings_fixture import prepare as prepare_ppa_bookings
+            reference,market,security,manifest=prepare_ppa_bookings(reference,market,security,manifest)
+            if args.close_risk_check:
+                from close_risk_fixture import prepare as prepare_close_risk
+                reference,market,security,manifest=prepare_close_risk(reference,market,security,manifest)
+        if args.live_calculation_check or args.connected_portfolio_check or args.custom_curves_check or args.contract_observation_curve_check or args.with_custom_curves or args.market_dates_check or args.valuation_status_check:
+            from custom_curve_fixture import prepare as prepare_custom_curves
+            reference,market,manifest=prepare_custom_curves(reference,market,manifest,daily_lifecycle=args.connected_portfolio_check)
+            if args.contract_observation_curve_check:
+                from crude_formula_fixture import prepare as prepare_crude_formula
+                market,manifest=prepare_crude_formula(market,manifest)
+        if args.hosted_check:
+            from provision_hosted import prepare as prepare_hosted
+            prepared=temporary/'fresh-pilot-check'
+            from preview_fixture import installed_tzdb
+            source_id,job_id=str(uuid4()),str(uuid4())
+            collection={'sources':[{'id':source_id,'name':'Synthetic PJM source','provider':'PJM','dataset':'da_hrl_lmps','market':'DA','point':'51288','minutes':60,'unit':'MWh','currency':'USD','timeZone':'America/New_York'}],
+                        'jobs':[{'id':job_id,'provider':'PJM','name':'Synthetic paused collection','sourceIds':[source_id],'enabled':True,'scheduleEnabled':False,'cron':'0 8 * * *','scheduleZone':'UTC','fromDay':-7,'throughDay':-1}], 'requestsPerMinute':{'PJM':4}}
+            def render_hosted_clocks(request,target):
+                subprocess.run([str(dotnet),str(dll),'--render-clock-captures',str(request),str(target)],cwd=ROOT,env=env,check=True,timeout=60)
+            prepared_ids=prepare_hosted('https://pilot.synthetic.invalid',str(uuid4()),installed_tzdb(),prepared,collection,
+                clock_publication=('2026-03-08','2026-11-03',render_hosted_clocks))
+            calendar_request=prepared/'calendar.json';calendar_sql=prepared/'calendar.sql'
+            calendar_request.write_text(json.dumps({'referenceCatalogId':prepared_ids['reference'],'referenceRevisionId':prepared_ids['referenceRevision'],'from':'2026-03-08','through':'2026-11-02','clockCodes':['pjm']}))
+            subprocess.run([str(dotnet),str(dll),'--render-power-days',str(calendar_request),str(calendar_sql)],cwd=ROOT,env=env,check=True,timeout=30)
+            # The owner holds the six human roles by name, never the agent reader role.
+            human_roles=f"DO $$BEGIN IF(SELECT string_agg(r.code,',' ORDER BY r.code) FROM security.role_grants g JOIN security.roles r ON r.id=g.role_id WHERE g.principal_id='{prepared_ids['owner']}' AND NOT g.revoked)<>'access_administrator,market_data_approver,market_data_editor,risk_analyst,trader,viewer' THEN RAISE EXCEPTION 'The hosted owner must hold exactly the human roles';END IF;END$$;"
+            combined=(prepared/'seed.sql').read_text().replace('COMMIT;','')+calendar_sql.read_text().replace('BEGIN;','').replace('COMMIT;',"DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM power_data.operating_days WHERE operating_date='2026-03-08' AND ends_at-starts_at=interval '23 hours') OR NOT EXISTS(SELECT 1 FROM power_data.operating_days WHERE operating_date='2026-11-01' AND ends_at-starts_at=interval '25 hours') THEN RAISE EXCEPTION 'Incorrect retained operating-day bounds';END IF;END$$;"+human_roles+"ROLLBACK;")
+            query(combined)
+
+            print('PASS fresh hosted seed validates on an empty stock database without synthetic users, observations or trades, and grants its owner the human roles',flush=True)
+        if args.example=='standard' and (gas_demo or not args.check or args.async_workbench_check or args.factor_history_check or args.parametric_risk_check or args.historical_risk_check or args.monte_carlo_risk_check):
+            from factor_history_fixture import calendar as history_calendar
+            reference=history_calendar(reference,manifest)
+        query(reference)
+        if args.power_actual_check:
+            from check_power_actual_storage import prepare_market
+            market=prepare_market(market,manifest)
+            from check_power_publication_http import prepare_market as prepare_publication_market
+            market=prepare_publication_market(market,manifest)
+        if args.interval_series_check:
+            from check_interval_series_http import prepare_market as prepare_interval_series
+            market=prepare_interval_series(market,manifest)
+        if args.scheduled_swap_check:
+            from check_scheduled_swaps import prepare as prepare_scheduled
+            market=prepare_scheduled(market,manifest)
+        if args.close_out_drafts_check:
+            from check_close_out_drafts import prepare as prepare_close_out_drafts
+            market=prepare_close_out_drafts(market,manifest)
+        if args.price_authoring_check:
+            from check_price_publication_http import prepare_market as prepare_publication_market
+            market=prepare_publication_market(market,manifest)
+            from check_publication_release_pricing import prepare_market as prepare_release_market
+            market=prepare_release_market(market,manifest)
+        if args.example=='standard':
+            from preview_fixture import clock_capture_request, installed_tzdb
+            clock_request=temporary/'clock-captures.json';clock_sql=temporary/'clock-captures.sql'
+            capture_terms=clock_capture_request(manifest)
+            if args.scheduled_swap_check:
+                capture_terms['clocks'].extend(dict(code=code,kind='iana',fixedOffsetSeconds=None,ianaZone=zone,tzdbVersion=installed_tzdb())
+                    for code,zone in [('synthetic_london','Europe/London'),('synthetic_new_york','America/New_York')])
+            clock_request.write_text(json.dumps(capture_terms))
+            subprocess.run([str(dotnet),str(dll),'--render-clock-captures',str(clock_request),str(clock_sql)],cwd=ROOT,env=env,check=True,timeout=60)
+            marker='UPDATE ref_data.revisions SET state='
+            if marker not in market: raise RuntimeError('Synthetic reference sealing point is missing')
+            market=market.replace(marker,clock_sql.read_text()+marker,1)
+        from seed_fixture_market import load_market
+        before_seal=None
+        if args.contract_dates_check:
+            from contract_curve_fixture import verify_admissions
+            before_seal=lambda:query(verify_admissions(*(manifest[key] for key in ('catalogId','revisionId','tenantId','workspaceId'))))
+        historical_security=security
+        security=load_market(query,market,security,manifest,before_seal=before_seal)
+        catalogue_roles={role:manifest[key]['revisionId'] for role,key in
+            [('gas','gasMarket'),('crude','crudeMarket'),('lng','lngMarket')] if key in manifest}
+        if args.example=='standard':
+            from swap_fixture import fixture as swap_fixture
+            # The valuation-status check reads the last custom-curve close, at which the daily bundle publishes.
+            swap_market,swap_manifest=swap_fixture(fixing_frames=fixing_frames,observation_guards=args.side_calendar_check or args.side_observation_check or args.scheduled_swap_check,
+                scheduled_periods=args.side_calendar_check or args.scheduled_swap_check,closes=['2020-12-31T16:00:00Z'] if args.valuation_status_check else (),
+                effective_from='2020-12-16' if args.retained_schedule_check else '2020-01-01')
+            if args.index_fixing_check:
+                from check_swap_settlement_selection import prepare_daily
+                swap_market=prepare_daily(swap_market,swap_manifest)
+            load_market(query,swap_market,'',manifest)
+            if args.connected_portfolio_check or args.valuation_status_check or args.live_calculation_check or args.with_custom_curves or args.gas_in_term_check:
+                # The primary custom-curve fixture visits closes beyond the four standard weekdays.
+                # Its unrelated secondary bundle explicitly supplies no inputs there.
+                times={f['at'] for f in swap_manifest['frames']}
+                swap_manifest['frames'].extend({'at':f['at'],'observationIds':[],'frozenObservationIds':[],'curveContracts':{}}
+                    for f in manifest['frames'] if f['at'] not in times)
+            manifest['inputMarkets']=[swap_manifest]
+            if args.crude_setup_check: manifest['inputMarkets'].append(manifest.pop('crudeMarket'))
+            if args.factor_swap_check:
+                from factor_swap_fixture import prepare as prepare_factor
+                prepare_factor(manifest)
+        if security:query(security)
+        if args.example=='standard' and (args.structured_power_check or not args.check):
+            query("INSERT INTO security.role_permissions SELECT id,p FROM security.roles CROSS JOIN "
+                  "(VALUES('ReadPhysical'),('ManagePhysicalSetup'),('RunScenario'))x(p) "
+                  "WHERE code='market_data_editor' ON CONFLICT DO NOTHING;")
+            query("INSERT INTO security.role_permissions SELECT id,p FROM security.roles CROSS JOIN "
+                  "(VALUES('ReadPhysical'),('RunScenario'),('ReadRecInventory'),('RecordRecInventory'),('ConfigureRecInventory'))x(p) "
+                  "WHERE code='trader' ON CONFLICT DO NOTHING;")
+        query(f"SELECT security.initialize_operating_policies('{manifest["tenantId"]}','{manifest["workspaceId"]}');")
+        if args.example=='standard' and (gas_demo or not args.check or args.async_workbench_check or args.factor_history_check or args.parametric_risk_check or args.historical_risk_check or args.monte_carlo_risk_check):
+            from factor_history_fixture import seed as seed_history
+            seed_history(query,manifest)
+            if gas_demo and not args.physical_assistant_check:
+                from seed_gas_basis_demo import history_frames
+                history_frames(query,manifest)
+        if args.hosted_check:
+            from check_hosted_auth import run_checks as check_hosted_auth
+            check_hosted_auth(query, manifest)
+            from check_power_import import run_checks as check_power_import
+            check_power_import(query,manifest,dotnet,temporary,env)
+        from preview_fixture import catalogue_fixture
+        if args.exchange_check or args.with_exchange:
+            from exchange_fixture import fixture as exchange_fixture
+            er,em,es,et,exchange_manifest=exchange_fixture(ROOT)
+            query(er)
+            es=load_market(query,em,es,exchange_manifest)
+            if es.strip():query(es)
+            query(et)
+            query(f"SELECT security.initialize_operating_policies('{exchange_manifest['tenantId']}','{exchange_manifest['workspaceId']}');")
+            query(catalogue_fixture(exchange_manifest,exchange_manifest['identityIssuer']))
+            (temporary/'exchange-manifest.json').write_text(json.dumps(exchange_manifest))
+            if args.exchange_check:
+                from check_futures_option_storage import run_checks as check_futures_option_storage
+                check_futures_option_storage(query,exchange_manifest)
+                # Commits surface revisions, publications and contexts into the exchange catalog: later checks that count publications depend on running after it.
+                from check_vol_surface_storage import run_checks as check_vol_surface_storage
+                check_vol_surface_storage(query,exchange_manifest)
+        from preview_fixture import trading_fixture
+        query(trading_fixture(manifest['catalogId'],swap_defaults=args.example=='standard'))
+        curve_sources = [m['revisionId'] for m in manifest['inputMarkets']] if args.swap_risk_holdings_check else []
+        query(catalogue_fixture(manifest,'https://preview.invalid',curve_sources=curve_sources,role_revisions=catalogue_roles))
+        if args.side_calendar_check or args.ppa_bookings_check or args.blotter_stream_benchmark:
+            from ppa_bookings_fixture import trading as ppa_benchmark_books
+            query(ppa_benchmark_books(manifest['catalogId']))
+        if args.ppa_bookings_check:
+            from ppa_revision_fixture import install as install_ppa_revisions
+            install_ppa_revisions(query,manifest)
+        if args.power_actual_check:
+            from check_power_actual_storage import run_checks as check_power_actual_storage
+            check_power_actual_storage(query,manifest)
+        if args.interval_curves_check:
+            from check_interval_curves_storage import run_checks as check_interval_curves_storage
+            check_interval_curves_storage(query,manifest)
+        # The close-risk fixture has a contemporary definition period; the
+        # unchanged temporal baseline runs separately in --ppa-bookings-check.
+        if args.ppa_bookings_check and not args.close_risk_check:
+            from check_pre_retention_storage import ppa as check_ppa_raw_admission
+            check_ppa_raw_admission(query,psql,env,ROOT,
+                [reference,market,swap_market,historical_security,trading_fixture(manifest['catalogId'],swap_defaults=True)],manifest)
+        if args.ppa_check:
+            from check_settlement_preview import prepare as prepare_settlement_preview
+            manifest=prepare_settlement_preview(manifest)
+            from check_ppa_storage import run_checks as check_ppa_storage
+            check_ppa_storage(query,manifest)
+            from check_meter_finality import run_checks as check_meter_finality
+            check_meter_finality(query,manifest,psql,env,dotnet,temporary)
+        if args.interval_series_check:
+            from check_interval_series_storage import run_checks as check_interval_series_storage
+            check_interval_series_storage(query,manifest,psql,env)
+        if args.index_fixing_check:
+            from check_index_fixing_upgrade import run_checks as check_index_fixing_upgrade
+            check_index_fixing_upgrade(query,psql,env,ROOT)
+        if args.unit_check:
+            manifest['unitCatalogPreviousKnownAt']=query("SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"');")
+            unit_reference='20000000-0000-0000-0000-000000000004'
+            query(f"INSERT INTO ref_data.revisions(catalog_id,id,revision_key) VALUES('{manifest['referenceCatalogId']}','{unit_reference}','unit_catalog_v1');")
+            for table in ('dimensions','units','unit_conversions','commodities','measurement_bases','quantity_specifications'):
+                query(f"INSERT INTO ref_data.{table} SELECT (jsonb_populate_record(NULL::ref_data.{table},to_jsonb(t)||jsonb_build_object('revision_id','{unit_reference}'))).* FROM ref_data.{table} t WHERE catalog_id='{manifest['referenceCatalogId']}' AND revision_id='{manifest['referenceRevisionId']}';")
+            query(f"INSERT INTO ref_data.units VALUES('{manifest['referenceCatalogId']}','{unit_reference}','catalog_only_kwh','Catalog kWh','energy'); INSERT INTO ref_data.unit_conversions VALUES('{manifest['referenceCatalogId']}','{unit_reference}','catalog_only_kwh','kilowatt_hour','energy',1,1); INSERT INTO ref_data.quantity_specifications VALUES('{manifest['referenceCatalogId']}','{unit_reference}','test_power_catalog_only','test_power','test_power_energy','catalog_only_kwh','energy'); UPDATE ref_data.revisions SET state='sealed' WHERE catalog_id='{manifest['referenceCatalogId']}' AND id='{unit_reference}';")
+            unit_bundle='60000000-0000-0000-0000-000000000004'
+            query(f"BEGIN; INSERT INTO market_data.revisions VALUES ('{manifest['catalogId']}','{unit_bundle}','{manifest['referenceCatalogId']}','{unit_reference}','draft',0); INSERT INTO market_data.revision_periods VALUES ('{manifest['catalogId']}','{unit_bundle}','2020-01-01','2022-01-01'); UPDATE market_data.revisions SET state='sealed' WHERE catalog_id='{manifest['catalogId']}' AND id='{unit_bundle}'; COMMIT;")
+            manifest['unitCatalog']={'referenceRevisionId':unit_reference,'definitionRevisionId':unit_bundle}
+            unit_roles={**catalogue_roles,'units':unit_bundle,**{'reference:'+table:unit_bundle for table in
+                ('dimensions','units','unit_conversions','commodities','measurement_bases','quantity_specifications')}}
+            query(catalogue_fixture(manifest,'https://preview.invalid',curve_sources=curve_sources,
+                role_revisions=unit_roles,expected_head=query(f"SELECT id FROM market_data.catalogue_publications WHERE catalog_id='{manifest['catalogId']}' ORDER BY publication_order DESC LIMIT 1;"),
+                request_id=str(uuid4())))
+        if args.factor_swap_check:
+            from check_factor_swap_upgrade import run_checks as check_factor_upgrade
+            check_factor_upgrade(query,psql,env,ROOT)
+        if args.check and args.example=='standard' and not (args.exchange_check or args.cash_pnl_check or args.ephemeral_context_check):
+            from check_trade_revision_upgrade import run_checks as check_upgrade
+            legacy_reference,legacy_market,legacy_security,_=fixture(ROOT,current_schema=False)
+            check_upgrade(query,psql,env,ROOT,[legacy_reference,legacy_market,legacy_security,trading_fixture(manifest['catalogId'],annotations=False)],manifest)
+        if args.jobs_check:
+            from check_jobs_http import prepare as prepare_jobs
+            prepare_jobs(query,manifest)
+        if args.reference_demo_check:
+            from reference_demo_fixture import install as install_reference_demo
+            reference_demo=install_reference_demo(query,manifest)
+            # One owned test date deliberately has no admitted demo input frame.
+            reference_demo['omittedAt']=max(f['at'] for f in reference_demo['frames'] if not f['at'].startswith('2020-12-18'))
+            manifest['inputMarkets'][-1]['frames']=[f for f in reference_demo['frames'] if f['at']!=reference_demo['omittedAt']]
+            query(catalogue_fixture(manifest,'https://preview.invalid',curve_sources=[reference_demo['definitionRevisionId']],
+                role_revisions={**catalogue_roles,**{'reference:'+table:reference_demo['definitionRevisionId'] for table in
+                    ('interest_rate_definitions','value_specifications')}},
+                expected_head=query(f"SELECT id FROM market_data.catalogue_publications WHERE catalog_id='{manifest['catalogId']}' ORDER BY publication_order DESC LIMIT 1;"),
+                request_id='fbf30992-496b-4cd5-9abf-2d7cd3ab0a96'))
+        # Only recorded closes are closes (D334): the built-in frames are recorded as synthetic session closes.
+        from seed_session_closes import seed as seed_session_closes
+        # The aligned-history check reads a correction through a working frame of its day, which a close's exact pins never take.
+        # Generation and normalized close reports qualify their one-definition profiles separately.
+        close_inputs=[]
+        if not (args.pilot_close_check or args.close_risk_check or args.close_risk_lease_check):
+            close_inputs=list(manifest.get('inputMarkets', ()))
+            for key in ('gasMarket','crudeMarket','lngMarket'):
+                if key in manifest and manifest[key]['revisionId'] != manifest['revisionId']:
+                    close_inputs.append(manifest[key])
+            if len({source['revisionId'] for source in close_inputs}) != len(close_inputs):
+                raise ValueError('A fixture must declare each exact retained close source once.')
+        # The factor scenario publishes its additional contracts after opening
+        # the initial view, so its explicit working selections are never recorded
+        # as closes containing contracts that do not exist yet.
+        working_days=tuple({frame['at'][:10] for frame in manifest['frames']}) if args.factor_swap_check else (
+            ('2020-12-18',) if args.factor_history_check or args.context_read_check else ())
+        seed_session_closes(query,manifest,working=working_days,input_markets=close_inputs)
+        (temporary/'manifest.json').write_text(json.dumps(manifest))
+        (temporary/'manifest.json').chmod(0o600)
+        # Freeze assets for this owned instance; a later web build must not change
+        # another running preview's presentation while it is being used.
+        shutil.copytree(ROOT/'web/dist',temporary/'web')
+        limits_file=temporary/'process-limits.json'
+        shutil.copyfile(ROOT/'deploy/process-limits.example.json',limits_file)
+        if args.custom_curves_check and not args.price_authoring_check:
+            # The fixture's rolling average consumes 12 contracts on 20 sample dates.
+            limits=json.loads(limits_file.read_text());limits['previewRecipeSampleReferences']=12*20
+            limits_file.write_text(json.dumps(limits))
+        port=args.port
+        if port==0:
+            with socket.socket() as reservation:
+                reservation.bind(('127.0.0.1',0))
+                port=reservation.getsockname()[1]
+        url=f'http://127.0.0.1:{port}'
+        app_env={**env,'OPENETRM_PREVIEW_ROOT':str(temporary),'OPENETRM_PREVIEW_PORT':str(port),
+                 'OPENETRM_PREVIEW_WEB':str(temporary/'web'),
+                 'OPENETRM_PREVIEW_RUNTIME':f'Host={temporary};Port=55439;Database=postgres;Username=preview_runtime;SSL Mode=Disable;Timeout=5;Command Timeout=5;Maximum Pool Size=8',
+                 'OPENETRM_PREVIEW_AUTHENTICATOR':f'Host={temporary};Port=55439;Database=postgres;Username=preview_authenticator;SSL Mode=Disable;Timeout=5;Command Timeout=5;Maximum Pool Size=8',
+                 **credential_keys}
+        # Exercise transport independently of the launcher's UTC psql sessions.
+        if args.check:
+            app_env['PGTZ']='America/Chicago'
+        shutil.copytree(dll.parent,temporary/'api')
+        frozen_dll=temporary/'api'/dll.name
+        log=(temporary/'app.log').open('w')
+        api_env=app_env
+        if args.physical_assistant_check or args.assistant_check or args.provider_adapters_check or args.assistant_workspace_check or args.assistant_runtime_check or args.assistant_browser_check or args.exchange_check:
+            # Provider tests reach a loopback fake provider through the check endpoint, and every proxy
+            # setting names a trap that no request may reach (docs/ai-assistant.md §5.2, §13).
+            from fake_model_provider import FakeProvider,Trap
+            fake_provider,proxy_trap=FakeProvider(),Trap()
+            api_env={**app_env,'OPENETRM_PROVIDER_CHECK_ENDPOINT':fake_provider.url,'no_proxy':'','NO_PROXY':'',
+                     **{name:proxy_trap.url for name in ('http_proxy','https_proxy','all_proxy','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY')}}
+        child=subprocess.Popen([str(dotnet),str(frozen_dll),'--local-preview'],cwd=ROOT,env=api_env,stdout=log,stderr=subprocess.STDOUT)
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            if child.poll() is not None:
+                raise RuntimeError('Preview failed to start:\n'+(temporary/'app.log').read_text())
+            try:
+                with urlopen(url+'/api/health',timeout=.5) as response:
+                    health=json.load(response)
+                if health.get('runId')!=run_id:
+                    raise RuntimeError('HTTP port belongs to a different process; refusing to reuse it')
+                break
+            except OSError:
+                time.sleep(.1)
+        else:
+            raise RuntimeError('Preview did not become ready:\n'+(temporary/'app.log').read_text())
+        # A worker's calculation timeout; its process gets 30 s more to claim, report and exit.
+        def prepare_risk_worker(selected=None,login='preview_risk_worker',timeout=60):
+            from check_risk_jobs_db import provision_worker
+            provision_worker(query,selected or manifest,login)
+            connection=temporary/f'{login}-connection'
+            connection.write_text(f'Host={temporary};Port=55439;Database=postgres;Username={login};SSL Mode=Disable;Timeout=5;Command Timeout=5;Maximum Pool Size=2')
+            connection.chmod(0o600)
+            config=temporary/f'{login}.json'
+            config.write_text(json.dumps({'connectionFile':str(connection),'leaseSeconds':30,'pollSeconds':1,'timeoutSeconds':timeout}))
+            config.chmod(0o600)
+            return {**env,'OPENETRM_RISK_WORKER_CONFIG':str(config)}
+        def risk_worker_runner(selected=None,login='preview_risk_worker',timeout=60,worker_env=None):
+            worker_env=worker_env or prepare_risk_worker(selected,login,timeout)
+            def run(measure=False):
+                command=[str(dotnet),str(frozen_dll),'--risk-worker','once']
+                if not measure:
+                    subprocess.run(command,cwd=ROOT,env=worker_env,check=True,timeout=timeout+30);return None
+                # One claimed job, with the worker process's resident memory sampled every 50 ms; returns the sampled peak in KiB.
+                process=subprocess.Popen(command,cwd=ROOT,env=worker_env);peak=0;deadline=time.monotonic()+timeout+30
+                while process.poll() is None:
+                    sample=subprocess.run(['ps','-o','rss=','-p',str(process.pid)],capture_output=True,text=True).stdout.strip()
+                    peak=max(peak,int(sample)) if sample else peak
+                    if time.monotonic()>deadline:process.kill();raise RuntimeError(f'The risk worker did not finish within {timeout+30} seconds.')
+                    time.sleep(.05)
+                if process.returncode:raise subprocess.CalledProcessError(process.returncode,command)
+                return peak
+            return run
+        if (not gas_demo and not args.check or args.jobs_check or args.live_calculation_check or args.unit_check or args.risk_jobs_check or args.async_workbench_check or args.factor_history_check or args.parametric_risk_check or args.historical_risk_check or args.monte_carlo_risk_check or args.valuation_status_check or args.desk_fields_check or args.ephemeral_context_check) and args.example=='standard':
+            if not args.check and date_plan is not None:
+                from demo_date_plan import verify_instrument_dates
+                count=verify_instrument_dates(query,date_plan,manifest['catalogId'],manifest['revisionId'],manifest['contractsOutsideDatePlan'] if args.with_custom_curves else ())
+                print(f'Verified {count} demo contracts and rate pillars against source schedule dates.',flush=True)
+            from seed_preview_positions import seed_positions
+            seed_positions(url,run_id,temporary)
+            from seed_preview_swaps import seed_swaps
+            seed_swaps(url,run_id,temporary)
+            print('Loaded eight futures and sixteen financial swap examples across four weekdays.',flush=True)
+            if not args.check:
+                from seed_demo_instruments import owned_client,seed_heat_rates
+                seed_heat_rates(owned_client(url,run_id,temporary))
+                print('Loaded eight synthetic heat-rate swaps with explicit side quantities and native-unit rates.',flush=True)
+
+            if not args.check:
+                from seed_schedule_examples import seed_schedule_examples
+                seed_schedule_examples(url,run_id,temporary)
+                print('Published date mappings and verified them against the schedule receipts used to compile demo instruments.',flush=True)
+                from delivery_price_seed import seed as seed_delivery_prices
+                seed_delivery_prices(query,manifest)
+                print('Collected seven synthetic days of hourly and quarter-hour delivery prices, including the 2026-11-01 fall-back day.',flush=True)
+        if gas_demo:
+            query("INSERT INTO security.role_permissions SELECT id,p FROM security.roles CROSS JOIN unnest(ARRAY['ReadFacilityQuantities','RecordFacilityQuantities','ConfigureFacilityLimits'])p WHERE code='trader' ON CONFLICT DO NOTHING;")
+            from seed_gas_basis_demo import seed as seed_gas_demo
+            gas_demo_fixture=seed_gas_demo(url,run_id,temporary)
+            print('Loaded synthetic gas benchmark, basis and history plus three gas trades and a facility allocation plan.',flush=True)
+        if args.with_gas_operations_demo and not args.check:
+            from check_gas_operations import run_checks as seed_gas_operations
+            operations_demo=seed_gas_operations(url,query,manifest)
+            (temporary/'gas-operations-target.json').write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'facility':operations_demo}))
+            print('Loaded synthetic manual service, nomination and imbalance history: '+operations_demo['tradeId'],flush=True)
+        if args.with_exchange and not args.check:
+            from seed_exchange_positions import seed_positions as seed_exchange
+            seed_exchange(url,run_id,temporary)
+            print('Loaded twelve source-listed monthly futures examples with original synthetic execution prices.',flush=True)
+        if args.with_ppa:
+            from seed_preview_ppa import seed_ppa
+            seed_ppa(url,manifest)
+            from seed_demo_instruments import owned_client,seed_ppas
+            seed_ppas(owned_client(url,run_id,temporary),manifest)
+            print('Loaded five synthetic physical, virtual and generation-linked PPA trades in the mixed book.',flush=True)
+        print(f'PREVIEW_URL={url}',flush=True)
+        print('Private synthetic database. Ctrl+C stops the app and removes its owned database.',flush=True)
+        if args.check:
+            if args.structured_power_check:
+                from check_structured_power import run_checks as check_structured_power
+                structured=check_structured_power(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,
+                        'structuredTrading':{'snapshotId':structured['operating']['snapshotId'],
+                            'operating':structured['operating'],'hedge':structured['operating']['hedge'],'rec':structured['rec']}}))
+                    for suite in ('--structured-power','--structured-trading'):
+                        browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),suite],cwd=ROOT,env=env,start_new_session=True)
+                        if browser_process.wait(timeout=300):raise RuntimeError('Owned structured power browser checks failed: '+suite)
+            elif args.page_read_benchmark:
+                from benchmark_page_reads import run_benchmark as run_page_read_benchmark
+                print('PAGE_READS='+json.dumps(run_page_read_benchmark(url,query,manifest,dotnet=dotnet,api_pid=child.pid)),flush=True)
+            elif args.async_workbench_check:
+                from check_async_workbench_http import run_checks
+                run_checks(url,query,psql,env,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--async-workbench'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=300):raise RuntimeError('Owned asynchronous workbench browser checks failed')
+            elif args.side_calendar_check:
+                from check_side_calendar_http import run_checks as check_side_calendars
+                check_side_calendars(url,query,manifest)
+            elif args.context_read_check:
+                from check_context_read_demand import run_checks as check_context_read_demand
+                check_context_read_demand(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--context'],cwd=ROOT,env=env,start_new_session=True)
+                    browser_process.wait(timeout=240)
+                    if evidence:=os.environ.get('OPENETRM_CONTEXT_BROWSER_EVIDENCE'):
+                        destination=Path(evidence).resolve();destination.mkdir(parents=True,exist_ok=True)
+                        for screenshot in temporary.glob('*context*.png'):shutil.copy2(screenshot,destination/screenshot.name)
+                    if browser_process.returncode:raise RuntimeError('Owned context header browser checks failed')
+            elif args.unified_trading_check:
+                from check_demo_instruments import run_checks as check_demo
+                run_demo_worker=risk_worker_runner()
+                check_demo(url,manifest,query,run_worker=run_demo_worker,owned_root=temporary,run_id=run_id,psql=psql,environment=env)
+                from check_physical_gas_preview import run_checks as check_gas_purchase
+                check_gas_purchase(url)
+                from check_gas_composition import run_checks as check_composed
+                check_composed(url,query,manifest,run_worker=run_demo_worker)
+                if args.browser_check:
+                    # This synthetic operator explicitly holds both manual scheduling capabilities.
+                    principal=query("SELECT principal_id FROM security.identity_bindings WHERE issuer='https://preview.invalid' AND subject='trader';")
+                    for role in ['gas_operator','gas_service_admin']:
+                        query(f"INSERT INTO security.role_grants SELECT '{uuid4()}','{principal}',id,'{manifest['tenantId']}','{manifest['workspaceId']}',clock_timestamp()-interval '1 day',clock_timestamp()+interval '1 hour',false FROM security.roles WHERE code='{role}';")
+                    target=temporary/'browser-target.json';target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--unified-trading'],cwd=ROOT,env=env,check=True,timeout=240)
+            elif args.lng_cargo_check:
+                from check_lng_cargo_schema import run_schema_checks as check_lng_schema,run_resolution_checks as check_lng_resolution
+                from check_physical_lng_preview import run_checks as check_lng
+                check_lng_schema(query)
+                check_lng_resolution(query,manifest)
+                lng_receipt=check_lng(url,query,manifest)
+                from check_side_schedule_inspection import check_physical
+                check_physical(url,query,manifest,lng_receipt,'physical_lng',[539000,-490000])
+                lng_admission=temporary/'lng-admission.json'
+                lng_admission.write_text(query(f"SELECT request::text FROM trading.trades WHERE(catalog_id,id)=('{manifest['catalogId']}','{lng_receipt['tradeId']}');"))
+                subprocess.run([str(dotnet),'run','--project','tests/OpenEtrm.Api.Checks','--','--lng-admission',str(lng_admission)],cwd=ROOT,env=app_env,check=True,timeout=120)
+                from check_lng_cargo_schema import run_booking_authority_check
+                run_booking_authority_check(query,manifest,psql,env,lng_receipt)
+                from check_lng_portfolio import run_checks as check_lng_portfolio
+                check_lng_portfolio(url,lng_receipt,run_worker=risk_worker_runner(),query=query,manifest=manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json';target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--physical-lng'],cwd=ROOT,env=env,check=True,timeout=180)
+                from check_lng_retained import run_checks as check_lng_retained
+                check_lng_retained(url,query,manifest,lng_receipt)
+            elif args.physical_crude_check:
+                from check_physical_crude_preview import run_checks as check_crude,run_shape_checks as check_crude_shapes
+                if args.crude_setup_check:
+                    from check_crude_setup_editor import run_checks as check_crude_setup,run_resolution_authority_check
+                    check_crude_setup(url,query,manifest)
+                    run_resolution_authority_check(query,manifest,psql,env)
+                    from check_crude_setup_editor import run_gas_reference_bootstrap,run_reference_publication_checks
+                    run_reference_publication_checks(url,query,manifest,psql,env)
+                    run_gas_reference_bootstrap(manifest,temporary,dotnet,frozen_dll,app_env,args.browser.resolve() if args.browser_check else None)
+                crude_receipt=check_crude(url,query,manifest)
+                from check_side_schedule_inspection import check_physical
+                check_physical(url,query,manifest,crude_receipt,'physical_crude',[80000,-70000,100])
+                check_crude_shapes(query,manifest,crude_receipt)
+                from check_crude_portfolio import run_checks as check_crude_portfolio
+                crude_risk_worker=risk_worker_runner()
+                if args.crude_setup_check:
+                    from check_crude_setup_editor import run_booking_checks
+                    run_booking_checks(url,query,manifest,run_worker=crude_risk_worker)
+                if args.crude_lifecycle_check:
+                    from check_crude_lifecycle import run_checks as check_crude_lifecycle
+                    check_crude_lifecycle(url,query,manifest,crude_receipt)
+                    from check_crude_reversals import run_checks as check_crude_reversals
+                    check_crude_reversals(url,query,manifest,crude_receipt)
+                    from check_crude_inventory_sales import run_checks as check_crude_inventory_sales
+                    check_crude_inventory_sales(url,query,manifest,crude_receipt)
+                check_crude_portfolio(url,crude_receipt,run_worker=crude_risk_worker)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    # Full-page recovery scenarios repeatedly reload facts and valuation for the accumulated fixture.
+                    # Keep each action bounded separately from the complete booking, corrections and sales suite.
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--crude-setup' if args.crude_setup_check else '--physical-crude'],cwd=ROOT,env={**env,'OPENETRM_BROWSER_ACTION_WAIT_MS':'30000'},check=True,timeout=900)
+            elif args.physical_assistant_check:
+                from check_physical_assistant import run_checks as check_physical_assistant
+                physical_assistant=check_physical_assistant(url,query,manifest,fake_provider,gas_demo_fixture,dotnet,app_env,temporary)
+                if args.browser_check:
+                    target=temporary/'physical-assistant-browser.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'provider':fake_provider.control(),'facility':physical_assistant}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--physical-assistant'],cwd=ROOT,env=env,check=True,timeout=300)
+            elif args.gas_basis_demo_check:
+                from check_gas_basis_demo import run_checks as check_gas_demo
+                check_gas_demo(url,run_id,temporary,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'facility':gas_demo_fixture}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--gas-basis-demo'],cwd=ROOT,env=env,check=True,timeout=300)
+            elif args.gas_in_term_check:
+                from check_gas_in_term import run_checks as check_gas_in_term
+                def browse_in_term(fixture):
+                    target=temporary/'browser-target.json';target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'facility':fixture}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--gas-in-term'],cwd=ROOT,env=env,check=True,timeout=300)
+                # The private administrator command, run with the authenticator and the dedicated loader login (D360).
+                def admin_load_in_term(request):
+                    def private(name,value):
+                        path=temporary/name;path.write_text(value);path.chmod(0o600);return str(path)
+                    login=lambda user:f'Host={temporary};Port=55439;Database=postgres;Username={user};SSL Mode=Disable;Timeout=5;Command Timeout=30;Maximum Pool Size=2'
+                    config=private('gas-in-term-load.json',json.dumps({'manifestFile':str(temporary/'manifest.json'),
+                        'authenticatorConnectionFile':private('gas-in-term-authenticator.connection',login('preview_authenticator')),
+                        'loaderConnectionFile':private('gas-in-term-loader.connection',login('preview_gas_in_term_loader'))}))
+                    return subprocess.run([str(dotnet),str(frozen_dll),'--admin-load-gas-in-term',config,private('gas-in-term-request.json',json.dumps(request))],
+                                          cwd=ROOT,env=env,text=True,capture_output=True,timeout=300)
+                check_gas_in_term(url,query,manifest,risk_worker_runner(),admin_load_in_term,browse_in_term if args.browser_check else None)
+                from check_gas_point_in_term import run_checks as check_point_in_term
+                check_point_in_term(url,query,manifest,admin_load_in_term)
+            elif args.gas_indexed_check:
+                from check_gas_indexed import run_checks as check_gas_indexed
+                indexed_fixture=check_gas_indexed(url,query,manifest,risk_worker_runner())
+                from check_side_schedule_inspection import run_checks as check_side_schedule_inspection
+                check_side_schedule_inspection(url,query,manifest,indexed_fixture)
+                if args.browser_check:
+                    target=temporary/'browser-target.json';target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--gas-indexed'],cwd=ROOT,env=env,check=True,timeout=180)
+            elif args.physical_gas_check:
+                from check_physical_gas_preview import run_checks,run_shape_checks
+                run_checks(url,query,manifest)
+                run_shape_checks(query,manifest)
+                if args.facility_quantity_check:
+                    from check_facility_quantity_ledger import run_checks as check_facility_quantities
+                    facility_fixture=check_facility_quantities(url,query,manifest)
+                if args.gas_daily_quantity_check:
+                    from check_gas_daily_quantities import run_checks as check_gas_daily_quantities
+                    check_gas_daily_quantities(url,query,manifest)
+                    if args.gas_quantity_benchmark:
+                        from benchmark_gas_quantities import run as benchmark_gas_quantities
+                        benchmark_gas_quantities(url,query,manifest,child.pid)
+                if args.gas_operations_check:
+                    from check_gas_operations import run_checks as check_gas_operations
+                    gas_operations_fixture=check_gas_operations(url,query,manifest)
+                if args.gas_billing_check:
+                    from check_gas_billing import run_checks as check_gas_billing
+                    gas_billing_fixture=check_gas_billing(url,query,manifest)
+                run_gas_worker=risk_worker_runner() if args.gas_composition_check or args.gas_amendments_check or args.gas_indexed_check else None
+
+                if args.gas_composition_check:
+                    from check_gas_composition import run_checks as check_gas_composition
+                    check_gas_composition(url,query,manifest,run_worker=run_gas_worker)
+                if args.gas_amendments_check:
+                    from check_gas_amendments import run_checks as check_gas_amendments
+                    amendment_fixture=check_gas_amendments(url,query,manifest,run_worker=run_gas_worker)
+                if args.deal_ticket_check:
+                    from check_deal_ticket import run_checks as check_deal_ticket
+                    check_deal_ticket(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,**({'facility':gas_operations_fixture} if args.gas_operations_check else {'facility':gas_billing_fixture} if args.gas_billing_check else {'facility':facility_fixture} if args.facility_quantity_check else {}),**({'gasAmendment':amendment_fixture} if args.gas_amendments_check else {})}))
+                    if args.gas_operations_check:
+                        subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--gas-operations'],cwd=ROOT,env=env,check=True,timeout=180)
+                    if args.gas_billing_check:
+                        subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--gas-billing'],cwd=ROOT,env=env,check=True,timeout=180)
+                    if args.gas_amendments_check:
+                        subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--gas-amendments'],cwd=ROOT,env=env,check=True,timeout=180)
+
+                    if args.facility_quantity_check:
+                        subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--facility-quantities'],cwd=ROOT,env=env,check=True,timeout=300)
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--physical-gas'],cwd=ROOT,env=env,check=True,timeout=180)
+                    if args.deal_ticket_check:
+                        subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--deal-ticket'],cwd=ROOT,env=env,check=True,timeout=300)
+                if args.gas_setup_check:
+                    from check_gas_point_curve import run_checks as check_point_curve
+                    check_point_curve(url,query,manifest)
+                    from check_gas_setup_editor import run_checks as check_gas_setup
+                    check_gas_setup(url,query,manifest)
+            elif args.retained_schedule_check:
+                from check_retained_side_schedules import run_stage_checks,run_temporal_checks
+                run_stage_checks(query,manifest)
+                booked_program_instruments,before_programs=run_temporal_checks(url,query,manifest)
+                from check_booked_side_programs import run_direct_read_checks,run_authority_checks,book_native_programs
+                booked_program_instruments+=book_native_programs(url,manifest,query)
+                booked_program_items=run_direct_read_checks(query,manifest,temporary,dotnet,app_env,booked_program_instruments,
+                    ('fixed','floating','power','certificate','capacity'))
+                run_authority_checks(query,manifest,booked_program_items[0],before_programs)
+            elif args.demo_instruments_check:
+                from check_demo_instruments import run_checks
+                run_demo_worker=risk_worker_runner()
+                run_checks(url,manifest,query,run_worker=run_demo_worker,owned_root=temporary,run_id=run_id,psql=psql,environment=env)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--demo-instruments'],cwd=ROOT,env=env,check=True,timeout=240)
+            elif args.live_calculation_check:
+                from check_live_calculation import run_checks as check_live_calculation
+                check_live_calculation(url,manifest,query)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--live-calculation'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=240):raise RuntimeError('Owned live calculation browser checks failed')
+            elif args.connected_portfolio_check:
+                from check_custom_projection_db import run_checks as check_custom_projection_db
+                check_custom_projection_db(query,manifest)
+                from check_connected_portfolio import run_checks as check_connected_portfolio
+                worker_env=prepare_risk_worker()
+                def run_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=worker_env,check=True,timeout=90)
+                check_connected_portfolio(url,manifest,query,run_worker)
+                from check_published_curve_sources import run_checks as check_published_curve_sources
+                check_published_curve_sources(url,manifest,query,run_worker)
+                from check_curve_activation import run_checks as check_curve_activation
+                check_curve_activation(url,manifest,query)
+                from check_daily_custom_projection import run_checks as check_daily_custom_projection
+                check_daily_custom_projection(url,manifest,query,run_worker)
+                from check_curve_lookup import run_checks as check_curve_lookup
+                check_curve_lookup(url,manifest,query,run_worker)
+            elif args.monte_carlo_risk_check:
+                from check_monte_carlo_risk import run_checks as check_monte_carlo
+                worker_env=prepare_risk_worker(timeout=120)
+                run_monte_carlo_worker=risk_worker_runner(timeout=120,worker_env=worker_env)
+                check_monte_carlo(url,manifest,query,run_monte_carlo_worker)
+                if args.with_exchange:
+                    from check_hybrid_monte_carlo_risk import option_checks
+                    option_checks(url,exchange_manifest,risk_worker_runner(exchange_manifest,'preview_hybrid_option_worker',timeout=120))
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    risk_worker_process=subprocess.Popen([str(dotnet),str(frozen_dll),'--risk-worker','serve'],cwd=ROOT,env=worker_env,start_new_session=True)
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--monte-carlo-risk'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=360):raise RuntimeError('Owned Monte Carlo browser checks failed')
+                    if evidence:=os.environ.get('OPENETRM_MONTE_CARLO_BROWSER_EVIDENCE'):
+                        destination=Path(evidence).resolve();destination.mkdir(parents=True,exist_ok=True)
+                        for screenshot in temporary.glob('risk-monte-carlo-*.png'):shutil.copy2(screenshot,destination/screenshot.name)
+
+            elif args.historical_risk_check:
+                from check_historical_risk import run_checks as check_historical
+                worker_env=prepare_risk_worker()
+                def run_historical_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=worker_env,check=True,timeout=120)
+                check_historical(url,manifest,query,run_historical_worker)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    risk_worker_process=subprocess.Popen([str(dotnet),str(frozen_dll),'--risk-worker','serve'],cwd=ROOT,env=worker_env,start_new_session=True)
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--historical-risk'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=360):raise RuntimeError('Owned historical browser checks failed')
+                    if evidence:=os.environ.get('OPENETRM_HISTORICAL_BROWSER_EVIDENCE'):
+                        destination=Path(evidence).resolve();destination.mkdir(parents=True,exist_ok=True)
+                        for screenshot in temporary.glob('risk-historical-*.png'):shutil.copy2(screenshot,destination/screenshot.name)
+            elif args.parametric_risk_check:
+                from check_parametric_risk import run_checks as check_parametric
+                worker_env=prepare_risk_worker()
+                def run_statistical_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=worker_env,check=True,timeout=90)
+                check_parametric(url,manifest,query,run_statistical_worker)
+                from check_workspace_clock import run_checks as check_workspace_clock
+                check_workspace_clock(query,manifest,psql,env)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    risk_worker_process=subprocess.Popen([str(dotnet),str(frozen_dll),'--risk-worker','serve'],cwd=ROOT,env=worker_env,start_new_session=True)
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--parametric-risk'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=300):raise RuntimeError('Owned parametric browser checks failed')
+            elif args.factor_history_check:
+                from check_factor_history import run_checks as check_factor_history
+                check_factor_history(url,manifest,query)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--factor-history'],cwd=ROOT,env=env,check=True,timeout=240)
+            elif args.risk_jobs_check:
+                from preview_client import PreviewClient
+                from check_risk_preview import run_checks as check_risk
+                from check_risk_jobs import run_checks as check_risk_jobs
+                from check_portfolio_risk import run_checks as check_portfolio_risk
+                from check_portfolio_risk_authority import run_checks as check_portfolio_risk_authority
+                from check_risk_jobs_db import run_checks as check_risk_jobs_db
+                class Client(PreviewClient):
+                    def __init__(self): super().__init__(url)
+                def check(name,condition=True):
+                    if not condition: raise AssertionError(name)
+                    print('PASS '+name,flush=True)
+                worker_env=prepare_risk_worker()
+                def run_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=worker_env,check=True,timeout=90)
+                from check_curve_scenarios import run_checks as check_curve_scenarios
+                check_curve_scenarios(url,run_worker)
+                check_portfolio_risk_authority(Client,query,check,manifest,temporary)
+                check_portfolio_risk(Client,check,run_worker,query)
+                check_risk(Client,check)
+                check_risk_jobs(Client,check,run_worker)
+                check_risk_jobs_db(query,manifest,psql,env)
+                from check_portfolio_risk import run_supplemental_scope
+                run_supplemental_scope(Client,check,query,manifest,run_worker)
+                from check_risk_run_definitions import run_now_checks
+                run_now_checks(url,query,run_worker)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    risk_worker_process=subprocess.Popen([str(dotnet),str(frozen_dll),'--risk-worker','serve'],cwd=ROOT,env=worker_env,start_new_session=True)
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--risk'],cwd=ROOT,env=env,start_new_session=True)
+                    # Both complete suites include sequential multipart admission
+                    # and retained-worker recovery within their own deadlines.
+                    if browser_process.wait(timeout=600):raise RuntimeError('Owned risk browser checks failed')
+            elif args.interval_series_benchmark:
+                from benchmark_interval_series import run_benchmark
+                print(json.dumps(run_benchmark(url,query,dotnet,child.pid),indent=2),flush=True)
+            elif args.blotter_stream_benchmark:
+                from benchmark_blotter_stream import run_benchmark as run_blotter_stream_benchmark
+                run_blotter_stream_benchmark(url,manifest,query,dotnet=dotnet,api_pid=child.pid,run_id=run_id,owned_root=temporary,output=args.output.resolve())
+            elif args.usage_benchmark:
+                from benchmark_usage import run_benchmark as run_usage_benchmark
+                print(json.dumps(run_usage_benchmark(url,query,psql,manifest,app_env,dotnet,child.pid),indent=2),flush=True)
+            elif args.close_risk_lease_check:
+                from check_close_risk_leases import run_checks as check_close_risk_leases
+                check_close_risk_leases(url,query,manifest,dotnet,temporary,app_env,psql,env)
+            elif args.close_risk_check:
+                from check_close_risk import run_checks as check_close_risk
+                check_close_risk(url,query,manifest,dotnet,temporary,app_env,psql,env)
+            elif args.ppa_bookings_check:
+                from check_ppa_portfolio import run_checks as check_ppa_portfolio
+                check_ppa_portfolio(url,query,manifest,dotnet,temporary,app_env)
+                from check_ppa_bookings_http import run_checks as check_ppa_bookings_http
+                check_ppa_bookings_http(url,query,manifest,benchmark=args.ppa_http_benchmark,api_pid=child.pid,dotnet=dotnet)
+                from check_ppa_ui_http import run_checks as check_ppa_ui_http
+                ppa_browser_fixture=check_ppa_ui_http(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'ppa':ppa_browser_fixture}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--ppa'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=240):raise RuntimeError('Owned PPA browser checks failed')
+                    if evidence:=os.environ.get('OPENETRM_PPA_BROWSER_EVIDENCE'):
+                        destination=Path(evidence).resolve();destination.mkdir(parents=True,exist_ok=True)
+                        for screenshot in temporary.glob('ppa-*.png'):shutil.copy2(screenshot,destination/screenshot.name)
+
+            elif args.ppa_check and not args.ephemeral_context_check:
+                from check_ppa_http import run_checks as check_ppa_http
+                check_ppa_http(url,query,manifest)
+                from check_ppa_break_even import run_checks as check_ppa_break_even
+                check_ppa_break_even(url,query,manifest)
+                from check_settlement_preview import run_checks as check_settlement_preview
+                check_settlement_preview(url,query,manifest,dotnet,temporary,env,quarter_only=args.settlement_quarter_check)
+            elif args.power_actual_check:
+                from check_power_actual_http import run_checks as check_power_actual_http
+                check_power_actual_http(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--power-publication'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=240):raise RuntimeError('Owned power publication browser checks failed')
+            elif args.interval_curves_check:
+                from check_interval_curves_http import run_checks as check_interval_curves_http
+                check_interval_curves_http(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--interval-curves'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=180):raise RuntimeError('Owned interval curves browser checks failed')
+            elif args.interval_series_check:
+                from check_interval_series_http import run_checks as check_interval_series_http
+                check_interval_series_http(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--interval-series'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=180):raise RuntimeError('Owned interval series browser checks failed')
+            elif args.side_observation_check:
+                from check_side_observations import run_checks as check_side_observations
+                check_side_observations(url,query,manifest,psql,app_env)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--side-observations'],cwd=ROOT,env=env,start_new_session=True)
+                    # This combines 26 observation checks and the 171 swap checks
+                    # whose standalone suite has a 300s budget. Linux reached
+                    # 194/195 with continuous progress before the former 240s
+                    # cutoff. Individual action and application deadlines stay unchanged.
+                    if browser_process.wait(timeout=360):raise RuntimeError('Owned side observation browser checks failed')
+            elif args.swap_risk_holdings_check:
+                from check_swap_risk_holdings import run_checks as check_swap_risk_holdings
+                check_swap_risk_holdings(url,query,manifest,dotnet,temporary,app_env,psql)
+            elif args.close_out_drafts_check:
+                from check_close_out_drafts import run_checks as check_close_out_drafts
+                close_out_fixture=check_close_out_drafts(url,query,dotnet,temporary,app_env)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'closeOut':close_out_fixture}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--close-out'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=240):raise RuntimeError('Owned Blotter close-out browser checks failed')
+            elif args.curve_eligibility_check:
+                from check_curve_eligibility import run_checks as check_curve_eligibility
+                check_curve_eligibility(url,query,manifest)
+            elif args.regional_closes_check:
+                from check_close_sessions import run_checks as check_close_sessions
+                check_close_sessions(url,query,manifest)
+                from check_regional_closes import run_checks as check_regional_closes
+                check_regional_closes(url,query,manifest)
+                # Last: it records bare closes directly in SQL, which no later read could qualify.
+                from check_regional_closes_sql import run_checks as check_regional_closes_sql
+                check_regional_closes_sql(url,query,manifest)
+                from check_exact_pin_reads import run_checks as check_exact_pin_reads
+                check_exact_pin_reads(query,manifest,dotnet,app_env,temporary,psql,env)
+            elif args.pilot_close_check:
+                from check_pilot_close import run_checks as check_pilot_close
+                check_pilot_close(url,query,manifest,psql,app_env)
+                from check_pilot_worker import run_checks as check_pilot_worker
+                pilot_run=check_pilot_worker(url,query,manifest,dotnet,temporary,app_env,psql)
+                from check_pilot_reports import run_checks as check_pilot_reports
+                check_pilot_reports(url,query,manifest,pilot_run,owner_profile='approver',psql=psql,environment=app_env)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--pilot-close'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=180):raise RuntimeError('Owned pilot close browser checks failed')
+            elif args.factor_swap_check:
+                from check_factor_swaps import run_checks as check_factor_swaps
+                worker_env=prepare_risk_worker()
+                def run_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=worker_env,check=True,timeout=90)
+                check_factor_swaps(url,query,manifest,run_worker)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--factor-swaps'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=180):raise RuntimeError('Owned factor swap browser checks failed')
+            elif args.market_dates_reads_check:
+                from check_market_dates_reads import run_checks as check_market_dates_reads
+                check_market_dates_reads(url,query,manifest,psql,env,temporary/'postgres.log',child.pid,verify=not args.market_dates_benchmark_only)
+            elif args.ephemeral_context_check:
+                from check_ephemeral_contexts import run_checks
+                def check_runtime_context_browser():
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    subprocess.run(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--ephemeral-contexts'],cwd=ROOT,env=env,check=True,timeout=180)
+                run_checks(url,query,manifest,check_runtime_context_browser if args.browser_check else None,risk_worker_runner())
+            elif args.market_dates_check:
+                from check_market_dates import run_checks as check_market_dates
+                check_market_dates(url,query,manifest,temporary/'postgres.log')
+                subprocess.run([str(dotnet),'run','--project','tests/OpenEtrm.Api.Checks','--','--market-calendar-demand'],cwd=ROOT,env=app_env,check=True,timeout=120)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--market-dates'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=240):raise RuntimeError('Owned market date browser checks failed')
+                from check_workspace_as_of import run_checks as check_workspace_as_of
+                check_workspace_as_of(url,query,manifest)
+                from check_ephemeral_calendar import run_checks as check_ephemeral_calendar
+                check_ephemeral_calendar(url,query,manifest,psql,env)
+            elif args.contract_dates_check:
+                from check_contract_dates import run_checks as check_contract_dates
+                check_contract_dates(url,query,manifest,psql,env)
+                from check_contract_materialization import run_checks as check_materialization
+                check_materialization(url,query,manifest,psql,env)
+                from check_curve_definitions import run_checks as check_curve_definitions
+                check_curve_definitions(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--contract-dates'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=360):raise RuntimeError('Owned shared contract-date browser checks failed')
+            elif args.power_flat_check:
+                from check_power_flat import run_checks as check_power_flat
+                if args.power_context_check:
+                    from check_power_context import run_checks as check_power_context
+                    check_power_context(url,query,manifest,dotnet,temporary,env)
+                else:check_power_flat(url,query,manifest,booked_roll=args.power_booked_roll_check)
+            elif args.contract_observation_curve_check:
+                from check_contract_observation_storage import run_checks as check_contract_observation_storage
+                check_contract_observation_storage(url,query,manifest)
+                from check_contract_observation_curve import run_checks as check_contract_observation_curve
+                check_contract_observation_curve(url,query,manifest,dotnet,temporary,app_env)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--contract-observation-curve'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=180):raise RuntimeError('Owned contract observation curve browser checks failed')
+            elif args.custom_curves_check:
+                from check_custom_curves import run_checks as check_custom_curves
+                check_custom_curves(url,query,manifest,temporary/'postgres.log',check_budget=not args.price_authoring_check)
+                from check_curve_activation import run_checks as check_curve_activation
+                check_curve_activation(url,manifest,query)
+                if args.price_authoring_check:
+                    try:
+                        from check_price_publication_http import run_checks as check_price_publications
+                        check_price_publications(url,query,manifest)
+                        from check_contract_price_terms_http import run_checks as check_contract_price_terms
+                        check_contract_price_terms(url,query,manifest)
+                        from check_publication_release_pricing import run_checks as check_publication_release_pricing
+                        check_publication_release_pricing(url,query,manifest)
+                    except Exception:
+                        print('Owned synthetic authoring API diagnostics:\n'+(temporary/'app.log').read_text()[-8000:],flush=True)
+                        raise
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_suite='--'+args.authoring_browser_suite if args.authoring_browser_suite else '--price-authoring' if args.price_authoring_check else '--custom-curves'
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),browser_suite],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=180):raise RuntimeError('Owned custom curve browser checks failed')
+            elif args.execution_check:
+                from check_futures_execution import run_checks as check_execution
+                check_execution(url,query,manifest)
+            elif args.reference_import_check:
+                from check_reference_import import run_checks as check_reference_import
+                check_reference_import(query,manifest,temporary,dotnet,env)
+            elif args.reference_demo_check:
+                from check_reference_demo import run_checks as check_reference_demo
+                worker_env=prepare_risk_worker()
+                def run_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=worker_env,check=True,timeout=90)
+                check_reference_demo(url,manifest,reference_demo,query,run_worker)
+                reference_reuse=temporary/'reference-reuse.json';reference_reuse.write_text(json.dumps(reference_demo))
+                subprocess.run([str(dotnet),'run','--project','tests/OpenEtrm.Api.Checks','--','--reference-reuse',str(reference_reuse)],
+                    cwd=ROOT,env=app_env,check=True,timeout=120)
+            elif args.reference_check:
+                from check_reference_display_http import run_checks as check_reference_display
+                check_reference_display(url,query)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--reference-editor'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=180):raise RuntimeError('Owned reference-editor browser checks failed')
+            elif args.jobs_check:
+                from check_jobs_http import observe_nodes, run_checks as check_jobs
+                check_jobs(url,query)
+                from check_managed_pool import check as check_pool, TASK, NODE
+                pool_env={**prepare_risk_worker(),'OPENETRM_TASK_ID':TASK,'OPENETRM_NODE_ID':NODE,'OPENETRM_TASK_SLOT':'1'}
+                def pool_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=pool_env,check=True,timeout=90)
+                controller_connection=temporary/'synthetic-controller.connection'
+                controller_connection.write_text(f'Host={temporary};Port=55439;Database=postgres;Username=jobs_fixture_worker;SSL Mode=Disable')
+                controller_connection.chmod(0o600)
+                def pool_controller():
+                    subprocess.run([str(dotnet),'run','--no-restore','--project','tests/OpenEtrm.Api.Checks','--','--managed-pool-controller',str(controller_connection)],
+                                   cwd=ROOT,env=env,check=True,timeout=90)
+                from check_managed_pool import ReadBarrier
+                admin,risk=check_pool(url,query,pool_worker,pool_controller,lambda:ReadBarrier(psql,env))
+                if args.historical_pool_check:
+                    from check_historical_pool import run as historical_check
+                    def historical_worker(task):
+                        identity={'OPENETRM_TASK_ID':task['id'],'OPENETRM_NODE_ID':task['node'],'OPENETRM_TASK_SLOT':str(task['slot'])}
+                        subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env={**pool_env,**identity},check=True,timeout=90)
+                    historical_check(manifest,query,admin,risk,historical_worker,lambda:ReadBarrier(psql,env))
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    # Keep the disposable controller's inventory current while the browser exercises node commands.
+                    observe_nodes(query)
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--jobs'],cwd=ROOT,env=env,start_new_session=True)
+                    deadline=time.monotonic()+120
+                    while browser_process.poll() is None:
+                        remaining=deadline-time.monotonic()
+                        if remaining<=0:raise subprocess.TimeoutExpired(browser_process.args,120)
+                        try:browser_process.wait(timeout=min(5,remaining))
+                        except subprocess.TimeoutExpired:observe_nodes(query)
+                    if browser_process.returncode:raise RuntimeError('Owned jobs browser checks failed')
+            elif args.hosted_check:
+                from check_hosted_http import run_checks as check_hosted_http
+                check_hosted_http(temporary,manifest,query,dotnet,frozen_dll,app_env,args.browser if args.browser_check else None,url,run_id,psql=psql,psql_environment=env)
+            elif args.lifecycle_swap_browser_check:
+                from lifecycle_swap_browser_fixture import prepare as prepare_lifecycle_books
+                target=temporary/'browser-target.json'
+                target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'lifecycleSwapBooks':prepare_lifecycle_books(query,manifest)}))
+                browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--lifecycle-swaps'],cwd=ROOT,env={**env,'OPENETRM_BROWSER_ACTION_WAIT_MS':'30000'},start_new_session=True)
+                if browser_process.wait(timeout=420):raise RuntimeError('Owned shared lifecycle swap browser checks failed')
+            elif args.scheduled_swap_check:
+                from check_scheduled_swaps import run_checks as check_scheduled
+                worker_env=prepare_risk_worker()
+                def run_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=worker_env,check=True,timeout=90)
+                settlement_fixture=check_scheduled(url,query,manifest,run_worker=run_worker)
+                from check_swap_settlement_agents import prepare as prepare_settlement_agent
+                agent_fixture=temporary/'settlement-agent.json'
+                agent_fixture.write_text(json.dumps(prepare_settlement_agent(query,settlement_fixture)))
+                subprocess.run([str(dotnet),'run','--project','tests/OpenEtrm.Api.Checks','--','--swap-holding-markets',str(agent_fixture)],cwd=ROOT,env=app_env,check=True,timeout=120)
+                subprocess.run([str(dotnet),'run','--project','tests/OpenEtrm.Api.Checks','--','--swap-settlement-agent',str(agent_fixture)],cwd=ROOT,env=app_env,check=True,timeout=120)
+                if args.browser_check:
+                    from lifecycle_swap_browser_fixture import prepare as prepare_lifecycle_books
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'lifecycleSwapBooks':prepare_lifecycle_books(query,manifest)}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--scheduled-swaps'],cwd=ROOT,env={**env,'OPENETRM_BROWSER_ACTION_WAIT_MS':'30000'},start_new_session=True)
+                    # Four owned browser suites: authoring, schedules, settlement and netting.
+                    # Every action here re-reads scheduled swaps, so each may wait up to thirty seconds; keep an overall bound too.
+                    if browser_process.wait(timeout=900):raise RuntimeError('Owned scheduled-swap browser checks failed')
+            elif args.draft_check:
+                from check_draft_pricing import run_checks as check_draft
+                check_draft(url,query,manifest)
+                from check_swap_composition import run_checks as check_composition
+                check_composition(url,query,manifest)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--swaps'],cwd=ROOT,env=env,start_new_session=True)
+                    # This suite has 169 checks. Two Linux runs made continuous
+                    # progress through 149/150 before the former 180s whole-suite
+                    # cutoff. Individual action and application deadlines stay unchanged.
+                    if browser_process.wait(timeout=300):raise RuntimeError('Owned swap browser checks failed')
+            elif args.booking_check:
+                from check_definition_publication import run_checks as check_definition_publication
+                check_definition_publication(query,manifest)
+                from check_booking_facts import run_checks as check_booking_facts
+                check_booking_facts(url,query,manifest)
+            elif args.exchange_check or args.cash_pnl_check:
+                if args.exchange_check:
+                    from check_exchange_preview import run_checks as check_exchange
+                    check_exchange(url,query,exchange_manifest)
+                    from seed_exchange_positions import seed_positions as seed_exchange
+                    seeded=seed_exchange(url,run_id,temporary)
+                    assert len(seeded)==13 and seeded==seed_exchange(url,run_id,temporary)
+                    print('PASS exchange examples populate thirteen source-listed monthly product families through idempotent authorized bookings.',flush=True)
+                    if args.browser_check:
+                        target=temporary/'browser-target.json'
+                        target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                        browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--exchange'],cwd=ROOT,env=env,start_new_session=True)
+                        if browser_process.wait(timeout=120):raise RuntimeError('Owned exchange browser checks failed')
+                    # Option bookings, lifecycle and portfolio risk, after the Blotter reads above that count the seeded futures.
+                    from check_futures_option_lifecycle import run_checks as check_option_booking,run_lifecycle_checks as check_option_lifecycle,check_agent_catalog
+                    check_option_booking(url,query,exchange_manifest)
+                    check_option_lifecycle(url,query,exchange_manifest)
+                    check_agent_catalog(url,query,exchange_manifest,fake_provider)
+                    from check_futures_option_portfolio import run_checks as check_option_portfolio
+                    check_option_portfolio(url,query,exchange_manifest,run_worker=risk_worker_runner(exchange_manifest,'exchange_risk_worker'))
+                    # The volatility surface fit of each option product, in the managed calculation against the example's settlements.
+                    from check_vol_surface_fit import run_checks as check_vol_surface_fit
+                    check_vol_surface_fit(url,query,exchange_manifest,dotnet,temporary,app_env)
+                    # Surfaces fitted as jobs on the risk queue, recorded and read back over HTTP.
+                    from check_vol_surface_api import run_checks as check_vol_surface_api
+                    check_vol_surface_api(url,query,exchange_manifest,run_worker=risk_worker_runner(exchange_manifest,'exchange_fit_worker',timeout=300),worker_login='exchange_fit_worker')
+                    if args.browser_check:
+                        # The option ticket and position window, beside the options the checks above booked; then Vol surfaces, whose fits
+                        # the trader submits and a served risk worker runs.
+                        from check_vol_surface_api import grant_browser_fitter
+                        grant_browser_fitter(query,exchange_manifest)
+                        risk_worker_process=subprocess.Popen([str(dotnet),str(frozen_dll),'--risk-worker','serve'],cwd=ROOT,env=prepare_risk_worker(exchange_manifest,'exchange_browser_worker',timeout=300),start_new_session=True)
+                        browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--futures-options'],cwd=ROOT,env={**env,'OPENETRM_BROWSER_ACTION_WAIT_MS':'30000'},start_new_session=True)
+                        if browser_process.wait(timeout=720):raise RuntimeError('Owned futures option browser checks failed')
+                        # The browser deliberately leaves a refit running. Release its worker's authority lock before the
+                        # unrelated cash/P&L checks revoke reference access; those checks require no background worker.
+                        stop_owned_group(risk_worker_process)
+                        risk_worker_process=None
+                from check_recorded_cash import run_checks as check_recorded_cash
+                def verify_pnl_persistence(fixture):
+                    path=temporary/'pnl-persistence.json'
+                    path.write_text(json.dumps(fixture));path.chmod(0o600)
+                    subprocess.run([str(dotnet),'run','--project','tests/OpenEtrm.Api.Checks','--','--pnl-persistence',str(path)],cwd=ROOT,env=app_env,check=True,timeout=120)
+                check_recorded_cash(url,query,exchange_manifest,verify_persistence=verify_pnl_persistence)
+            elif args.party_check:
+                from check_party_editors import run_checks as check_parties
+                check_parties(url)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--parties-power'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=120):raise RuntimeError('Owned party/power browser checks failed')
+            elif args.unit_check:
+                from check_units_preview import run_checks as check_units
+                check_units(url,manifest.get('unitCatalogPreviousKnownAt'))
+                from check_deal_formats import run_checks as check_formats
+                check_formats(url)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--units'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=60):raise RuntimeError('Owned unit browser checks failed')
+            elif args.index_fixing_check:
+                from check_index_fixings import run_checks as check_index_fixings
+                check_index_fixings(url,query,manifest)
+            elif args.market_read_check:
+                from check_market_read_authority import run_checks as check_market_authority
+                check_market_authority(query,manifest)
+            elif args.valuation_status_check:
+                from check_blotter_valuation_status import run_checks as check_valuation_status, run_risk_checks as check_valuation_status_risk, run_scheduled_checks as check_scheduled_valuation_status
+                worker_env=prepare_risk_worker()
+                def run_worker():
+                    subprocess.run([str(dotnet),str(frozen_dll),'--risk-worker','once'],cwd=ROOT,env=worker_env,check=True,timeout=90)
+                valuation_session=check_valuation_status(url)
+                check_valuation_status_risk(valuation_session,run_worker)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--valuation-status'],cwd=ROOT,env=env,start_new_session=True)
+                    if browser_process.wait(timeout=180):raise RuntimeError('Owned valuation status browser checks failed')
+                # Last, as it books a scheduled swap beside the seeded positions the checks above count.
+                check_scheduled_valuation_status(valuation_session)
+            elif args.desk_fields_check:
+                from check_blotter_desk_fields import run_checks as check_desk_fields
+                check_desk_fields(url)
+            elif args.provider_adapters_check:
+                from preview_client import PreviewClient
+                from check_additional_providers import run_checks as check_additional_providers
+                admin=PreviewClient(url);admin.bootstrap();admin.call('profile',{'profile':'admin'})
+                admin.call('admin/create',{'operationId':str(uuid4()),'login':'provider_adapters_admin','name':'Synthetic provider administrator',
+                                          'kind':'human','roles':['access_administrator','viewer']})
+                admin.call('profile',{'profile':'provider_adapters_admin'})
+                check_additional_providers(query,manifest,fake_provider,proxy_trap,admin)
+            elif args.assistant_workspace_check:
+                from check_assistant_digest import run_checks as check_assistant_digest
+                check_assistant_digest(dotnet)
+                from check_assistant_workspace import run_checks as check_assistant_workspace
+                check_assistant_workspace(url,query,manifest,fake_provider,proxy_trap,psql,app_env)
+                if args.browser_check:
+                    target=temporary/'assistant-workspace-browser.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'provider':fake_provider.control()}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--assistant-workspace'],cwd=ROOT,env=env,start_new_session=True)
+                    browser_process.wait(timeout=300)
+                    if browser_process.returncode:raise RuntimeError('Assistant workspace browser checks failed')
+                    if evidence:=os.environ.get('OPENETRM_ASSISTANT_BROWSER_EVIDENCE'):
+                        destination=Path(evidence).resolve();destination.mkdir(parents=True,exist_ok=True)
+                        for screenshot in temporary.glob('assistant-*.png'):shutil.copy2(screenshot,destination/screenshot.name)
+            elif args.assistant_check or args.assistant_runtime_check or args.assistant_browser_check:
+                if args.assistant_check:
+                    # First, while nothing else can be writing to the application log.
+                    from check_request_refusals import run_checks as check_request_refusals
+                    # The preview holds at most 64 sessions, so the modules reuse the administrator's, a second of the
+                    # administrator's and the viewer's sessions instead of each opening its own.
+                    admin=check_request_refusals(url,temporary/'app.log')
+                    from check_model_providers import run_checks as check_model_providers
+                    viewer,again=check_model_providers(url,query,psql,manifest,temporary,app_env,dotnet,admin)
+                    from check_model_catalog import run_checks as check_model_catalog
+                    check_model_catalog(url,query,psql,manifest,app_env,admin,viewer,again)
+                    from check_model_qualification import run_checks as check_model_qualification
+                    check_model_qualification(query,psql,manifest,app_env,admin,viewer,again)
+                    from check_model_versions import run_checks as check_model_versions
+                    check_model_versions(query,psql,manifest,app_env,admin,viewer,again)
+                    from check_provider_test_http import run_checks as check_provider_test_http
+                    check_provider_test_http(url,query,psql,manifest,app_env,temporary/'app.log',fake_provider,proxy_trap,admin,viewer,again)
+                    from check_provider_tests import run_checks as check_provider_tests
+                    check_provider_tests(query,psql,manifest,app_env,admin)
+                    from check_agent_administration import run_checks as check_agent_administration
+                    check_agent_administration(query,psql,manifest,app_env,admin,viewer,again)
+                    from check_agent_grants import run_checks as check_agent_grants
+                    check_agent_grants(url,query,psql,manifest,app_env,admin,viewer)
+                else:
+                    from preview_client import PreviewClient
+                    admin=PreviewClient(url);admin.bootstrap();admin.call('profile',{'profile':'admin'})
+                if not args.assistant_browser_check:
+                    from check_agent_turns import run_checks as check_agent_turns
+                    check_agent_turns(url,query,psql,manifest,app_env,dotnet)
+                    from check_agent_turn_http import run_checks as check_agent_turn_http
+                    sessions=check_agent_turn_http(url,query,psql,manifest,app_env,temporary/'app.log',fake_provider,proxy_trap)
+                    from check_agent_tool_http import run_checks as check_agent_tool_http
+                    check_agent_tool_http(url,query,psql,manifest,app_env,temporary/'app.log',fake_provider,proxy_trap,*sessions,api_pid=child.pid)
+                    from check_turn_stream_http import run_checks as check_turn_stream_http
+                    check_turn_stream_http(url,query,psql,manifest,app_env,fake_provider,proxy_trap,*sessions)
+                    from check_model_usage import run_checks as check_model_usage
+                    check_model_usage(url,query,psql,manifest,app_env)
+                from check_additional_providers import run_checks as check_additional_providers
+                if args.assistant_runtime_check or args.assistant_browser_check:
+                    provider_admin='synthetic_runtime_provider_'+uuid4().hex[:8]
+                    admin.call('admin/create',{'operationId':str(uuid4()),'login':provider_admin,'name':'Synthetic runtime provider administrator',
+                                              'kind':'human','roles':['access_administrator','viewer']})
+                    admin.call('profile',{'profile':provider_admin})
+                check_additional_providers(query,manifest,fake_provider,proxy_trap,admin)
+                # A scope keeps at most 64 sessions for their 30 minutes (Program.cs). The browser checks below open their
+                # own, as will later page-assistant suites, so the sessions this process has opened so far, in every suite
+                # before this point, leave a stated margin for them.
+                from preview_client import PreviewClient
+                opened,cap,margin=PreviewClient.sessions['baseline'],64,SESSION_MARGIN
+                if opened+margin>cap:raise RuntimeError(f'This process opened {opened} of the {cap} sessions a scope keeps by the end of the page-assistant checks, leaving fewer than {margin}.')
+                print(f'PASS this process opened {opened} of the {cap} sessions a scope keeps by the end of the page-assistant checks, leaving {cap-opened}, at least {margin} for the browser and later suites',flush=True)
+                if args.browser_check:
+                    target=temporary/'browser-target.json'
+                    # The panel's scenario scripts the fake provider's answers, and releases the ones it holds, through its control listener.
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id,'provider':fake_provider.control()}))
+                    if args.assistant_browser_check:
+                        # The standalone browser fixture owns a second readable USD reference for the currency-choice check.
+                        alternate=str(uuid4())
+                        query(f"INSERT INTO ref_data.revisions(catalog_id,id,revision_key) VALUES('{manifest['referenceCatalogId']}','{alternate}','browser_model_price_alternate');"
+                              f"INSERT INTO ref_data.currencies VALUES('{manifest['referenceCatalogId']}','{alternate}','usd','USD','US Dollar',2);"
+                              f"UPDATE ref_data.revisions SET state='sealed' WHERE(catalog_id,id)=('{manifest['referenceCatalogId']}','{alternate}');")
+                    # Roles holding one of Settings › AI's permissions each, so the browser sees every tab offered by its own.
+                    query("INSERT INTO security.roles(id,code,name) VALUES(gen_random_uuid(),'synthetic_agents_admin','Synthetic agents administrator'),"
+                          "(gen_random_uuid(),'synthetic_models_admin','Synthetic models administrator'),(gen_random_uuid(),'synthetic_usage_reader','Synthetic usage reader');"
+                          "INSERT INTO security.role_permissions SELECT id,'ManageAgents' FROM security.roles WHERE code='synthetic_agents_admin';"
+                          "INSERT INTO security.role_permissions SELECT id,'ManageModelProviders' FROM security.roles WHERE code='synthetic_models_admin';"
+                          "INSERT INTO security.role_permissions SELECT id,'ReadModelUsage' FROM security.roles WHERE code='synthetic_usage_reader';")
+                    # Settings › AI's two tests and Usage's one reach the provider; the retry and the refused test must not.
+                    from fake_model_provider import echo
+                    reached=len(fake_provider.received);fake_provider.respond(echo(),echo(),echo())
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),'--assistant'],cwd=ROOT,env=env,start_new_session=True)
+                    # Settings › AI, its Agents and Usage tabs and the assistant panel run in one browser process.
+                    if browser_process.wait(timeout=600):raise RuntimeError('Owned page-assistant browser checks failed')
+                    if len(fake_provider.received)!=reached+3+fake_provider.controlled or fake_provider.script:
+                        raise RuntimeError('The browser tests did not reach the provider exactly once for each answer they scripted and three times besides')
+                    print('PASS the browser tests reached the provider once for each answer the panel scripted and three times besides: a retry and a refused test sent nothing',flush=True)
+            elif args.identity_check:
+                from check_units_preview import run_checks as check_units
+                check_units(url)
+                from check_trading_reference_access import run_checks as check_reference_authority
+                check_reference_authority(query,manifest,url)
+                from check_economic_lookups import run_checks as check_identities
+                check_identities(url,query,manifest)
+                from check_trading_reference_allocation import run_checks as check_reference_allocation, run_http_checks as check_reference_allocation_http
+                check_reference_allocation(query,manifest,psql,env)
+                check_reference_allocation_http(url,query)
+                from check_trading_history_boundary import run_checks as check_trading_history, run_http_checks as check_trading_history_http
+                check_trading_history(query,manifest)
+                check_trading_history_http(query,manifest,url,temporary)
+            elif args.example=='mixed-gas':
+                from check_mixed_preview import run_checks
+                run_checks(url,json.loads(export.read_text()))
+            else:
+                from check_preview import run_checks
+                from check_direct_reads import run_checks as check_direct_reads
+                after_browser=[]
+                workspace=run_checks(url,query,manifest,lambda views,trades:check_direct_reads(views,trades,dotnet,app_env,temporary,query),after_browser)
+                from check_table_views import run_checks as check_table_views
+                check_table_views(url,query)
+                # Preview sessions are capped, so the account checks below share two browser sessions, each switching them to its own users.
+                from preview_client import PreviewClient
+                browsers=[PreviewClient(url) for _ in range(2)]
+                for browser in browsers:browser.bootstrap()
+                from check_dashboard_layout import run_checks as check_dashboard_layout
+                check_dashboard_layout(url,query,browsers)
+                from check_risk_run_definitions import run_checks as check_risk_run_definitions
+                check_risk_run_definitions(url,query,browsers)
+                from check_schedule_storage import run_checks as check_schedule_storage
+                check_schedule_storage(query,psql,env,manifest)
+                from check_temporal_storage import run_checks as check_temporal_storage
+                check_temporal_storage(query,psql,env,manifest,url)
+                from check_reference_policy_storage import run_checks as check_reference_policy_storage
+                check_reference_policy_storage(query,manifest)
+                from check_market_read_authority import run_checks as check_market_authority
+                check_market_authority(query,manifest)
+                from check_futures_storage import run_checks as check_futures_storage
+                check_futures_storage(query,manifest,psql,env)
+                from check_futures_amendments import run_checks as check_amendments
+                check_amendments(url,query,manifest,psql,env)
+                adapter_fixture=temporary/'adapter-fixture.json'
+                adapter_fixture.write_text(json.dumps(workspace))
+                subprocess.run([str(dotnet),'run','--project','tests/OpenEtrm.Api.Checks','--',str(adapter_fixture)],cwd=ROOT,env=env,check=True,timeout=60)
+                from check_seeded_preview import run_checks as check_seeded_preview
+                check_seeded_preview(url,run_id,temporary)
+                from check_reference_display_http import run_checks as check_reference_display
+                check_reference_display(url,query)
+                from check_schedule_examples import run_checks as check_schedule_examples
+                check_schedule_examples(url,run_id,temporary)
+                if args.browser_check:
+                    # The Delivery prices desk checks read the interactive preview's synthetic week; the HTTP checks above ran without it.
+                    from delivery_price_seed import seed as seed_delivery_prices
+                    seed_delivery_prices(query,manifest)
+                    worker_env=prepare_risk_worker()
+                    risk_worker_process=subprocess.Popen([str(dotnet),str(frozen_dll),'--risk-worker','serve'],cwd=ROOT,env=worker_env,start_new_session=True)
+                    target=temporary/'browser-target.json'
+                    target.write_text(json.dumps({'suite':'business_browser_v1','url':url,'runId':run_id}))
+                    browser_process=subprocess.Popen(['node',str(ROOT/'tests/browser/run.mjs'),str(target),str(args.browser.resolve()),*(['--blotter-loading'] if args.blotter_loading_check else ['--markets-desk'] if args.markets_desk_check else [])],cwd=ROOT,env=env,start_new_session=True)
+                    # The desk's and the Blotter workbench's scenarios run in this suite; a CI runner needs about a quarter of an hour for them.
+                    if browser_process.wait(timeout=1500):
+                        raise RuntimeError('Owned browser checks failed')
+                    if evidence:=os.environ.get('OPENETRM_MARKETS_BROWSER_EVIDENCE'):
+                        destination=Path(evidence).resolve();destination.mkdir(parents=True,exist_ok=True)
+                        for screenshot in temporary.glob('markets-*.png'):shutil.copy2(screenshot,destination/screenshot.name)
+                # Checks that record durable closes would add samples to the browser suites' history, so they run after them.
+                for later in after_browser:later()
+                # Preview sessions are capped, so the checks below share this session instead of each opening one.
+                from check_swaps_preview import run_checks as check_swaps
+                session=check_swaps(url)
+                from check_trading_pin_reads import run_supplemental_checks as check_supplemental_pins
+                def check_pin(name,condition=True):
+                    if not condition:raise AssertionError(name)
+                    print('PASS '+name,flush=True)
+                check_supplemental_pins(session,check_pin,query,manifest)
+                from check_empty_trading_directory import run_nonempty_checks
+                run_nonempty_checks(session,query,manifest)
+                from check_swap_payment_rules import run_checks as check_swap_payment_rules
+                check_swap_payment_rules(url,session)
+                from check_booking_facts import run_checks as check_booking_facts
+                check_booking_facts(url,query,manifest,session,browsers[0])
+                from check_draft_pricing import run_checks as check_draft
+                check_draft(url,query,manifest,session)
+                from check_definition_publication import run_checks as check_definition_publication
+                check_definition_publication(query,manifest)
+                from check_trade_annotations import run_checks as check_trade_annotations
+                check_trade_annotations(url,session)
+                from check_trade_parties import run_checks as check_trade_parties
+                check_trade_parties(url,query,manifest,session)
+                from check_units_preview import run_checks as check_units
+                check_units(url,client=session)
+                from check_trading_reference_access import run_checks as check_reference_authority
+                check_reference_authority(query,manifest,url,session)
+                from check_economic_lookups import run_checks as check_identities
+                check_identities(url,query,manifest,session)
+                from check_trading_reference_allocation import run_checks as check_reference_allocation, run_http_checks as check_reference_allocation_http
+                check_reference_allocation(query,manifest,psql,env)
+                check_reference_allocation_http(url,query,session)
+                from check_trading_history_boundary import run_checks as check_trading_history, run_http_checks as check_trading_history_http
+                check_trading_history(query,manifest)
+                check_trading_history_http(query,manifest,url,temporary,session)
+                from check_pre_retention_storage import ordinary_swaps as check_swaps_storage
+                check_swaps_storage(query,psql,env,ROOT,
+                    [reference,market,swap_market,historical_security,trading_fixture(manifest['catalogId'],swap_defaults=True)],manifest)
+                from seed_preview_swaps import seed_swaps
+                seeded=seed_swaps(url,run_id,temporary,session)
+                assert len(seeded)==16 and seeded==seed_swaps(url,run_id,temporary,session)
+                print('PASS sixteen synthetic swap examples seed idempotently across all four weekdays',flush=True)
+                from check_seeded_preview import run_swap_book_checks
+                run_swap_book_checks(session,seeded)
+                from check_swap_projection_reads import run_checks as check_swap_projection_reads
+                check_swap_projection_reads(session,query,manifest)
+                from check_blotter_swap_scope import run_checks as check_blotter_swap_scope
+                check_blotter_swap_scope(session,query,manifest,seeded[0]['tradeId'])
+            if args.scheduled_swap_check:
+                from check_whole_term_swap_schema import run_storage_checks as check_whole_term_swap_storage, check_rebooking_guard
+                from check_pre_retention_storage import swaps as check_whole_term_swap_admission
+                check_whole_term_swap_admission(query,psql,env,ROOT,
+                    [reference,market,swap_market,historical_security,trading_fixture(manifest['catalogId'],swap_defaults=True)],manifest)
+                check_whole_term_swap_storage(query,manifest,require_retention=True)
+                check_rebooking_guard(query,psql,env,ROOT)
+        else:
+            if args.example=='standard':
+                worker_env=prepare_risk_worker()
+                risk_worker_process=subprocess.Popen([str(dotnet),str(frozen_dll),'--risk-worker','serve'],cwd=ROOT,env=worker_env,start_new_session=True)
+            child.wait()
+    except KeyboardInterrupt:
+        print('Stopping the owned preview.',flush=True)
+        if args.check:
+            raise
+    except Exception:
+        print_failure_identifiers(temporary/'app.log')
+        raise
+    finally:
+        if risk_worker_process is not None:
+            try:
+                stop_owned_group(risk_worker_process)
+            except Exception:
+                browser_cleanup_ok=False
+                print('Worker cleanup unconfirmed; retaining its private directory.',flush=True)
+        # Stop the entire owned browser group, even if Node timed out or exited
+        # before Chromium. Never remove a profile while a live child still uses it.
+        if browser_process is not None:
+            try:
+                stop_owned_group(browser_process)
+            except Exception:
+                browser_cleanup_ok=False
+                print('Browser cleanup unconfirmed; retaining its private directory.',flush=True)
+        # Only the process started above and its exact database directory are touched.
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+        if log is not None:
+            log.close()
+        if startup_attempted:
+            status=run([bins['pg_ctl'],'-D',data,'status'])
+            if status.returncode==0:
+                stopped=run([bins['pg_ctl'],'-D',data,'-m','immediate','-w','-t','15','stop'])
+                if stopped.returncode:
+                    raise RuntimeError('Failed to stop owned preview; retained '+str(temporary))
+                status=run([bins['pg_ctl'],'-D',data,'status'])
+            if status.returncode!=3:
+                raise RuntimeError('Cannot establish that owned preview stopped; retained '+str(temporary))
+            # A failed startup can leave a late child; retain its directory.
+            safe_to_remove=started and browser_cleanup_ok
+        if safe_to_remove:
+            shutil.rmtree(temporary)
+            print('Removed owned disposable preview database.',flush=True)
+        else:
+            print(f'Startup/cleanup incomplete; retained private directory: {temporary}',flush=True)
+        if not browser_cleanup_ok:
+            raise RuntimeError('Owned worker/browser cleanup could not be confirmed; private files retained')
+
+
+if __name__=='__main__':
+    main()

@@ -1,0 +1,85 @@
+using System.Collections.Immutable;
+using System.Text.Json;
+
+namespace OpenEtrm.Api;
+
+// The immutable selection retained at admission and the certified context acquired by a requested financial read.
+// Working frames retain their exact inputs; recorded closes retain an exact close reference. Later reads reuse
+// that context without widening it or consulting the page's subsequent selection (docs/ai-assistant.md §7.2).
+public sealed class TurnPin
+{
+    TurnPin(bool working,Guid context,DateTimeOffset cutoff,InputFrame? frame)=>(Working,ContextId,Cutoff,Frame)=(working,context,cutoff,frame);
+    // Working data, whose first financial read captured the context, or a historical view's retained context.
+    public bool Working {get;}
+    public Guid ContextId {get;}
+    public DateTimeOffset Cutoff {get;}
+    public InputFrame? Frame {get;}
+    public bool Operational {get;private init;}
+    public DateOnly? BusinessDate {get;private init;}
+    public bool Resolved {get;private init;}=true;
+
+    // Selection is retained in memory at admission. No context, frame serialization or market read is performed.
+    internal static TurnPin Deferred(string mode,Guid? retained,InputFrame? frame,DateOnly? businessDate)=>
+        new(mode!="retained",retained??Guid.Empty,default,frame){Operational=mode=="operational",BusinessDate=businessDate,Resolved=false};
+
+    internal static string StoredFrame(InputFrame frame)=>frame.OriginCloseId is {} close
+        ?JsonSerializer.Serialize(new{frameId=frame.Id,closeId=close}):Record(frame);
+
+    // The record as start_turn answers it: the turn's context and its frame's pins, for this scope's catalog. A record the
+    // worker cannot read is a defect, never a reason to read another context.
+    public static TurnPin From(JsonElement context,JsonElement pins,Guid catalog,PreviewManifest manifest,JsonElement? pageReport=null,InputFrame? exactFrame=null)
+    {
+        try
+        {
+            if(context.GetProperty("mode").GetString()=="operational")
+            {
+                if(catalog!=manifest.CatalogId||context.GetProperty("contextId").ValueKind!=JsonValueKind.Null||
+                    context.GetProperty("frameId").ValueKind!=JsonValueKind.Null||pins.ValueKind!=JsonValueKind.Null)throw Unreadable();
+                return new(true,Guid.Empty,context.GetProperty("cutoff").GetDateTimeOffset(),null){Operational=true};
+            }
+            var businessDate=pageReport is {} report?PageReports.BusinessDate(report):null;
+            var working=context.GetProperty("mode").GetString() switch{"current"=>true,"retained"=>false,_=>throw Unreadable()};
+            var id=context.GetProperty("contextId").GetGuid();
+            var frameId=context.GetProperty("frameId") is {ValueKind:JsonValueKind.String} named?named.GetGuid():(Guid?)null;
+            var frame=pins.ValueKind==JsonValueKind.Null?null:pins.TryGetProperty("closeId",out var close)
+                ?exactFrame is {} selected&&selected.Id==frameId&&selected.OriginCloseId==close.GetGuid()
+                    ?selected with{ContextId=working?null:id}:throw Unreadable()
+                :Rebuild(pins,working?null:id);
+            if(catalog!=manifest.CatalogId||frame?.Id!=frameId||businessDate is not null&&frame is not null||working&&frame is null&&businessDate is null)throw Unreadable();
+            return new(working,id,context.GetProperty("cutoff").GetDateTimeOffset(),frame){BusinessDate=businessDate};
+        }
+        catch(Exception e) when(e is KeyNotFoundException or FormatException or InvalidOperationException){throw Unreadable();}
+    }
+
+    // The pins a requested financial read records for its As of frame (§7.2), which a turn's reads rebuild.
+    internal static string Record(InputFrame frame)
+    {
+        var record=RetainedFrames.Record(frame);
+        record["frameId"]=record["id"]!.DeepClone();record.Remove("id");record.Remove("contextId");
+        return record.ToJsonString();
+    }
+
+    static InputFrame Rebuild(JsonElement pins,Guid? context)
+    {
+        var record=System.Text.Json.Nodes.JsonNode.Parse(pins.GetRawText())!.AsObject();
+        record["id"]=record["frameId"]!.DeepClone();record.Remove("frameId");
+        record["contextId"]=context;
+        return RetainedFrames.Read(record);
+    }
+
+    // The context a read binds, as the knowledge store reads it: exactly the record's, at its recorded cutoff.
+    public ScheduleContext Exact(ScheduleContext stored)=>
+        (BusinessDate is null||stored.EffectiveOn==BusinessDate.Value.ToString("yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture))&&stored.ContextId==ContextId&&stored.KnownAt is {} at&&SchedulePreview.ParseAt(at)==Cutoff?stored:throw Unreadable();
+
+    // The page views: working data as of the context its first financial read captured, a historical view at its retained context.
+    public PinnedContext Page(ScheduleContext context)=>Working?PinnedContext.Rereading(Exact(context),RequireFrame()):PinnedContext.Retained(Exact(context),Frame);
+    // Current-only definitions run only over working data, binding no context.
+    public PinnedContext CurrentOnly()=>Working?PinnedContext.Current(Frame):throw ScheduleReads.Historical();
+    // Trades and parties read the frame as of the context: the capture for a working-data read, or a historical view's own.
+    public TradingView Trading(ScheduleContext context)=>
+        Working?TradingView.Reread(RequireFrame(),Exact(context)):TradingView.Retained(RequireFrame(),Exact(context));
+    // Reads that consume a frame fail without one (§7.2).
+    public InputFrame RequireFrame()=>Frame??throw PinnedContext.Missing();
+
+    static InvalidOperationException Unreadable()=>new("The turn's pinned-context record cannot be read.");
+}

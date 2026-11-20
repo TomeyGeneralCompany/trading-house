@@ -1,0 +1,163 @@
+using OpenEtrm.MarketData.CustomCurves;
+using OpenEtrm.MarketData.Power;
+using OpenEtrm.MarketData.Gas;
+using OpenEtrm.MarketData.Crude;
+
+namespace OpenEtrm.MarketData.Trading;
+
+public sealed partial class ScheduleMarketSources
+{
+    private (ExactUnitPrice Price,SchedulePriceFacts State,ScheduleSourceEvidence Evidence) ContractObservation(BookedSideInstruction instruction,CurveBuild market)
+    {
+        if(contractObservations is null)throw Invalid("The retained contract observation requires its exact context-bound source samples.");
+        var bound=instruction.Bindings.Single(binding=>binding.Port=="market").Market;
+        var candidates=contractObservations.Points.Keys.Where(lookup=>lookup.Market==bound&&
+            ContractObservationScheduleSource.Read(instruction,lookup.Contract,lookup.Quote)==lookup).ToArray();
+        if(candidates.Length!=1)throw Invalid("The stored contract observation requires one exact admitted sample without reselection.");
+        var resolved=contractObservations.Resolve(candidates[0],market.Graph);RequireUnit(resolved.Price,instruction.Output);
+        return(resolved.Price,resolved.State==SchedulePriceState.Actual?SchedulePriceFacts.PublishedFixing:SchedulePriceFacts.Projected,new ScheduleContractObservationEvidence(candidates[0],resolved));
+    }
+
+    // The admitted dated lookups exactly matching a stored price row's contract, quote, fixing and projection definition.
+    internal static IndexPriceLookup[] DatedCandidates(BookedSideInstruction instruction,IEnumerable<IndexPriceLookup> dated,bool publishedWhenAvailable)
+    {
+        var row=instruction.Output;var bindings=instruction.Bindings.ToDictionary(binding=>binding.Port);
+        if(!bindings.ContainsKey("market")||!bindings.ContainsKey("index")||!bindings.ContainsKey("quote")||!bindings.TryGetValue("fixing",out var fixing))
+            throw Invalid("A scalar price requires exact dated market, index, quote and fixing bindings.");
+        return dated.Where(lookup=>lookup.PublishedWhenAvailable==publishedWhenAvailable&&lookup.Market==bindings["market"].Market&&lookup.Index==bindings["index"].Reference&&
+            lookup.Quote.Key==bindings["quote"].Reference&&lookup.Contract.DeliveryFrom==row.ObservationFrom&&lookup.Contract.DeliveryTo==row.ObservationTo&&
+            DefinitionIdentity.For(lookup.Settlement).Canonical==row.Parameters["selection"]&&CurvePriceScheduleSource.Matches(row,lookup)&&
+            lookup.Fixing is {} f&&f.Series==fixing.Series&&f.Source==fixing.Reference&&f.Implementation==fixing.Coordinate&&
+            (bindings.TryGetValue("projection",out var projection)?lookup.CustomProjection is {} p&&p.CatalogId==projection.EntityCatalog&&p.CurveId==projection.Entity&&
+                p.Version==projection.Version&&p.OutputNode==projection.Coordinate&&p.Position==projection.Position:lookup.CustomProjection is null)).Distinct().ToArray();
+    }
+
+    // deliveryMark: the row prices undelivered physical gas, which reads its location mark and never the payment fixing (D360).
+    private (ExactUnitPrice Price,SchedulePriceFacts State,ScheduleSourceEvidence Evidence) Dated(BookedSideInstruction instruction,CurveBuild market,bool deliveryMark,bool publishedWhenAvailable)
+    {
+        var candidates=DatedCandidates(instruction,dated,publishedWhenAvailable);
+        var row=instruction.Output;var bindings=instruction.Bindings.ToDictionary(binding=>binding.Port);
+        GasValuationAssignment? gasAssignment=null;
+        if(bindings.TryGetValue("assignment",out var assignment))
+        {
+            var matching=gasAssignments.Where(a=>a.Key==assignment.Reference&&a.Point==bindings["point"].Reference&&
+                a.Product==bindings["product"].Reference&&DefinitionIdentity.For(a).Canonical==assignment.Coordinate&&
+                a.From==row.ObservationFrom&&a.To==row.ObservationTo&&a.Lookup.Market==bindings["market"].Market&&
+                a.Quote.Key==bindings["quote"].Reference&&a.Settlement.SelectedIndex==bindings["index"].Reference).ToArray();
+            if(matching.Length!=1)throw Invalid("The gas price requires its exact admitted point/product assignment and complete definition.");
+            gasAssignment=matching[0];
+        }
+        CrudeValuationAssignment? crudeAssignment=null;
+        if(bindings.TryGetValue("crude",out var crude))
+        {
+            var matching=crudeAssignments.Where(a=>a.Key==crude.Reference&&
+                a.Location.Facility==bindings["facility"].Reference&&a.Location.CustodyPoint==bindings["custody"].Reference&&
+                a.Grade==bindings["grade"].Reference&&a.Commodity==bindings["commodity"].Reference&&
+                DefinitionIdentity.For(a).Canonical==crude.Coordinate&&a.Projection.Market.Curve.Revision==crude.Definitions&&
+                a.Projection.Contract.DeliveryFrom==row.ObservationFrom&&a.Projection.Contract.DeliveryTo==row.ObservationTo).ToArray();
+            if(matching.Length!=1)throw Invalid("The crude price requires its exact admitted grade, custody point and complete assignment.");
+            crudeAssignment=matching[0];
+        }
+        if(candidates.Length!=1)throw Invalid("A stored dated lookup requires one exact admitted contract, quote, fixing and projection definition.");
+        if(gasAssignment is not null&&!CurvePriceScheduleSource.SameObservation(candidates[0],gasAssignment.Lookup))
+            throw Invalid("Gas price metadata must retain the complete qualified assignment lookup, including fixing time.");
+        if(crudeAssignment is not null&&candidates[0]!=crudeAssignment.Lookup)
+            throw Invalid("Crude metadata must retain the exact qualified quote, index, forward and fixing lookup.");
+        if(bindings.TryGetValue("lng",out var lng))
+        {
+            var matches=lngAssignments.Where(a=>a.Key==lng.Reference&&DefinitionIdentity.For(a).Canonical==lng.Coordinate&&
+                a.Lookup.Market.Curve.Revision==lng.Definitions&&a.DischargeFacility==bindings["lng_terminal"].Reference&&
+                a.DischargeCustody==bindings["lng_custody"].Reference&&a.Product==bindings["lng_product"].Reference&&a.Lookup==candidates[0]).ToArray();
+            if(matches.Length!=1)throw Invalid("The LNG mark requires its complete exact product/discharge custody assignment and price source.");
+        }
+        if(deliveryMark&&gasAssignment is null)throw Invalid("Undelivered physical gas requires its exact admitted point/product assignment.");
+        var resolved=deliveryMark?PeriodPriceSelector.ResolveDeliveryMark(market,candidates[0],request=>market.Pricing.Price(request,default),request=>market.Pricing.Lineage(request,default)):
+            PeriodPriceSelector.Resolve(market,candidates[0],request=>market.Pricing.Price(request,default),request=>market.Pricing.Lineage(request,default));
+        RequireUnit(resolved.Price,row);
+        // A delivery mark's actual is its contract's final settlement, never a published fixing.
+        return(resolved.Price,resolved.State!=SchedulePriceState.Actual?SchedulePriceFacts.Projected:deliveryMark?SchedulePriceFacts.Actual:SchedulePriceFacts.PublishedFixing,
+            new ScheduleDatedPriceEvidence(candidates[0],resolved));
+    }
+
+    private (ExactUnitPrice Price,SchedulePriceFacts State,ScheduleSourceEvidence Evidence) Native(BookedSideInstruction instruction,ScheduleDefinitionGrid grid,int cell,string family,IntervalPriceResolver resolver,ValuedAttribute? nativePriceAttribute)
+    {
+        RequireNative(grid);var row=instruction.Output;var interval=grid.Interval(cell);var binding=instruction.Bindings.Single(value=>value.Port is "curve" or "location");
+        CurveKey curve;PriceSettlementSelection? selection=null;LocationAssignment? assignment=null;
+        if(binding.Kind=="curve_interval")
+        {
+            curve=new(binding.Definitions!.Value,binding.Code!);
+            if(row.Parameters["selection"]!="interval_attribute_lookup_v1")
+            {
+                var matches=selections.Where(value=>DefinitionIdentity.For(value).Canonical==row.Parameters["selection"]&&
+                    value.SelectedIndex==instruction.Bindings.Single(value=>value.Port=="index").Reference).Distinct().ToArray();
+                if(matches.Length!=1)throw Invalid("The stored indexed lookup requires its exact explicit settlement selection.");
+                selection=matches[0];
+            }
+        }
+        else
+        {
+            ReferenceKey location;
+            if(binding.Kind=="location")location=binding.Reference!.Value;
+            else
+            {
+                AssetKey asset;
+                if(binding.Kind=="asset")asset=new(binding.Definitions!.Value,binding.Code!);
+                else if(binding.Kind=="quantity_source"&&reference!.Sources.TryGetValue(new(binding.Definitions!.Value,binding.Code!),out var source))asset=source.Asset;
+                else throw Invalid("The physical price requires its exact asset or source location.");
+                if(!reference!.Assets.TryGetValue(asset,out var definition))throw Invalid("The physical price asset is unavailable.");
+                location=definition.Location;
+            }
+            var attribute=binding.Coordinate switch{"energy"=>ValuedAttribute.Energy,"certificate"=>ValuedAttribute.Certificate,"capacity"=>ValuedAttribute.Capacity,
+                _=>throw Invalid("The physical price attribute is unsupported.")};
+            assignment=LocationValuation.Partition(reference!.Assignments,location,attribute,[interval],reference.Definitions)[0];curve=assignment.Curve;
+        }
+        if(!read!.Curves.TryGetValue(curve,out var prepared))throw Invalid("The exact native price curve is unavailable.");
+        if(assignment is not null&&prepared.Curve is PeriodContractCurve period)selection=PriceSettlementSelection.CurveTarget(period.SettlementIndex);
+        if((prepared.Curve is PeriodContractCurve)!=(selection is not null))throw Invalid("Period prices require an explicit settlement selection.");
+        var selectedAttribute=binding.Kind=="curve_interval"?nativePriceAttribute??
+            throw Invalid("An indexed native source requires its explicit authorized instrument attribute."):
+            binding.Coordinate switch{"energy"=>ValuedAttribute.Energy,"certificate"=>ValuedAttribute.Certificate,"capacity"=>ValuedAttribute.Capacity,
+                _=>throw Invalid("The physical price attribute is unsupported.")};
+        if(!Enum.IsDefined(selectedAttribute)||nativePriceAttribute is {} supplied&&supplied!=selectedAttribute)
+            throw Invalid("Native source classification must agree with the authorized instrument binding.");
+        if(!reference!.Quantities.TryGetValue(row.Unit!.Value,out var specification))
+            throw new MarketDataException("ppa_quantity_unit","The native price requires its exact quantity specification.");
+        AssetDefinitions.Specification(specification,reference.Reference);
+        var validUnit=selectedAttribute switch
+        {
+            ValuedAttribute.Energy=>specification.Unit.Code=="megawatt_hour"&&specification.Dimension.Code=="energy",
+            ValuedAttribute.Capacity=>specification.Unit.Code=="megawatt_day"&&specification.Dimension.Code=="energy",
+            ValuedAttribute.Certificate=>specification.Dimension.Code=="certificate",
+            _=>false
+        };
+        if(!validUnit)throw new MarketDataException("ppa_quantity_unit","The selected attribute must match its supported exact quantity dimension and unit.");
+        if((selectedAttribute is ValuedAttribute.Certificate or ValuedAttribute.Capacity)!=(prepared.Curve is PeriodContractCurve))
+            throw new MarketDataException("ppa_cadence","The selected attribute requires its declared native or whole-period price cadence.");
+        var values=resolver.Prices(curve,grid.Month,selection);
+        var contracts=prepared.Period(grid.Month).Contracts;
+        var matchesPrice=values.Where((value,n)=>prepared.Curve is PeriodContractCurve?
+            contracts[n].DeliveryFrom<=interval.OperatingDate&&interval.OperatingDate<contracts[n].DeliveryTo:value.Interval==interval).ToArray();
+        if(selectedAttribute==ValuedAttribute.Capacity)
+        {
+            var matching=contracts.Where(contract=>contract.DeliveryFrom<=interval.OperatingDate&&interval.OperatingDate<contract.DeliveryTo).ToArray();
+            if(matching.Length!=1||matching[0].DeliveryFrom!=grid.Month||matching[0].DeliveryTo!=grid.Month.AddMonths(1))
+                throw new MarketDataException("ppa_cadence","Capacity pricing requires one exact whole-month contract.");
+        }
+        if(matchesPrice.Length!=1)throw Invalid("The price must cover exactly the stored interval or its selected whole-period contract.");
+        var resolved=matchesPrice[0];var price=PpaPriceGraphCompiler.Required(resolved);
+        var state=resolved.State switch{IntervalPriceState.Actual=>SchedulePriceFacts.Actual,IntervalPriceState.PublishedFixing=>SchedulePriceFacts.PublishedFixing,
+            IntervalPriceState.Modeled=>SchedulePriceFacts.Modeled,IntervalPriceState.Unresolved=>SchedulePriceFacts.Estimated,_=>SchedulePriceFacts.Projected};
+        if(prepared.Curve is PeriodContractCurve&&family!="certificate"&&interval.End<=context.ValuationAt&&state==SchedulePriceFacts.Projected)state=SchedulePriceFacts.Estimated;
+        if(state==SchedulePriceFacts.Estimated&&pending!=PendingActualsPolicy.EstimateUntilActual)
+            throw new MarketDataException("actuals_required","Delivered prices require eligible actuals under the selected policy.");
+        if(assignment is not null)
+        {
+            if(price.Unit!=assignment.Unit||row.Currency!=price.Unit.Currency||row.Unit!=price.Unit.Quantity||row.QuoteMultiplier!="1")
+                throw Invalid("Physical assignments require the exact currency, quantity and canonical output quote scale.");
+            price=price.Add(ExactUnitPrice.FromPrice(new(assignment.Adjustment,assignment.Unit)));
+            price=ExactUnitPrice.FromFraction(price.NumeratorValue*price.Unit.Multiplier.ScaledValue,
+                price.DenominatorValue*ExactDecimal.WorkingScale,new(price.Unit.Currency,price.Unit.Quantity,ExactDecimal.Parse("1")));
+        }
+        RequireUnit(price,row);return(price,state,new ScheduleNativePriceEvidence(prepared,resolved,assignment,price,state));
+    }
+}

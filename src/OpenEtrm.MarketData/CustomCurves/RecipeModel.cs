@@ -1,0 +1,69 @@
+using System.Collections.Immutable;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
+using OpenEtrm.MarketData.Risk;
+using OpenEtrm.MarketData.Curves;
+
+namespace OpenEtrm.MarketData.CustomCurves;
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RecipeContractWeight(int OutputPosition,string SourcePort,Guid ContractId,string Weight);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RecipePanelWeight([property:JsonRequired] string SourcePort,[property:JsonRequired] string Weight);
+// Every member is required; a blank position is an explicit null that validation refuses for its term.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RecipeObservationTerm([property:JsonRequired] int Ordinal,[property:JsonRequired] string Group,[property:JsonRequired] string Weight,
+    [property:JsonRequired,JsonConverter(typeof(ObservationPositionConverter))] int? Position,
+    [property:JsonRequired,JsonConverter(typeof(ObservationPositionConverter))] int? LessPosition,[property:JsonRequired] string Period);
+// A position is sent as typed: a whole number, or null for a blank. Anything else present is a typed entry the definition
+// refuses, not a malformed request. The member cannot name its term; validation names the term for the other refusals.
+public sealed class ObservationPositionConverter:JsonConverter<int?>
+{
+    public override bool HandleNull=>true;
+    public override int? Read(ref Utf8JsonReader reader,Type typeToConvert,JsonSerializerOptions options)=>
+        reader.TokenType==JsonTokenType.Null?null:
+        reader.TokenType==JsonTokenType.Number&&reader.TryGetInt32(out var position)?position:
+        throw new MarketDataException("recipe_definition","An observation term position must be a whole number from 1 to 120.");
+    public override void Write(Utf8JsonWriter writer,int? value,JsonSerializerOptions options)
+    {
+        if(value is {} position)writer.WriteNumberValue(position);else writer.WriteNullValue();
+    }
+}
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record PublishedRecipeReference(Guid CatalogId,Guid CurveId,int Version,string OutputNode);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RecipeNode(string Id,string Kind,ImmutableDictionary<string,string> Parameters,ImmutableDictionary<string,string> Inputs,
+    [property:JsonIgnore(Condition=JsonIgnoreCondition.WhenWritingDefault)] ImmutableArray<RecipeContractWeight> ContractWeights=default,
+    [property:JsonIgnore(Condition=JsonIgnoreCondition.WhenWritingNull)] PublishedRecipeReference? PublishedSource=null,
+    [property:JsonIgnore(Condition=JsonIgnoreCondition.WhenWritingDefault)] ImmutableArray<RecipePanelWeight> PanelWeights=default,
+    [property:JsonIgnore(Condition=JsonIgnoreCondition.WhenWritingNull)] ContractPriceTermsSet? ContractTerms=null,
+    [property:JsonIgnore(Condition=JsonIgnoreCondition.WhenWritingDefault)] ImmutableArray<RecipeObservationTerm> ObservationTerms=default);
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RecipeDefinition(string Code,string Name,ImmutableArray<RecipeNode> Nodes,string Output)
+{
+    // Whether `other` states this same graph: its code, name, output and each node's content, in any order of statement.
+    public bool SameGraph(RecipeDefinition other)=>JsonNode.DeepEquals(Evidence(),other.Evidence());
+    JsonNode Evidence()=>JsonSerializer.SerializeToNode(new{Code,Name,Output,
+        Nodes=Nodes.OrderBy(n=>n.Id,StringComparer.Ordinal).Select(ConnectedRecipeDeclaration.NodeEvidence).ToArray()})!;
+}
+public sealed record RecipeContract(MarketContract Contract,DateTimeOffset EligibleFrom);
+public sealed record RecipeSample(DateOnly Date,DateTimeOffset At,ContractKey Contract,UnitPrice Price,
+    ImmutableArray<ObservationKey> Observations,ImmutableArray<QuoteFactor> Factors,bool Fixed);
+public sealed record RecipeSource(CurveKey Key,PriceUnit Unit,ImmutableArray<RecipeContract> Contracts);
+public sealed record RecipeInputs(DateOnly ContextDate,DateTimeOffset ValuationAt,
+    ImmutableDictionary<string,RecipeSource> Sources,ImmutableDictionary<string,ImmutableArray<DateOnly>> Dates)
+{
+    [JsonIgnore] public int SampleReferenceLimit{get;init;}=RecipeEngine.MaximumSampleReferences;
+    public ImmutableDictionary<string,ImmutableArray<RecipeObservationWindow>> Windows{get;init;}=ImmutableDictionary<string,ImmutableArray<RecipeObservationWindow>>.Empty;
+}
+// Explicit output intervals from a consumer or a downstream recipe. Sampling instants are supplied even
+// for unconsumed cells; missing price samples never acquire substitute values.
+public sealed record RecipeDelivery(DateOnly From,DateOnly To);
+// The observation days of one term for one target delivery month, in ascending order.
+public sealed record RecipeObservationWindow(RecipeDelivery Target,int Term,ImmutableArray<DateOnly> Days);
+public sealed record RecipeOutputDemand(ImmutableHashSet<RecipeDelivery> Deliveries,
+    ImmutableDictionary<DateOnly,DateTimeOffset> SamplingInstants);
+public sealed record RecipePoint(string Label,int Position,ExactUnitPrice Price,ImmutableArray<ContractKey> Contracts,
+    ImmutableArray<DateOnly> Dates,int SampleCount);
+public sealed record RecipeResult(ImmutableArray<RecipePoint> Points,ImmutableArray<RecipeSample> Inputs,ImmutableArray<QuoteFactor> Factors);

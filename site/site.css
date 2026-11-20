@@ -1,0 +1,130 @@
+@charset "UTF-8";
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --ink: #141a26;
+  --muted: #56607a;
+  --line: #d5dae6;
+  --button: #141a26;
+  --button-ink: #fff;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --serif: Georgia, "Times New Roman", serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0f1a;
+    --ink: #f3f5fa;
+    --muted: #9aa3b9;
+    --line: #2a334a;
+    --button: #f3f5fa;
+    --button-ink: #0b0f1a;
+  }
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+a {
+  color: inherit;
+}
+a:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+.skip {
+  position: absolute;
+  top: -100px;
+  left: 20px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--bg);
+}
+.skip:focus {
+  top: 12px;
+}
+main,
+footer {
+  width: min(100% - 48px, 640px);
+  margin-inline: auto;
+}
+main {
+  align-self: center;
+  padding-block: 64px;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 28px;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.5px;
+}
+.brand-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 27px;
+  height: 30px;
+  padding-right: 2px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #8bb6ff, #ffb267);
+  color: #0a0e1a;
+  font: italic 25px/1 var(--serif);
+}
+h1 {
+  margin: 0 0 16px;
+  font-size: clamp(1.9rem, 5vw, 2.6rem);
+  font-weight: 650;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  text-wrap: balance;
+}
+.lede {
+  margin: 0 0 28px;
+  color: var(--muted);
+  font-size: 17px;
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 46px;
+  padding: 11px 20px;
+  border: 1px solid var(--button);
+  border-radius: 999px;
+  background: var(--button);
+  color: var(--button-ink);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.button.ghost {
+  border-color: var(--line);
+  background: transparent;
+  color: var(--ink);
+}
+footer {
+  padding-block: 24px 32px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+}
+footer p {
+  margin: 0;
+}

@@ -1,0 +1,273 @@
+using System.Collections.Immutable;
+using System.Security.Cryptography;
+using System.Text.Json;
+using Npgsql;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.Calculation;
+using OpenEtrm.MarketData.CustomCurves;
+using OpenEtrm.MarketData.Trading;
+
+namespace OpenEtrm.Api;
+
+public sealed record ConnectedSampleObservation(Guid Id,Guid SeriesId,string Use);
+public sealed record ConnectedSampleEvidence(Guid SnapshotId,DateTimeOffset At,string SourceCurve,Guid ContractId,
+    bool FreezeHistorical,ImmutableArray<ConnectedSampleObservation> Observations,string Kind="recipe",bool FreezeObservation=false);
+public sealed record ConnectedMarketEvidence(Guid RevisionId,string ManifestId,string SourceExecutionConvention,
+    ImmutableArray<CustomCurveProjectionBinding> Recipes,ImmutableArray<ConnectedSampleEvidence> Samples);
+public sealed record ConnectedPreparationWork(int SourceCompilations,int DeclaredSourceNodes);
+
+public static partial class CustomCurves
+{
+    internal enum MarketPreparation { ValuationDependencies=1, ScenarioUniverse }
+    internal sealed record PreparedMarket(ConnectedValuation Valuation,CurveBuild Authority,
+        ImmutableDictionary<CurveRequest,CurvePointKey> Bindings,ConnectedMarketEvidence Evidence,ConnectedPreparationWork Preparation);
+
+    internal static ResolvedCalculationContext CompleteContext(InputFrame frame,MarketSnapshot snapshot,ScheduleContext context)
+    {
+        var exact=PinnedContext.Exact(context);
+        if(frame.SourceInputs is not {} parts||parts.Count==0||parts.Any(p=>p.Value is null||p.Value.Source is null||p.Key!=p.Value.Source.DefinitionRevisionId||
+                p.Value.ObservationIds.IsDefault||p.Value.FrozenObservationIds.IsDefault||p.Value.CurveContracts is null||p.Value.RootCurves.IsDefault)||
+            frame.ContextId!=exact.ContextId||snapshot.Id!=frame.Id||snapshot.ValuationAt!=frame.At||
+            snapshot.Knowledge is not {} knowledge||knowledge.ContextId!=exact.ContextId||knowledge.KnownAt!=SchedulePreview.ParseAt(exact.KnownAt)||
+            frame.Source is null||!parts.TryGetValue(snapshot.Definitions.RevisionId,out var own)||own.Source!=frame.Source||!own.Matches(frame))
+            throw Invalid("Full valuation requires its explicit complete source matrix, common opening clock and certified knowledge context.");
+        var manifest=Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new{
+            Implementation="complete_selected_market_inputs_v1",context=exact,frame.Time,snapshot.MarketCutoff,
+            Sources=parts.OrderBy(p=>p.Key).Select(p=>new{p.Key,p.Value.Source,
+                Observations=p.Value.ObservationIds.Order(),Frozen=p.Value.FrozenObservationIds.Order(),
+                Contracts=p.Value.CurveContracts.OrderBy(c=>c.Key,StringComparer.Ordinal),Roots=p.Value.RootCurves.Order(StringComparer.Ordinal)})},RiskJobs.Json)));
+        return new(exact.ContextId!.Value,manifest,frame.At,knowledge.KnownAt,frame.At,snapshot.MarketCutoff);
+    }
+    private static bool SameInputSelection(MarketSourceInputs part,MarketSnapshot snapshot)=>
+        part.Source.DefinitionRevisionId==snapshot.Definitions.RevisionId&&part.ObservationIds.Length==snapshot.Selections.Length&&
+        part.ObservationIds.ToHashSet().SetEquals(snapshot.Selections.Select(s=>s.Observation.Key.Id))&&
+        snapshot.Selections.All(s=>s.Input.Use==(part.FrozenObservationIds.Contains(s.Observation.Key.Id)||s.Observation.Role==ObservationRole.IndexFixing?
+            InputUse.FrozenFact:InputUse.Variable));
+
+    // Only authorized retained data enters this resolver. Synthetic runtime
+    // aliases are coordinates in that materialization, never database identities.
+    internal sealed class PreparedBindings(HashSet<CurveKey> definitions,ResolvedCalculationContext selected):ICurveBindingResolver
+    {
+        public CurveKey Resolve(LogicalCurveKey logical,ResolvedCalculationContext context)=>
+            throw Invalid("A booked custom projection requires an exact published version.");
+        public void RequireVisible(CurveKey exact,ResolvedCalculationContext context)
+        {
+            if(context!=selected||!definitions.Contains(exact))throw Invalid("The graph references a definition outside its authorized materialization.");
+        }
+    }
+
+    internal static Guid StableSampleId(MarketSnapshot snapshot)
+    {
+        var bytes=JsonSerializer.SerializeToUtf8Bytes(new{snapshot.Definitions,snapshot.ValuationAt,snapshot.MarketCutoff,
+            inputs=snapshot.Selections.OrderBy(s=>s.Input.Series.Id).ThenBy(s=>s.Input.Use)
+                .Select(s=>new{s.Input,s.Observation})},RiskJobs.Json);
+        return new Guid(SHA256.HashData(bytes).AsSpan(0,16));
+    }
+
+    internal static ImmutableArray<ConnectedRecipeSample> RetainSamples(IEnumerable<ConnectedRecipeSample> samples)
+    {
+        var all=samples.ToImmutableArray();
+        var retained=all.DistinctBy(s=>(s.Source,s.Date,s.Contract,s.FreezeObservation)).ToList();
+        var frames=retained.Select(s=>(s.Snapshot.Id,s.Snapshot.Definitions)).ToHashSet();
+        // Each row carries its complete exact frame. Preserve existing receipt
+        // rows, adding evidence only when an independently required frame would
+        // otherwise disappear behind a larger version's overlapping samples.
+        foreach(var sample in all)
+            if(frames.Add((sample.Snapshot.Id,sample.Snapshot.Definitions)))retained.Add(sample);
+        return retained.ToImmutableArray();
+    }
+
+    internal static async Task<PreparedMarket> PrepareMarket(NpgsqlConnection connection,PreviewDatabase database,
+        PreviewData data,InputFrame frame,MarketSnapshot snapshot,ScheduleContext context,
+        ImmutableArray<Instrument> instruments,ImmutableArray<CurveRequest> dependencies,MarketPreparation purpose,CancellationToken ct,
+        ConnectedMarketEvidence? retained=null,ImmutableArray<SchedulePriceTerm>? activePrices=null,ContractObservationSamples.History? sourceHistories=null,PreparationScope? preparationScope=null,
+        SavedVersions? savedVersions=null,ResolvedCalculationContext? calculationContext=null,ImmutableArray<PreparedMarket> linkedMarkets=default)
+    {
+        if(purpose is not(MarketPreparation.ValuationDependencies or MarketPreparation.ScenarioUniverse))
+            throw Invalid("Select the connected preparation purpose explicitly.");
+        if(retained is not null&&purpose!=MarketPreparation.ScenarioUniverse)
+            throw new MarketDataException("risk_graph_manifest","Retained scenario receipts require their complete admitted scenario universe.");
+        var exact=PinnedContext.Exact(context);
+        if(frame.ContextId!=exact.ContextId||snapshot.Id!=frame.Id||snapshot.ValuationAt!=frame.At||
+            snapshot.Definitions!=data.DefinitionRevision)
+            throw Invalid("Connected pricing requires the exact retained financial and market context.");
+        if(snapshot.Knowledge is not null)
+            snapshot=MarketSnapshotBinding.Bind(snapshot,exact.ContextId!.Value,SchedulePreview.ParseAt(exact.KnownAt));
+        if(calculationContext is not null&&(frame.Source!=CatalogueSource.From(data)||
+            !MarketSnapshotBinding.Bind(data.Snapshot(frame),exact.ContextId!.Value,SchedulePreview.ParseAt(exact.KnownAt)).HasSameInputs(snapshot)))
+            throw Invalid("Complete valuation must retain this source's exact selected observations, values and original uses.");
+        var prices=activePrices??instruments.OfType<SidedInstrument>().SelectMany(instrument=>instrument.Sides)
+            .SelectMany(member=>member.Side.GenerateSchedule().Rows).SelectMany(row=>row.Prices).ToImmutableArray();
+        var custom=prices.Where(price=>price.Lookup?.CustomProjection is not null)
+            .Select(price=>new{Binding=price.Lookup!.CustomProjection!,Original=price.Lookup.Market,Request=price.Lookup.ProjectionRequest,Interval=price.Lookup.ForecastDelivery}).Distinct().ToArray();
+        var linked=linkedMarkets.IsDefault?ImmutableArray<PreparedMarket>.Empty:linkedMarkets;
+        if(!linked.IsEmpty&&calculationContext is null||linked.Any(m=>m is null||m.Valuation is null||m.Authority is null||m.Bindings is null)||linked.Select(m=>m.Valuation.Snapshot.Definitions).Distinct().Count()!=linked.Length||
+            linked.Any(m=>m.Valuation.Snapshot.Definitions==snapshot.Definitions))
+            throw Invalid("Each explicitly linked market requires one distinct original native source.");
+        var ordinary=calculationContext is null&&linked.IsEmpty&&purpose==MarketPreparation.ValuationDependencies&&retained is null&&custom.Length==0&&
+            prices.All(price=>price.ContractObservation is null);
+        ct.ThrowIfCancellationRequested();
+        if(ordinary&&preparationScope?.Find(connection,database,data,snapshot,exact,dependencies) is {} reused)
+        {
+            foreach(var lookup in prices.Where(price=>price.Lookup is not null).Select(price=>price.Lookup!).Distinct())
+                _=IndexFixingPricing.Resolve(reused.Authority,lookup);
+            return reused;
+        }
+        var aliases=custom.ToDictionary(p=>p.Request,p=>p.Original);
+        var needed=dependencies.ToHashSet();
+        var originals=dependencies.Where(d=>!aliases.ContainsKey(d)&&d.Curve.Revision==snapshot.Definitions).ToImmutableArray();
+        var authority=data.Model.Build(snapshot,[]);
+        var inputManifest=Convert.ToHexStringLower(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new{
+            snapshot.Id,snapshot.Definitions,snapshot.ValuationAt,snapshot.MarketCutoff,context=exact,
+            selections=snapshot.Selections.OrderBy(s=>s.Input.Series.Id).ThenBy(s=>s.Input.Use)},RiskJobs.Json)));
+        var resolved=calculationContext??new ResolvedCalculationContext(exact.ContextId!.Value,inputManifest,frame.At,
+            SchedulePreview.ParseAt(exact.KnownAt),frame.At,snapshot.MarketCutoff);
+        if(calculationContext is not null&&calculationContext!=CompleteContext(frame,snapshot,exact)||linked.Any(m=>
+            m.Valuation.Scenario.Depth!=0||m.Valuation.Snapshot.Definitions.CatalogId!=snapshot.Definitions.CatalogId||
+            !m.Authority.Snapshot.HasSameInputs(m.Valuation.Snapshot)||m.Valuation.Scenario.Plan.Context!=resolved||m.Valuation.Snapshot.Knowledge!=snapshot.Knowledge||
+            m.Valuation.Snapshot.ValuationAt!=snapshot.ValuationAt||m.Valuation.Snapshot.MarketCutoff!=snapshot.MarketCutoff||
+            frame.SourceInputs?.GetValueOrDefault(m.Valuation.Snapshot.Definitions.RevisionId) is not {} part||!SameInputSelection(part,m.Valuation.Snapshot)))
+            throw Invalid("Linked graphs must retain the complete selected input context and the original common opening clock and knowledge cutoff.");
+        // Base valuation needs the declared dependency closure. Risk also
+        // publishes coordinates for available quotes outside held instruments.
+        var availableQuotes=purpose==MarketPreparation.ScenarioUniverse
+            ?data.Model.QuoteFactors(snapshot).SelectMany(f=>f.Curves.Select(curve=>new CurveRequest(curve,f.Contract))).ToImmutableArray()
+            :ImmutableArray<CurveRequest>.Empty;
+        var export=data.Model.Compile(snapshot,originals.Concat(availableQuotes).Distinct().ToImmutableArray(),false,resolved,ct);
+        var sourceCompilations=1;var declaredSourceNodes=export.Definitions.Sum(d=>d.Points.Length);
+        var outputRoots=ImmutableArray.CreateBuilder<CurvePointKey>();
+        outputRoots.AddRange(availableQuotes.Select(request=>export.Points[(request,InputUse.Variable)]));
+        var definitions=export.Definitions.ToList();
+        var bindings=ImmutableDictionary.CreateBuilder<CurveRequest,CurvePointKey>();
+        foreach(var request in originals)bindings.Add(request,export.Points[(request,InputUse.Variable)]);
+        foreach(var selected in linked)
+        {
+            definitions.AddRange(selected.Valuation.Scenario.Plan.Points.Values.GroupBy(p=>p.Key.Curve).Select(g=>new ConnectedCurveDefinition(g.Key,g.ToImmutableArray())));
+            declaredSourceNodes+=selected.Valuation.Scenario.Plan.Points.Count;
+        }
+        foreach(var request in dependencies.Where(d=>!aliases.ContainsKey(d)&&d.Curve.Revision!=snapshot.Definitions))
+        {
+            var selected=linked.SingleOrDefault(m=>m.Valuation.Snapshot.Definitions==request.Curve.Revision);
+            if(selected is null||!selected.Bindings.TryGetValue(request,out var point))
+                throw Invalid("A foreign dependency requires its exact explicitly linked original market graph and bound point.");
+            bindings.Add(request,point);
+        }
+        var required=custom.Where(c=>needed.Contains(c.Request)).ToArray();
+        var recipeBindings=required.Select(c=>c.Binding).Distinct().OrderBy(c=>c.CurveId).ThenBy(c=>c.Version)
+            .ThenBy(c=>c.OutputNode,StringComparer.Ordinal).ThenBy(c=>c.Position).ToImmutableArray();
+        var samples=ImmutableArray.CreateBuilder<ConnectedRecipeSample>();
+        if(!recipeBindings.IsEmpty)
+        {
+            var historyPins=retained is null?frame.ObservationIds:retained.Samples.SelectMany(s=>s.Observations.Select(o=>o.Id))
+                .Concat(frame.ObservationIds).Distinct().ToImmutableArray();
+            var sourceData=await database.Read(connection,ct,data.DefinitionRevision.RevisionId,data,historyPins,
+                includeCalendarDays:false,observationScope:retained is null?ObservationReadScope.FactHistory:ObservationReadScope.ExactPins);
+            var saved=await (savedVersions?.Read(connection,ct)??new CustomCurvesStore(database).Read(connection,ct));
+            // Coalesce every exact ancestor's demand before loading any sample.
+            // Overlapping historical projections must share the same admitted
+            // sample frame, including when a version is also consumed directly.
+            var demands=new Dictionary<(Guid,int),ImmutableHashSet<RecipeDelivery>?>();
+            var preparation=new RecipePreparation(connection,database,sourceData,frame,exact,resolved,saved,demands,retained is not null);
+            async Task Require(Guid id,int version,ImmutableHashSet<RecipeDelivery>? deliveries,int depth)
+            {
+                if(depth>32||demands.Count>=256&&!demands.ContainsKey((id,version)))throw Invalid("Published source preparation supports 32 dependency edges and 256 exact versions.");
+                if(demands.TryGetValue((id,version),out var prior))
+                {
+                    if(prior is null||deliveries is not null&&deliveries.IsSubsetOf(prior))return;
+                    deliveries=deliveries is null?null:prior.Union(deliveries);
+                }
+                demands[(id,version)]=deliveries;
+                var definition=saved.SingleOrDefault(v=>v.Id==id&&v.Version==version)?.Definition??throw Invalid("The exact published custom curve is unavailable.");
+                var topology=await preparation.Topology(new(data.DefinitionRevision.CatalogId,id,version,definition.Output),ct);
+                var parents=topology.PublishedInputs(deliveries);
+                foreach(var parent in definition.Nodes.Where(n=>n.Kind=="published_source").Select(n=>n.PublishedSource!).Distinct())
+                    await Require(parent.CurveId,parent.Version,parents.GetValueOrDefault(parent,ImmutableHashSet<RecipeDelivery>.Empty),depth+1);
+            }
+            foreach(var group in recipeBindings.GroupBy(b=>(b.CurveId,b.Version)))
+            {
+                if(group.Any(binding=>binding.Selection==CustomCurveProjectionBinding.SupportedSelection))
+                {await Require(group.Key.CurveId,group.Key.Version,null,0);continue;}
+                var shape=await preparation.Topology(new(data.DefinitionRevision.CatalogId,group.Key.CurveId,group.Key.Version,group.First().OutputNode),ct);
+                var intervals=shape.Outputs.Select(output=>new ProjectionDelivery(output.DeliveryFrom,output.DeliveryTo)).ToArray();
+                var selected=group.SelectMany(binding=>CurvePriceMapping.RequiredIntervals(binding.Selection,intervals,
+                    required.Where(c=>c.Binding==binding).Select(c=>c.Interval))).Select(interval=>new RecipeDelivery(interval.From,interval.To)).ToImmutableHashSet();
+                await Require(group.Key.CurveId,group.Key.Version,selected,0);
+            }
+            foreach(var group in recipeBindings.GroupBy(b=>(b.CatalogId,b.CurveId,b.Version)))
+            {
+                ct.ThrowIfCancellationRequested();
+                if(group.Key.CatalogId!=data.DefinitionRevision.CatalogId)throw Invalid("The projection must belong to this exact market catalog.");
+                var version=saved.SingleOrDefault(v=>v.Id==group.Key.CurveId&&v.Version==group.Key.Version)
+                    ??throw Invalid("The exact published custom curve is unavailable in this knowledge context.");
+                if(version.State!="published"||version.EngineVersion!=RecipeEngine.Version||version.PublishedAt is null||
+                    version.PublishedAt>SchedulePreview.ParseAt(exact.KnownAt)||version.Sources.Values.Any(s=>s.CatalogId!=group.Key.CatalogId||s.RevisionId!=data.DefinitionRevision.RevisionId)||
+                    group.Any(b=>b.OutputNode!=version.Definition.Output))
+                    throw Invalid("Connected projections require a published managed recipe, its exact output and retained source revision.");
+                var graph=await preparation.Published(new(group.Key.CatalogId,group.Key.CurveId,group.Key.Version,version.Definition.Output),ct);
+                definitions.AddRange(graph.Definitions);
+                outputRoots.AddRange(graph.Outputs.Select(o=>o.Point));
+                var mapping=ProjectionMapping(graph);
+                foreach(var binding in group)
+                {
+                    foreach(var item in required.Where(c=>c.Binding==binding))
+                    {
+                        bindings.Add(item.Request,mapping.Resolve(binding,item.Interval));
+                    }
+                }
+            }
+            samples.AddRange(preparation.Samples);sourceCompilations+=preparation.SourceCompilations;declaredSourceNodes+=preparation.DeclaredSourceNodes;
+        }
+        if(bindings.Count!=dependencies.Length)throw Invalid("Every declared pricing dependency must have exactly one retained graph binding.");
+
+        // A due index fixing is a pricing input even when no projected curve
+        // dependency remains. Qualify it before advertising a usable risk graph.
+        foreach(var lookup in prices.Where(price=>price.Lookup is not null).Select(price=>price.Lookup!).Distinct())
+            _=IndexFixingPricing.Resolve(authority,lookup);
+        var observationLookups=prices.Where(price=>price.ContractObservation is not null)
+            .Select(price=>price.ContractObservation!).Distinct().ToImmutableArray();
+        if(!observationLookups.IsEmpty&&snapshot.MarketCutoff!=frame.At)
+            throw new MarketDataException("contract_observation_context","This source consumer requires an explicit market cutoff equal to the valuation instant.");
+        var observationSamples=await ContractObservationSamples.Read(connection,database,data,frame,exact,observationLookups,ct,retained,sourceHistories);
+        ContractObservationPricing? observationPricing=null;
+        if(!observationSamples.IsEmpty)
+        {
+            observationPricing=ContractObservationPricing.Compile(observationSamples,resolved,
+                new PreparedBindings(observationLookups.Select(lookup=>lookup.Market.Curve).ToHashSet(),resolved));
+            definitions.AddRange(observationPricing.Definitions);
+            outputRoots.AddRange(observationPricing.Points.Values);
+            sourceCompilations+=observationSamples.Length;
+            declaredSourceNodes+=observationPricing.Definitions.Sum(definition=>definition.Points.Length);
+        }
+        var merged=ConnectedCurves.MergeDefinitions(definitions);
+        // Fully fixed instruments have no projected roots; source authority is
+        // still retained for the ordinary fixing contract.
+        var roots=bindings.Values.Concat(outputRoots).Distinct().ToImmutableArray();
+        var plan=ConnectedCurves.Compile(merged,roots,resolved,new PreparedBindings(merged.Select(d=>d.Key).ToHashSet(),resolved),ct);
+        if(samples.Any(s=>s.Snapshot.MarketCutoff!=s.Snapshot.ValuationAt))
+            throw Invalid("This retained sample contract requires market cutoff and sample valuation to be the same explicit instant.");
+        var evidence=new ConnectedMarketEvidence(data.DefinitionRevision.RevisionId,plan.ManifestId,data.FuturesConvention,recipeBindings,
+            samples.OrderBy(s=>s.Source.Code,StringComparer.Ordinal).ThenBy(s=>s.Date).ThenBy(s=>s.Contract.Id).ThenBy(s=>s.Snapshot.Id)
+                .Select(s=>new ConnectedSampleEvidence(s.Snapshot.Id,s.Snapshot.ValuationAt,s.Source.Code,s.Contract.Id,s.FreezeHistorical,
+                    s.Snapshot.Selections.OrderBy(o=>o.Input.Series.Id).ThenBy(o=>o.Input.Use)
+                        .Select(o=>new ConnectedSampleObservation(o.Observation.Key.Id,o.Input.Series.Id,o.Input.Use.ToString())).ToImmutableArray(),FreezeObservation:s.FreezeObservation))
+                .Concat(observationSamples.Select(sample=>ContractObservationSamples.Evidence(sample,frame.At)))
+                .DistinctBy(sample=>JsonSerializer.Serialize(sample,RiskJobs.Json))
+                .OrderBy(sample=>sample.Kind,StringComparer.Ordinal).ThenBy(sample=>sample.SourceCurve,StringComparer.Ordinal)
+                .ThenBy(sample=>sample.At).ThenBy(sample=>sample.ContractId).ThenBy(sample=>sample.FreezeObservation).ThenBy(sample=>sample.SnapshotId).ToImmutableArray());
+        if(retained is not null&&JsonSerializer.Serialize(evidence,RiskJobs.Json)!=JsonSerializer.Serialize(retained,RiskJobs.Json))
+            throw new MarketDataException("risk_graph_manifest","The rebuilt graph differs from its admitted recipe, sample or topology manifest.");
+        var valuation=ConnectedValuation.Prepare(ConnectedScenario.Base(plan,database.Calculations,ct),snapshot,
+            samples.Select(s=>snapshot.Knowledge is null?s.Snapshot:
+                MarketSnapshotBinding.Bind(s.Snapshot,exact.ContextId!.Value,SchedulePreview.ParseAt(exact.KnownAt))).Concat(observationSamples.Select(sample=>sample.Snapshot))
+                .Concat(linked.SelectMany(m=>m.Valuation.SourceSnapshots.Prepend(m.Valuation.Snapshot))).Distinct().ToImmutableArray(),ct);
+        if(observationPricing is not null)valuation=valuation.WithContractObservations(observationPricing);
+        var prepared=new PreparedMarket(valuation,authority,bindings.ToImmutable(),evidence,new(sourceCompilations,declaredSourceNodes));
+        if(ordinary)preparationScope?.Add(connection,database,data,snapshot,exact,dependencies,prepared);
+        return prepared;
+    }
+    static CurvePriceMapping ProjectionMapping(ConnectedRecipeGraph graph)
+    {
+        var points=graph.Definitions.SelectMany(d=>d.Points).ToDictionary(p=>p.Key);
+        return new(graph.Outputs.Select(o=>new ProjectionOutput(o.Position,o.Point,new(points[o.Point].DeliveryFrom,points[o.Point].DeliveryTo))));
+    }
+}

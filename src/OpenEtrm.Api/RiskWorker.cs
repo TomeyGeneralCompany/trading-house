@@ -1,0 +1,310 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
+using System.Collections.Immutable;
+using Npgsql;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.Risk;
+
+namespace OpenEtrm.Api;
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record RiskWorkerConfiguration(string ConnectionFile,int LeaseSeconds,int PollSeconds,int TimeoutSeconds)
+{
+    public void Validate()
+    {
+        if(string.IsNullOrWhiteSpace(ConnectionFile)||!Path.IsPathFullyQualified(ConnectionFile)||
+            LeaseSeconds is < 15 or > 300||PollSeconds is < 1 or > 60||TimeoutSeconds is < 1 or > 3600)
+            throw new InvalidOperationException("Supply an absolute worker connection file, 15–300 second lease, 1–60 second poll and 1–3600 second calculation timeout.");
+    }
+}
+
+// One claim owns one complete portfolio run. Independent replicas share the
+// durable queue; their only coordination is PostgreSQL's lease/publication fence.
+public static class RiskWorker
+{
+    public static async Task<int> Run(string[] args)
+    {
+        if(args is not ["once"] and not ["serve"])throw new ArgumentException("Choose once or serve for the risk worker.");
+        var path=Environment.GetEnvironmentVariable("OPENETRM_RISK_WORKER_CONFIG")
+            ??throw new InvalidOperationException("Explicit private risk-worker configuration is required.");
+        var settings=JsonSerializer.Deserialize<RiskWorkerConfiguration>(File.ReadAllText(path),RiskJobs.Json)
+            ??throw new InvalidOperationException("Missing risk-worker configuration.");
+        settings.Validate();
+        var taskId=Environment.GetEnvironmentVariable("OPENETRM_TASK_ID");
+        var nodeId=Environment.GetEnvironmentVariable("OPENETRM_NODE_ID");
+        var slotText=Environment.GetEnvironmentVariable("OPENETRM_TASK_SLOT");
+        var managed=taskId!=null || nodeId!=null || slotText!=null;
+        int slot=0;
+        if(managed && (string.IsNullOrWhiteSpace(taskId)||string.IsNullOrWhiteSpace(nodeId)||!int.TryParse(slotText,out slot)||slot is <1 or >2))
+            throw new InvalidOperationException("Managed workers require the Swarm task, node and slot identity.");
+        var connection=HostedConfiguration.Connection(settings.ConnectionFile);
+        if(managed)
+        {
+            RiskWorkerConnection.Validate(connection);
+            connection.MaxPoolSize=1;
+        }
+        await using var source=NpgsqlDataSource.Create(connection.ConnectionString);
+        await using var control=managed?NpgsqlDataSource.Create(connection.ConnectionString):null;
+        using var stop=new CancellationTokenSource();
+        ConsoleCancelEventHandler interrupt=(_,e)=>{e.Cancel=true;stop.Cancel();};
+        Console.CancelKeyPress+=interrupt;
+        using var terminate=System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM,
+            e=>{e.Cancel=true;stop.Cancel();});
+        try
+        {
+            do
+            {
+                await using var claim=source.CreateCommand(managed?"SELECT risk.pool_claim($1,$2,$3,$4,$5,$6)::text":"SELECT risk.claim($1,$2)::text");
+                claim.Parameters.AddWithValue(settings.LeaseSeconds);
+                claim.Parameters.AddWithValue(RiskJobs.EngineVersion);
+                if(managed)
+                {
+                    claim.Parameters.AddWithValue(taskId!);claim.Parameters.AddWithValue(nodeId!);
+                    claim.Parameters.AddWithValue(slot);claim.Parameters.AddWithValue(settings.PollSeconds);
+                }
+                var raw=await claim.ExecuteScalarAsync(stop.Token);
+                if(raw is string text && text!="null")
+                {
+                    var job=JsonNode.Parse(text)!.AsObject();
+                    await Execute(source,control??source,job,settings,stop.Token);
+                    if(managed)
+                    {
+                        await using var log=source.CreateCommand("SELECT risk.pool_app_result($1,$2,$3)");
+                        log.Parameters.AddWithValue(taskId!);log.Parameters.AddWithValue(job["jobId"]!.GetValue<Guid>());
+                        log.Parameters.AddWithValue(job["attempt"]!.GetValue<int>());
+                        if(await log.ExecuteScalarAsync(stop.Token) is string message)Console.WriteLine(message);
+                    }
+                }
+                else if(args[0]=="serve")await Task.Delay(TimeSpan.FromSeconds(settings.PollSeconds),stop.Token);
+            }while(args[0]=="serve"&&!stop.IsCancellationRequested);
+        }
+        catch(OperationCanceledException) when(stop.IsCancellationRequested){ }
+        finally{Console.CancelKeyPress-=interrupt;}
+        return 0;
+    }
+
+    private static async Task Execute(NpgsqlDataSource source,NpgsqlDataSource control,JsonObject job,RiskWorkerConfiguration settings,CancellationToken stopping)
+    {
+        var id=(job["id"]??job["jobId"])!.GetValue<Guid>();var lease=job["leaseToken"]!.GetValue<Guid>();
+        using var calculation=CancellationTokenSource.CreateLinkedTokenSource(stopping);
+        calculation.CancelAfter(TimeSpan.FromSeconds(settings.TimeoutSeconds));
+        using var heartbeatStop=new CancellationTokenSource();
+        var cancellationRequested=false;var leaseLost=false;
+        async Task Heartbeat()
+        {
+            try
+            {
+                while(true)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(settings.LeaseSeconds/3),heartbeatStop.Token);
+                    await using var command=control.CreateCommand("SELECT risk.heartbeat($1,$2,$3)");
+                    command.Parameters.AddWithValue(id);command.Parameters.AddWithValue(lease);command.Parameters.AddWithValue(settings.LeaseSeconds);
+                    var state=(string)(await command.ExecuteScalarAsync(heartbeatStop.Token))!;
+                    if(state=="cancellation_requested"){cancellationRequested=true;calculation.Cancel();return;}
+                    if(state!="running"){leaseLost=true;calculation.Cancel();return;}
+                }
+            }
+            catch(OperationCanceledException) when(heartbeatStop.IsCancellationRequested){ }
+            catch(NpgsqlException){leaseLost=true;calculation.Cancel();}
+        }
+        var heartbeat=Heartbeat();
+        string? failure=null;string? serializedReport=null;VolSurfaceFitOutcome? fit=null;
+        var fits=VolSurfaceStore.Fits(job);
+        try
+        {
+            // A fit reads its pinned inputs and then solves, all under the calculation timeout.
+            if(fits)fit=await VolSurfaceStore.Fit(source,job,id,lease,calculation.Token);
+            else serializedReport=await Report(source,job,id,lease,settings,calculation.Token);
+            calculation.Token.ThrowIfCancellationRequested();
+        }
+        catch(Exception e) when(e is MarketDataException or PreviewDeniedException or OpenEtrm.Shared.Temporal.TemporalException or NpgsqlException or
+            OperationCanceledException or JsonException or InvalidOperationException or ArgumentException or KeyNotFoundException or FormatException or OverflowException)
+        {
+            failure=e switch{MarketDataException m=>m.Code,OperationCanceledException=>stopping.IsCancellationRequested?"worker_stopped":"risk_timeout",
+                PreviewDeniedException=>"risk_authority",PostgresException p when p.SqlState=="42501"=>"risk_authority",_=>"risk_job_failed"};
+            Exception? diagnostic=e;
+            for(var depth=0;diagnostic is not null&&depth<4;diagnostic=diagnostic.InnerException,depth++)
+            {
+                Console.Error.WriteLine($"RISK_FAILURE_TYPE {diagnostic.GetType().Name}");
+                if(diagnostic is PostgresException pg)Console.Error.WriteLine($"RISK_FAILURE_SQLSTATE {pg.SqlState}");
+            }
+            foreach(var location in PreviewFailureDiagnostics.Codes(e))
+                Console.Error.WriteLine($"RISK_FAILURE_CODE {location}");
+        }
+        finally{heartbeatStop.Cancel();await heartbeat;}
+        // Calculation has stopped. A late cancellation may be acknowledged only
+        // for this exact attempt; a replacement token still fences the old worker.
+        if(leaseLost||stopping.IsCancellationRequested&&!cancellationRequested)
+        {
+            await AcknowledgeStopped(source,id,lease);
+            return;
+        }
+        if(calculation.IsCancellationRequested&&failure is null)failure="risk_timeout";
+        // A fitted surface is recorded by the transaction that completes its job; anything else completes through risk.finish.
+        NpgsqlCommand Completion()
+        {
+            if(!cancellationRequested&&failure is null&&fit is not null)return VolSurfaceStore.Finish(source,id,lease,fit);
+            var command=source.CreateCommand(cancellationRequested?"SELECT risk.acknowledge_cancel($1,$2)":"SELECT risk.finish($1,$2,$3::jsonb,$4)");
+            command.Parameters.AddWithValue(id);command.Parameters.AddWithValue(lease);
+            if(!cancellationRequested)
+            {
+                command.Parameters.Add(new NpgsqlParameter{Value=failure is null&&serializedReport is not null?serializedReport:DBNull.Value,NpgsqlDbType=NpgsqlTypes.NpgsqlDbType.Text});
+                command.Parameters.Add(new NpgsqlParameter{Value=(object?)failure??DBNull.Value,NpgsqlDbType=NpgsqlTypes.NpgsqlDbType.Text});
+            }
+            return command;
+        }
+        await using var finish=Completion();
+        try
+        {
+            var state=await finish.ExecuteScalarAsync(CancellationToken.None);
+            if(Equals(state,"cancellation_requested"))
+            {
+                await using var acknowledge=source.CreateCommand("SELECT risk.acknowledge_cancel($1,$2)");
+                acknowledge.Parameters.AddWithValue(id);acknowledge.Parameters.AddWithValue(lease);
+                state=await acknowledge.ExecuteScalarAsync(CancellationToken.None);
+            }
+            Console.WriteLine($"RISK_JOB {id} {state}");
+        }
+        catch(PostgresException p) when(p.SqlState=="P0001"&&failure is null&&(fits?VolSurfaceStore.Refusal(p.MessageText):p.MessageText is "risk_result_limit" or "risk_job_input"))
+        {
+            // A deterministic publication limit or recording refusal must not become a reclaim loop.
+            try
+            {
+                await using var rejected=source.CreateCommand("SELECT risk.finish($1,$2,NULL,$3)");
+                rejected.Parameters.AddWithValue(id);rejected.Parameters.AddWithValue(lease);
+                rejected.Parameters.AddWithValue(fits?p.MessageText:"risk_result_limit");
+                var state=await rejected.ExecuteScalarAsync(CancellationToken.None);
+                if(Equals(state,"cancellation_requested"))await AcknowledgeStopped(source,id,lease);
+                else Console.WriteLine($"RISK_JOB {id} {state}");
+            }
+            catch(PostgresException denied) when(denied.SqlState is "42501" or "P0001")
+            {await AcknowledgeStopped(source,id,lease);}
+        }
+        catch(PostgresException p) when(p.SqlState=="P0001"&&p.MessageText=="risk_job_cancelled")
+        {
+            try
+            {
+                await using var acknowledge=source.CreateCommand("SELECT risk.acknowledge_cancel($1,$2)");
+                acknowledge.Parameters.AddWithValue(id);acknowledge.Parameters.AddWithValue(lease);
+                Console.WriteLine($"RISK_JOB {id} {await acknowledge.ExecuteScalarAsync(CancellationToken.None)}");
+            }
+            catch(PostgresException denied) when(denied.SqlState is "42501" or "P0001")
+            {Console.WriteLine($"RISK_JOB_FENCED {id}");}
+        }
+        catch(PostgresException p) when(p.SqlState is "42501" or "P0001")
+        {await AcknowledgeStopped(source,id,lease);}
+    }
+
+    private static async Task AcknowledgeStopped(NpgsqlDataSource source,Guid id,Guid lease)
+    {
+        try
+        {
+            await using var command=source.CreateCommand("SELECT risk.acknowledge_cancel($1,$2)");
+            command.Parameters.AddWithValue(id);command.Parameters.AddWithValue(lease);
+            Console.WriteLine($"RISK_JOB {id} {await command.ExecuteScalarAsync(CancellationToken.None)}");
+        }
+        catch(NpgsqlException){Console.WriteLine($"RISK_JOB_STOPPED {id}");}
+    }
+
+    private sealed record Loaded(Func<CancellationToken,object> Calculate,ScheduleContext Context,DateTimeOffset At);
+
+    // A portfolio risk job's serialized report: its retained inputs loaded within the worker's bounded authority window, then calculated.
+    private static async Task<string> Report(NpgsqlDataSource source,JsonObject job,Guid id,Guid lease,RiskWorkerConfiguration settings,CancellationToken calculation)
+    {
+        using var loading=CancellationTokenSource.CreateLinkedTokenSource(calculation);
+        loading.CancelAfter(TimeSpan.FromSeconds(Math.Min(settings.LeaseSeconds/2,30)));
+        Loaded prepared;
+        try{prepared=await Load(source,job,id,lease,loading.Token);}
+        catch(OperationCanceledException) when(loading.IsCancellationRequested&&!calculation.IsCancellationRequested)
+        {throw new MarketDataException("risk_input_timeout","The retained inputs could not be loaded within the worker's bounded authority window.");}
+        loading.CancelAfter(Timeout.InfiniteTimeSpan);
+        var value=await Task.Run(()=>prepared.Calculate(calculation),calculation);
+        var report=JsonSerializer.SerializeToNode(value,RiskJobs.Json)!.AsObject();
+        report["context"]=JsonSerializer.SerializeToNode(prepared.Context,RiskJobs.Json);
+        report["asOf"]=JsonSerializer.SerializeToNode(prepared.At,RiskJobs.Json);
+        report["engineVersion"]=RiskJobs.EngineVersion;
+        var serialized=report.ToJsonString(RiskJobs.Json);
+        if(System.Text.Encoding.UTF8.GetByteCount(serialized)>30_000_000)
+            throw new MarketDataException("risk_result_limit","The retained result exceeds the supported serialized report size.");
+        return serialized;
+    }
+
+    private static async Task<Loaded> Load(NpgsqlDataSource source,JsonObject job,Guid id,Guid lease,CancellationToken ct)
+    {
+        var payload=job["request"]!.DeepClone().AsObject();
+        if(payload["engineVersion"]?.GetValue<string>()!=RiskJobs.EngineVersion)
+            throw new MarketDataException("risk_engine_version","The retained job requires its exact managed engine binaries.");
+        payload.Remove("engineVersion");
+        if(payload["convention"]?.GetValue<string>()!=PortfolioRiskPreview.Convention)
+            throw new MarketDataException("risk_job_convention","The retained request requires the supported portfolio risk operation.");
+        var request=payload.Deserialize<PortfolioRiskRequest>(RiskJobs.Json)??throw new JsonException("Missing risk request.");
+        RiskJobs.RequireTradeScope(request.TradeIds,job["frame"]?["scope"]);
+        var requestContext=request.Context??throw new JsonException("Missing risk context.");
+        var frame=RetainedFrames.Read(job["frame"]??throw new JsonException("Missing risk frame."));
+        var catalog=job["catalogId"]!.GetValue<Guid>();var revision=job["revisionId"]!.GetValue<Guid>();
+        if(requestContext.KnowledgeMode!="retained"||requestContext.ContextId!=frame.ContextId||requestContext.SnapshotId!=frame.Id||
+            requestContext.ContextId!=job["contextId"]!.GetValue<Guid>()||frame.At!=job["valuationAt"]!.GetValue<DateTimeOffset>())
+            throw new MarketDataException("risk_job_context","The queued request and retained frame must identify the same context.");
+        await using var connection=await source.OpenConnectionAsync(ct);
+        await using var transaction=await connection.BeginTransactionAsync(ct);
+        await using(var bind=ScheduleStore.Command(connection,"SELECT risk.bind($1,$2)",id,lease))await bind.ExecuteScalarAsync(ct);
+        var rows=await PreviewDatabase.Rows(connection,"SELECT row_to_json(t)::text FROM (SELECT * FROM market_data.revisions WHERE catalog_id=$1 AND id=$2)t",[catalog,revision],ct);
+        if(rows.Length!=1)throw new PreviewDeniedException();
+        var selected=rows[0];
+        var pinned=job["frame"]!["supplementalMarkets"] as JsonObject
+                ??throw new MarketDataException("risk_job_context","Portfolio risk requires an explicit supplemental-market manifest.");
+        var supplemental=pinned.ToImmutableDictionary(p=>Guid.Parse(p.Key),p=>RetainedFrames.Read(p.Value??throw new JsonException("Missing market frame.")));
+        if(supplemental.Any(p=>p.Key==revision||p.Value.Id!=frame.Id||p.Value.ContextId!=frame.ContextId||p.Value.At!=frame.At||
+            p.Value.SwapMarketSelections is {Count:>0})||frame.SwapMarketSelections is null||
+            frame.SwapMarketSelections.Count!=supplemental.Count||supplemental.Any(p=>!frame.SwapMarketSelections.TryGetValue(p.Key,out var pins)||!pins.SequenceEqual(p.Value.ObservationIds)))
+            throw new MarketDataException("risk_job_context","Every market must use the exact retained context and observation pins.");
+        var connected=job["frame"]!["connectedMarkets"]?.Deserialize<ImmutableArray<ConnectedMarketEvidence>>(RiskJobs.Json)
+            ??throw new MarketDataException("risk_graph_manifest","The retained job must include every connected market manifest.");
+        var sourceConventions=connected.Select(m=>m.SourceExecutionConvention).Distinct().ToArray();
+        if(sourceConventions.Length!=1||!OpenEtrm.MarketData.Trading.FuturesMarketBinding.Supported(sourceConventions[0]))
+            throw new MarketDataException("risk_graph_manifest","Every connected market must retain the same explicit source execution convention.");
+        var manifest=new PreviewManifest("retained-risk-job",catalog,revision,selected.Id("reference_catalog_id"),selected.Id("reference_revision_id"),
+            job["tenantId"]!.GetValue<Guid>(),job["workspaceId"]!.GetValue<Guid>(),[],null,
+            InputMarkets:supplemental.Select(p=>new PreviewInputMarket(p.Key,[new(p.Value.At,p.Value.ObservationIds.ToArray(),
+                p.Value.CurveContracts.ToDictionary(c=>c.Key,c=>c.Value.ToArray()),p.Value.FrozenObservationIds.ToArray())])).ToArray(),
+            FuturesConvention:sourceConventions[0]);
+        var context=(await new KnowledgeResolver(catalog).Read(connection,requestContext.ContextId!.Value,ct)).Context;
+        await using var database=new PreviewDatabase(manifest,source);
+        using var admissions=database.OwnReadTransaction(connection,transaction);
+        var data=await RetainedFrames.ReadBoundJobInputs(database,connection,frame,revision,ReferenceReadScope.TradeValuation,ct);
+        var markets=ImmutableArray.CreateBuilder<(PreviewData Data,InputFrame Frame)>();
+        foreach(var market in supplemental.OrderBy(p=>p.Key))
+            markets.Add((await database.Read(connection,ct,market.Key,observationIds:market.Value.ObservationIds,
+                referenceScope:ReferenceReadScope.TradeValuation,observationScope:ObservationReadScope.ExactPins),market.Value));
+        if(job["frame"]!["excludedPositions"]?.Deserialize<ImmutableArray<ExcludedPosition>>(RiskJobs.Json) is not {IsDefault:false} excluded)
+            throw new MarketDataException("risk_job_context","The retained job must list the positions its submission left out.");
+        var historyPlan=job["frame"]!["factorHistory"]?.Deserialize<RetainedFactorHistory>(RiskJobs.Json);
+        var historical=ImmutableArray<RiskHistoryObservation>.Empty;
+        var requiresHistory=request.Parametric is not null||request.Historical is not null||request.MonteCarlo is not null||request.Economic?.History is not null;
+        if(requiresHistory)
+        {
+            if(historyPlan is null)throw new MarketDataException("risk_parametric_history","A statistical job must retain its complete history input plan.");
+            var values=await PreviewDatabase.Rows(connection,"SELECT risk.history_inputs($1,$2)::text",[id,lease],ct);
+            var sources=markets.Select(m=>m.Data).Append(data).ToDictionary(m=>m.DefinitionRevision.RevisionId);
+            historical=[..values.GroupBy(r=>r.Id("definition_revision_id")).SelectMany(g=>PortfolioRiskPreview.ReadHistoryEvidence(sources[g.Key],[..g],ct))];
+        }
+        var prepared=await new PortfolioRiskPreview(database).Prepare(connection,data,frame,request,ct,markets.ToImmutable(),new(connected,excluded),historyPlan,historical);
+        RiskJobs.RequireEconomicFrame(job["frame"]!["economicLifecycle"],prepared.Economic);
+        var axes=job["frame"]!["scenarioAxes"]?.Deserialize<ImmutableArray<RetainedRiskAxis>>(RiskJobs.Json)
+            ??throw new MarketDataException("risk_graph_manifest","The retained job must include its exact resolved scenario coordinates.");
+        if(JsonSerializer.Serialize(axes,RiskJobs.Json)!=JsonSerializer.Serialize(CurveRiskAxes.Retained(prepared),RiskJobs.Json))
+            throw new MarketDataException("risk_graph_manifest","The requested scenario coordinates differ from their admitted graph targets.");
+        if(job["frame"]!["optionCalibrations"] is not JsonArray calibrations||
+            !JsonNode.DeepEquals(calibrations,JsonSerializer.SerializeToNode(prepared.Portfolio.OptionCalibrations,RiskJobs.Json)))
+            throw new MarketDataException("risk_option_calibration","The replayed option calibrations differ from the receipts the job retained.");
+        if(requiresHistory)
+        {
+            await using var authority=ScheduleStore.Command(connection,"SELECT risk.check_history($1,$2)",id,lease);
+            await authority.ExecuteScalarAsync(ct);
+        }
+        var loaded=new Loaded(token=>PortfolioRiskPreview.Calculate(prepared,token),context,frame.At);
+        await admissions.Commit(ct);
+        return loaded;
+    }
+}

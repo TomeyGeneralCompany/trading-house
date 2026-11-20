@@ -1,0 +1,1280 @@
+using System.Collections.Immutable;
+using System.Data;
+using System.Text.Json;
+using OpenEtrm.Api.Presentation;
+using Npgsql;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.CustomCurves;
+using OpenEtrm.MarketData.Trading;
+using OpenEtrm.Rates;
+
+namespace OpenEtrm.Api;
+
+public sealed record PreviewManifest(string Mode, Guid CatalogId, Guid RevisionId, Guid ReferenceCatalogId,
+    Guid ReferenceRevisionId, Guid TenantId, Guid WorkspaceId, PreviewSeedFrame[] Frames,PreviewExample? Example,
+    PreviewSequenceCoverage[]? Schedules = null,PreviewInputMarket[]? InputMarkets=null, PreviewUnitCatalog? UnitCatalog=null,string IdentityIssuer="https://preview.invalid",[property:System.Text.Json.Serialization.JsonRequired]string FuturesConvention="",PreviewReferenceCatalog? ReferenceCatalog=null,PreviewPhysicalMarket? GasMarket=null,PreviewPhysicalMarket[]? RetainedGasMarkets=null,PreviewPhysicalMarket? CrudeMarket=null,PreviewPhysicalMarket[]? RetainedCrudeMarkets=null,PreviewPhysicalMarket? LngMarket=null,PreviewPhysicalMarket[]? RetainedLngMarkets=null,PreviewLngReferences? LngReferenceCatalog=null);
+[System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
+public sealed record PreviewLngReferences(Guid ReferenceRevisionId,Guid DefinitionRevisionId);
+public sealed record PreviewPhysicalMarket(Guid RevisionId,PreviewSeedFrame[] Frames);
+public sealed record PreviewReferenceCatalog(Guid ReferenceRevisionId,Guid DefinitionRevisionId,ImmutableArray<string> Tables);
+public sealed record PreviewUnitCatalog(Guid ReferenceRevisionId,Guid DefinitionRevisionId);
+public sealed record UnitCatalogData(ReferenceRevision Revision,ImmutableDictionary<string,ImmutableArray<JsonElement>> References);
+public enum ReferenceReadScope { DefinitionClosure, AllVisible, TradeValuation }
+public enum ObservationReadScope { FactHistory, ExactPins }
+// An owned request may return a native command or reviewed read. Its original authority
+// is rechecked after all request work, immediately before commit admission.
+internal interface ICommitAdmission
+{
+    Task RequireCommit(NpgsqlConnection connection,CancellationToken ct);
+}
+public sealed record ReferencePage(string Table,ImmutableArray<JsonElement> Rows,
+    ImmutableDictionary<string,ImmutableArray<JsonElement>> References,int Offset,int PageSize,int MaximumOffset,bool HasMore,string Search,
+    ReferenceRevision ReferenceRevision,Guid DefinitionRevisionId);
+public sealed record FuturesProductRead(JsonElement Product,ImmutableArray<JsonElement> Series,ImmutableArray<JsonElement> Milestones,
+    ImmutableArray<JsonElement> ExecutionPolicies,ImmutableDictionary<string,ImmutableArray<JsonElement>> References,ReferenceRevision ReferenceRevision,Guid DefinitionRevisionId);
+public sealed record ReferenceSummaryField(string Label,string? Value);
+public sealed record ReferenceHit(string Table,string Code,string Label,string? ProductCode,ImmutableArray<ReferenceSummaryField> Summary);
+public sealed record ReferenceSearch(string Query,ImmutableArray<ReferenceHit> Hits,bool Truncated);
+public sealed record PreviewInputMarket(Guid RevisionId,PreviewSeedFrame[] Frames);
+public sealed record PreviewSequenceCoverage(string Curve, DateTimeOffset From, DateTimeOffset To, DateTimeOffset ExampleAt);
+public sealed record PreviewExample(DateTimeOffset At,string Curve);
+// CloseId names the recorded close a built-in frame was seeded as (D334); such a frame is that close, not a working snapshot.
+public sealed record PreviewSeedFrame(DateTimeOffset At, Guid[] ObservationIds, Dictionary<string,Guid[]> CurveContracts,Guid[]? FrozenObservationIds=null,CatalogueSource? PpaBundle=null,Guid? CloseId=null);
+public sealed record FrameClose(string Session,int SessionVersion,DateOnly BusinessDate,Guid? ReplacedBy);
+public sealed record InputFrame(Guid Id, string Name, DateTimeOffset At,
+    [property:System.Text.Json.Serialization.JsonRequired] DateOnly BusinessDate, ImmutableArray<Guid> ObservationIds,
+    ImmutableDictionary<string,ImmutableArray<Guid>> CurveContracts,
+    [property:System.Text.Json.Serialization.JsonIgnore(Condition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] Guid? ContextId=null,
+    [property:System.Text.Json.Serialization.JsonIgnore] ImmutableArray<Guid> FrozenObservationIds=default)
+{
+    [System.Text.Json.Serialization.JsonIgnore(Condition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public Guid? OriginCloseId{get;init;}
+    [System.Text.Json.Serialization.JsonIgnore]
+    public OpenEtrm.Shared.Temporal.BusinessTime Time
+    {
+        get
+        {
+            var time=new OpenEtrm.Shared.Temporal.BusinessTime(BusinessDate,At);
+            if(Close is {} close)time.RequireDate(close.BusinessDate);
+            return time;
+        }
+    }
+    // The session and business day of a recorded close, and the close in force for them when it is not this one (D334).
+    // Working snapshots that were never recorded have none.
+    [System.Text.Json.Serialization.JsonIgnore(Condition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public FrameClose? Close{get;init;}
+    [System.Text.Json.Serialization.JsonIgnore]
+    public Guid? OriginInputId{get;init;}
+    [System.Text.Json.Serialization.JsonIgnore]
+    public CatalogueSource? Source{get;init;}
+    [System.Text.Json.Serialization.JsonIgnore]
+    public ImmutableDictionary<Guid,MarketSourceInputs>? SourceInputs{get;init;}
+    public CatalogueSource? PpaBundle{get;init;}
+    // Pins explicitly selected in separate swap bundles, by bundle revision (D172).
+    [System.Text.Json.Serialization.JsonIgnore(Condition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public ImmutableDictionary<Guid,ImmutableArray<Guid>>? SwapMarketSelections{get;init;}
+    // Set only on frames a certified context resolves under its explicit latest-correction policy (D172).
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool ResolvesLatestCorrection{get;init;}
+    public InputFrame ForMarketSource(ImmutableArray<Guid> pins,ImmutableDictionary<string,ImmutableArray<Guid>> contracts,ImmutableArray<Guid> frozen)
+    {
+        if(pins.IsDefault||frozen.IsDefault||frozen.Distinct().Count()!=frozen.Length||frozen.Any(id=>!pins.Contains(id)))
+            throw new MarketDataException("snapshot_inputs","Each source requires its own explicit frozen observations within its selected pins.");
+        return this with{Name="Selected market inputs",ObservationIds=pins,CurveContracts=contracts,OriginCloseId=null,Close=null,OriginInputId=null,Source=null,FrozenObservationIds=frozen};
+    }
+    public InputFrame SelectRevision(Guid previous,Guid selected,string name)=>this with
+    {
+        Id=Guid.NewGuid(),Name=name,OriginCloseId=null,Close=null,OriginInputId=null,ObservationIds=ObservationIds.Replace(previous,selected),
+        SourceInputs=SelectSourceRevision(Source?.DefinitionRevisionId,previous,selected),
+        FrozenObservationIds=FrozenObservationIds.IsDefault?default:FrozenObservationIds.Contains(previous)?FrozenObservationIds.Replace(previous,selected):FrozenObservationIds
+    };
+    public InputFrame SelectSwapMarketRevision(Guid market,ImmutableArray<Guid> pins,Guid previous,Guid selected,string name)=>
+        Source?.DefinitionRevisionId==market?SelectRevision(previous,selected,name):this with
+    {
+        Id=Guid.NewGuid(),Name=name,OriginCloseId=null,Close=null,OriginInputId=null,
+        SourceInputs=SelectSourceRevision(market,previous,selected),
+        SwapMarketSelections=(SwapMarketSelections??ImmutableDictionary<Guid,ImmutableArray<Guid>>.Empty).SetItem(market,pins.Replace(previous,selected))
+    };
+    private ImmutableDictionary<Guid,MarketSourceInputs>? SelectSourceRevision(Guid? revision,Guid previous,Guid selected)
+    {
+        if(SourceInputs is null)return null;
+        if(revision is not {} id||!SourceInputs.TryGetValue(id,out var part))
+            throw new MarketDataException("snapshot_inputs","The selected source is absent from the exact input matrix.");
+        return SourceInputs.SetItem(id,part.SelectRevision(previous,selected));
+    }
+}
+// How a request binds its context: shared, like every request, or exclusive, taking the epoch row before binding so
+// a control-table write cannot deadlock against requests already admitted (docs/ai-assistant.md §5.4).
+public enum Admission { Shared, Administration, Agents, Grants, OperatingAgents, OperatingAccess }
+public sealed class PreviewDeniedException : Exception;
+
+public sealed partial class PreviewDatabase : IAsyncDisposable
+{
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<NpgsqlConnection,List<ICommitAdmission>> commitAdmissions=new();
+    internal void RegisterCommitAdmission(NpgsqlConnection connection,ICommitAdmission admission)
+    {
+        ArgumentNullException.ThrowIfNull(admission);
+        if(!commitAdmissions.TryGetValue(connection,out var pending))
+            throw new InvalidOperationException("Commit admission belongs to this database adapter's live owned transaction.");
+        pending.Add(admission);
+    }
+    private long observationRowsRead;
+    public long ObservationRowsRead=>Interlocked.Read(ref observationRowsRead);
+    private readonly NpgsqlDataSource? authenticator;
+    private readonly NpgsqlDataSource runtime;
+    private readonly NpgsqlDataSource? calculationRuntime;
+    // The page assistant's reads have pools of their own on the same logins, never the pages' (docs/ai-assistant.md §7.4).
+    private readonly NpgsqlDataSource? agentAuthenticator,agentRuntime;
+    private const string AgentReads="openetrm-agent-reads";
+    private readonly bool ownsSources=true;
+    private readonly string runtimeLogin;
+    private readonly Func<string>? hostedSession;
+    internal int RecipePreviewBudget{get;}=OpenEtrm.MarketData.CustomCurves.RecipeEngine.MaximumSampleReferences;
+    public PreviewManifest Manifest { get; }
+    internal Func<AssistantInvocation?>? AssistantRequest {get;set;}
+    public OpenEtrm.MarketData.Calculation.ConnectedCalculationCache Calculations {get;}=new(16,250_000);
+    internal NpgsqlConnection CalculationListener()=>calculationRuntime?.CreateConnection()
+        ??throw new InvalidOperationException("This database adapter has no calculation listener.");
+    public const int ReferenceMaximumOffset=100000;
+    // Each reference and definition table with its primary key within a revision. Every read returns
+    // rows in key order, so identical pins give identical rows in the same order whatever plan the database uses.
+    private static readonly (string Table,string Key)[] ReferenceKeys = [("currencies","code"), ("dimensions","code"), ("units","code"),
+        ("unit_conversions","from_unit_code,to_unit_code"), ("commodities","code"), ("measurement_bases","code"), ("quantity_specifications","code"),
+        ("quote_specifications","code"), ("value_specifications","code"), ("locations","code"), ("clock_rules","code"), ("clock_captures","clock_code"), ("calendars","code"),
+        ("calendar_days","calendar_code,business_date"), ("commodity_units","commodity_code,unit_code"), ("location_types","code"),
+        ("commodity_locations","commodity_code,location_code"), ("pipeline_zones","pipeline_code,zone_code"),
+        ("pipeline_delivery_points","pipeline_code,zone_code,point_code"),
+        ("crude_grades","code"), ("crude_delivery_points","commodity_code,grade_code,facility_code,custody_point_code"),
+        ("lng_products","code"), ("lng_custody_points","product_code,stage,facility_code,custody_point_code"),
+        ("lng_mass_energy_conversions","code"), ("incoterms_editions","code"), ("incoterms_rules","code"),
+        ("gas_delivery_conventions","pipeline_code,zone_code,point_code,product_code"), ("gas_meter_assignments","code"), ("exchanges","code"), ("clearing_houses","code"),
+        ("exchange_clearing_houses","exchange_code,clearing_house_code"), ("interest_rate_definitions","code"), ("price_index_definitions","code"),
+        ("sources","code"), ("product_evidence","product_code,source_code,fact_group"), ("delivery_profiles","code"), ("settlement_targets","code"),
+        ("futures_products","code"), ("futures_series","code"),
+        ("futures_execution_policies","series_code,implementation"), ("futures_milestones","series_code,milestone"),
+        ("futures_lot_resolutions","series_code"), ("futures_product_terms","product_code"), ("futures_basis_settlements","series_code"),
+        ("futures_option_rules","code"), ("futures_option_products","code"), ("trading_close_times","code"), ("futures_option_series","code")];
+    public static readonly string[] ReferenceTables = [..ReferenceKeys.Select(r=>r.Table)];
+    private static readonly (string Table,string Key)[] DefinitionTables = [("revisions","id"), ("contracts","id"), ("curves","code"), ("series","id"),
+        ("curve_members","curve_code,contract_id"), ("curve_inputs","curve_code,slot"), ("constituent_mappings","curve_code,slot,target_contract_id"),
+        ("rate_curves","code"), ("rate_curve_tenors","curve_code,ordinal"), ("revision_periods","revision_id"),
+        ("index_fixing_observations","index_code,observation_from,observation_to"), ("contract_intervals","contract_id"),
+        ("curve_blocks","curve_code"), ("shaped_curves","code"), ("shaped_curve_blocks","shaped_curve_code,block_curve_code"),
+        ("curve_expiry_rules","curve_code"), ("generation_assets","code"), ("generation_asset_versions","asset_code,effective_from"),
+        ("volume_sources","code"), ("location_valuation_assignments","code")];
+    private static string ReferenceKey(string table)=>ReferenceKeys.Single(r=>r.Table==table).Key;
+    internal static readonly ImmutableArray<string> UnitTables = ["dimensions", "units", "unit_conversions", "commodities", "measurement_bases", "quantity_specifications"];
+
+    // The scheduler's application adapter receives an already-qualified runtime
+    // source. It has no authenticator capability or HTTP host construction.
+    internal PreviewDatabase(PreviewManifest manifest,NpgsqlDataSource runtime)
+    {
+        Manifest=manifest;this.runtime=runtime;runtimeLogin="";ownsSources=false;
+    }
+
+    // The administrator in-term load's adapter: the authenticator issues the named administrator's context to the
+    // dedicated loader login, which then runs the ticket's booking path. It has no HTTP host or sign-in session.
+    internal PreviewDatabase(PreviewManifest manifest,NpgsqlConnectionStringBuilder authenticatorLogin,NpgsqlConnectionStringBuilder loaderLogin)
+    {
+        Manifest=manifest;authenticator=NpgsqlDataSource.Create(authenticatorLogin.ConnectionString);
+        runtime=NpgsqlDataSource.Create(loaderLogin.ConnectionString);runtimeLogin=loaderLogin.Username!;
+    }
+    internal async Task RequireLoaderBoundary(CancellationToken ct)
+    {
+        await DatabaseLoginBoundary.Require(runtime, DatabaseLoginProfile.GasInTermLoader, ct);
+        await DatabaseLoginBoundary.Require(authenticator!, DatabaseLoginProfile.Authenticator, ct);
+    }
+
+    public PreviewDatabase(string root,string manifestName="manifest.json", HostedConfiguration? hosted=null,Func<string>? hostedSession=null)
+    {
+        var processLimits=hosted?.Limits??ProcessLimits.Read(Path.Combine(root,"process-limits.json"));
+        RecipePreviewBudget=processLimits.RecipePreviewBudget;
+        if(manifestName is not ("manifest.json" or "exchange-manifest.json"))throw new InvalidOperationException("Choose a configured preview manifest.");
+        Manifest = JsonSerializer.Deserialize<PreviewManifest>(File.ReadAllText(Path.Combine(root, manifestName)),
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? throw new InvalidOperationException("Missing preview manifest.");
+        if (Manifest.Mode != (hosted is null ? "local-synthetic-preview" : "hosted-pilot")) throw new InvalidOperationException("Manifest does not match the explicitly selected host mode.");
+        if (hosted is not null && Manifest.IdentityIssuer != hosted.IdentityIssuer) throw new InvalidOperationException("The exact hosted identity issuer must match the manifest.");
+        if (hosted is null)
+        {
+            authenticator = PreviewSource(root, "OPENETRM_PREVIEW_AUTHENTICATOR", "preview_authenticator", true);
+            runtime = PreviewSource(root, "OPENETRM_PREVIEW_RUNTIME", "preview_runtime", true);
+            calculationRuntime=PreviewSource(root,"OPENETRM_PREVIEW_RUNTIME","preview_runtime",false,"openetrm-calculation-listener");
+            // An agent read is bounded by its version's time per read, so no one command of it is cut off sooner (D245).
+            agentAuthenticator = PreviewSource(root, "OPENETRM_PREVIEW_AUTHENTICATOR", "preview_authenticator", true, AgentReads, AgentCommandSeconds,processLimits.AgentConnections);
+            agentRuntime = PreviewSource(root, "OPENETRM_PREVIEW_RUNTIME", "preview_runtime", true, AgentReads, AgentCommandSeconds,processLimits.AgentConnections);
+            runtimeLogin = "preview_runtime";
+        }
+        else
+        {
+            this.hostedSession=hostedSession??throw new InvalidOperationException("Hosted capabilities require a verified server session.");
+            var auth = HostedConfiguration.Connection(hosted.AuthenticatorConnectionFile);
+            var app = HostedConfiguration.Connection(hosted.RuntimeConnectionFile);
+            if(auth.Username==app.Username || auth.Database!=app.Database || auth.Host!=app.Host || auth.Port!=app.Port)
+                throw new InvalidOperationException("Hosted runtime and authenticator require separate logins to the same dedicated database.");
+            authenticator=NpgsqlDataSource.Create(auth.ConnectionString); runtime=NpgsqlDataSource.Create(app.ConnectionString);
+            calculationRuntime=NpgsqlDataSource.Create(new NpgsqlConnectionStringBuilder(app.ConnectionString){Pooling=false,ApplicationName="openetrm-calculation-listener"}.ConnectionString);
+            agentAuthenticator=NpgsqlDataSource.Create(new NpgsqlConnectionStringBuilder(auth.ConnectionString){MaxPoolSize=processLimits.AgentConnections,ApplicationName=AgentReads,CommandTimeout=AgentCommandSeconds}.ConnectionString);
+            agentRuntime=NpgsqlDataSource.Create(new NpgsqlConnectionStringBuilder(app.ConnectionString){MaxPoolSize=processLimits.AgentConnections,ApplicationName=AgentReads,CommandTimeout=AgentCommandSeconds}.ConnectionString);
+            runtimeLogin=app.Username!;
+        }
+    }
+
+    // A pool of the given size, or unpooled connections without one, named for the server when an application is given.
+    // The command timeout of the agent read pools: the most time per read a version may set, so only the read's own bound,
+    // through its cancellation, stops a read (D245).
+    internal const int AgentCommandSeconds=RuntimeSet.MaxReadSeconds;
+
+    private static NpgsqlDataSource PreviewSource(string root, string variable, string login, bool pooling, string? application=null, int? commandTimeout=null,int? maximumPool=null)
+    {
+        var config = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable(variable)
+            ?? throw new InvalidOperationException($"Missing {variable}."));
+        if (Path.GetFullPath(config.Host!) != root || config.Username != login || config.Database != "postgres")
+            throw new InvalidOperationException("Preview connections must use its private owned socket and dedicated test login.");
+        // JSON timestamp transport follows the API UTC contract, independently
+        // of the database host, process environment or display preference.
+        config.Timezone = "UTC";
+        HostedConfiguration.RequireBudget(config,new(5,30,8));
+        if(commandTimeout is {} seconds)config.CommandTimeout=seconds;
+        config.Pooling=pooling;if(maximumPool is {} pool)config.MaxPoolSize=pool;
+        if (application is not null) config.ApplicationName = application;
+        return NpgsqlDataSource.Create(config.ConnectionString);
+    }
+
+    // The agent worker connects on the runtime login outside the request pools (docs/ai-assistant.md §7.4, §11). The
+    // connection that holds its lock is not pooled, so closing it ends its session and releases the lock; its writes,
+    // which hold no session state, have a pool of their own.
+    public static (NpgsqlDataSource Holder, NpgsqlDataSource Writes) WorkerSources(string root, HostedConfiguration? hosted)
+    {
+        if (hosted is null)
+            return (PreviewSource(root, "OPENETRM_PREVIEW_RUNTIME", "preview_runtime", false), PreviewSource(root, "OPENETRM_PREVIEW_RUNTIME", "preview_runtime", true));
+        var app = HostedConfiguration.Connection(hosted.RuntimeConnectionFile).ConnectionString;
+        return (NpgsqlDataSource.Create(new NpgsqlConnectionStringBuilder(app) { Pooling = false }.ConnectionString),
+            NpgsqlDataSource.Create(app));
+    }
+
+    // A local context lasts leaseSeconds (at most 300); a hosted context lasts what its sign-in session issues.
+    public async Task<T> WithIdentity<T>(string profile, string? permission, Func<NpgsqlConnection, CancellationToken, Task<T>> operation, CancellationToken ct, Admission admission=Admission.Shared,
+        int leaseSeconds=60,string? hostedDigest=null)
+    {
+        if(authenticator is null)throw new InvalidOperationException("This direct reader has no identity-issuing capability.");
+        if (string.IsNullOrWhiteSpace(profile) || profile.Length>48) throw new PreviewDeniedException();
+        var invocation=AssistantRequest?.Invoke();
+        var issuer=invocation?.ReadLimit is not null?agentAuthenticator??authenticator:authenticator;
+        var source=invocation?.ReadLimit is not null?agentRuntime??runtime:runtime;
+        await using var issue = issuer.CreateCommand(hostedSession is null?"SELECT security.issue_context($1,$2,$3,$4,$5,NULL,$6::name,$7)":"SELECT security.issue_hosted_context($1,$2::name)");
+        foreach (var value in hostedSession is null?new object[] { Manifest.IdentityIssuer, profile, "human_interactive", Manifest.TenantId, Manifest.WorkspaceId, runtimeLogin, leaseSeconds }:new object[]{hostedDigest??hostedSession(),runtimeLogin})
+            issue.Parameters.Add(new NpgsqlParameter { Value = value });
+        Guid token;
+        // A hosted request whose sign-in session was revoked or ended since it was authenticated (docs/ai-assistant.md §11).
+        try { token = (Guid)(await issue.ExecuteScalarAsync(ct) ?? throw new PreviewDeniedException()); }
+        catch (PostgresException e) when (hostedSession is not null && e.SqlState == "42501") { throw new PreviewSessionEnded(); }
+        return await Bound(source, token, hostedSession is not null, invocation?.ReadLimit, admission switch{Admission.Administration=>"SELECT security.use_administration_context($1)",
+            Admission.Agents=>"SELECT assistant.use_agent_admission($1)",Admission.Grants=>"SELECT assistant.use_grant_admission($1)",
+            Admission.OperatingAgents=>"SELECT security.use_operating_policy_context($1,'ManageAgents')",
+            Admission.OperatingAccess=>"SELECT security.use_operating_policy_context($1,'ManageAccess')",
+            _=>"SELECT security.use_context($1)"}, async(connection,ct)=>
+        {
+            await Hold(connection,permission,ct);
+            if(invocation is not null)await invocation.Capture(connection,ct);
+            var replay=invocation is null?(false,default(T)):(await invocation.Replay<T>(connection,ct));
+            var result = replay.Item1?replay.Item2!:await operation(connection, ct);
+            if(invocation is not null&&!replay.Item1)await invocation.Keep(connection,result,ct);
+            if(invocation is not null)await invocation.Capture(connection,ct);
+            await Hold(connection,permission,ct);
+            return result;
+        }, ct);
+    }
+
+    // A read in a request context issued to a turn's agent under the turn's grant (docs/ai-assistant.md §7.1, §7.4), on the
+    // agent pools: `boundAt` receives the instant on the database clock once the context is bound, then each permission the
+    // tool needs is checked before and after the read. The check after it is defense in depth: the bind holds the epoch
+    // row FOR SHARE until the read's transaction ends, so no revocation can commit during the read, and a grant or role
+    // grant whose term ends during it, the one change it can see, also fails the step's publication recheck.
+    // The database holds the read to `readLimit` too (D245): each statement, and each wait between them, so a read whose API
+    // can no longer cancel it still ends its transaction, and the epoch row, within twice that.
+    public async Task<T> WithAgent<T>(AgentIdentity agent, TimeSpan readLimit, ImmutableArray<string> permissions, Action<DateTimeOffset> boundAt,
+        Func<NpgsqlConnection, CancellationToken, Task<T>> read, CancellationToken ct)
+    {
+        if(agentAuthenticator is null||agentRuntime is null)throw new InvalidOperationException("This database adapter has no agent pools.");
+        await using var issue = agentAuthenticator.CreateCommand("SELECT security.issue_context($1,$2,'agent_credential',$3,$4,$5,$6::name,60)");
+        foreach (var value in new object[] { Manifest.IdentityIssuer, agent.Principal, Manifest.TenantId, Manifest.WorkspaceId, agent.Delegation, runtimeLogin })
+            issue.Parameters.Add(new NpgsqlParameter { Value = value });
+        var token = (Guid)(await issue.ExecuteScalarAsync(ct) ?? throw new PreviewDeniedException());
+        return await Bound(agentRuntime, token, false, readLimit, "SELECT security.use_context($1)", async(connection,ct)=>
+        {
+            await using(var now = new NpgsqlCommand("SELECT clock_timestamp()", connection))
+            await using(var reader = await now.ExecuteReaderAsync(ct))
+            {
+                await reader.ReadAsync(ct);
+                boundAt(reader.GetFieldValue<DateTimeOffset>(0));
+            }
+            foreach(var permission in permissions)await Hold(connection,permission,ct);
+            var result = await read(connection, ct);
+            foreach(var permission in permissions)await Hold(connection,permission,ct);
+            return result;
+        }, ct);
+    }
+
+    // Runs an operation in one READ COMMITTED transaction bound to an issued request context, which a hosted request
+    // also holds to its verified sign-in session before and after the operation. An agent's context has no sign-in
+    // session: revoking its delegator's cancels the turn instead (docs/ai-assistant.md §11). A `held` bound is set before the
+    // bind, which may itself wait on the epoch row, as the longest any statement or any wait between them may take.
+    private async Task<T> Bound<T>(NpgsqlDataSource source, Guid token, bool signedIn, TimeSpan? held, string bind, Func<NpgsqlConnection, CancellationToken, Task<T>> operation, CancellationToken ct)
+    {
+        await using var connection = await source.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        using var admissions=OwnReadTransaction(connection,transaction);
+        {
+            if(held is {} bound)
+                await using(var limit = new NpgsqlCommand("SELECT set_config('statement_timeout',$1,true),set_config('idle_in_transaction_session_timeout',$1,true)", connection, transaction))
+                { limit.Parameters.AddWithValue(((long)bound.TotalMilliseconds).ToString(System.Globalization.CultureInfo.InvariantCulture)); await limit.ExecuteNonQueryAsync(ct); }
+            await using (var command = new NpgsqlCommand(bind, connection, transaction))
+            { command.Parameters.AddWithValue(token); await command.ExecuteNonQueryAsync(ct); }
+            if(signedIn)await SignedIn(connection,ct);
+            var result = await operation(connection, ct);
+            if(signedIn)await SignedIn(connection,ct);
+            // A bounded transaction's commit is not cancelled: one cancelled in flight may still have been applied, and an agent's
+            // save could not say whether its draft and step landed. Its statement bound still limits the commit.
+            await admissions.Commit(ct,result as ICommitAdmission,commitUncancelled:held is not null);
+            return result;
+        }
+    }
+
+    // A hosted request's bound context is still held by its verified sign-in session, which may have ended or been revoked
+    // since the bind without touching the epoch row (docs/ai-assistant.md §11). A local preview has no sign-in session.
+    public Task RequireSignedIn(NpgsqlConnection connection,CancellationToken ct)=>hostedSession is null?Task.CompletedTask:SignedIn(connection,ct);
+    private static async Task SignedIn(NpgsqlConnection connection,CancellationToken ct)
+    {
+        await using var check=new NpgsqlCommand("SELECT security.require_hosted_session()",connection);
+        try{await check.ExecuteNonQueryAsync(ct);}
+        catch(PostgresException e) when(e.SqlState=="42501"){throw new PreviewSessionEnded();}
+    }
+
+    // The bound request context holds a permission, or the operation is denied.
+    private static async Task Hold(NpgsqlConnection connection, string? permission, CancellationToken ct)
+    {
+        if(permission is not null && !await HasPermission(connection,permission,ct)) throw new PreviewDeniedException();
+    }
+
+    // Whether the request context bound to this connection currently holds a permission.
+    public static async Task<bool> HasPermission(NpgsqlConnection connection,string permission,CancellationToken ct)
+    {
+        await using var command=ScheduleStore.Command(connection,"SELECT security.has_permission($1)",permission);
+        return Equals(await command.ExecuteScalarAsync(ct),true);
+    }
+
+    public async Task ValidateHostedBoundary(CancellationToken ct)
+    {
+        if(authenticator is null)throw new InvalidOperationException("This direct reader has no authenticator capability.");
+        await DatabaseLoginBoundary.Require(runtime, DatabaseLoginProfile.Runtime, ct);
+        await DatabaseLoginBoundary.Require(authenticator, DatabaseLoginProfile.Authenticator, ct);
+    }
+
+    // The isolated trusted issuer attests server-built clock evidence. Runtime
+    // SQL callers cannot mint a substitute calculation capture or read the store.
+    internal async Task<Guid> CaptureHistoryClock(NpgsqlConnection runtime,ScheduleContext source,OpenEtrm.MarketData.Risk.AlignedFactorHistory history,CancellationToken ct)
+    {
+        if(authenticator is null)throw new InvalidOperationException("This reader cannot attest calculation inputs.");
+        await using var connection=await authenticator.OpenConnectionAsync(ct);
+        object[] inputs=[Manifest.CatalogId,history.Forecast.ContextId,JsonSerializer.Serialize(history.Calendar,RiskJobs.Json),JsonSerializer.Serialize(history.Clock,RiskJobs.Json)];
+        if(source.ReadCut is not {} cut||source.ContextId!=history.Forecast.ContextId)throw new PreviewDeniedException();
+        cut.RequireCoordinates(Manifest.CatalogId,source);
+        await using var xid=ScheduleStore.Command(runtime,"SELECT pg_current_xact_id()::text");
+        var transaction=(string)(await xid.ExecuteScalarAsync(ct))!;
+        await using var attest=ScheduleStore.Command(connection,"SELECT risk.attest_workspace_clock($1,$2::text::xid8,$3,$4,$5::jsonb,$6::jsonb)",
+            [runtime.ProcessID,transaction,..inputs]);
+        var attestation=(Guid)(await attest.ExecuteScalarAsync(ct)??throw new PreviewDeniedException());
+        await using var command=ScheduleStore.Command(runtime,"SELECT risk.capture_workspace_clock($1,$2,$3::jsonb,$4::jsonb,$5)",[..inputs,attestation]);
+        return(Guid)(await command.ExecuteScalarAsync(ct)??throw new PreviewDeniedException());
+    }
+
+    public async Task<PreviewData> Read(NpgsqlConnection connection, CancellationToken ct,Guid? selectedRevision=null,PreviewData? sharedReferences=null,ImmutableArray<Guid>? observationIds=null,
+        ReferenceReadScope referenceScope=ReferenceReadScope.DefinitionClosure,bool includeCalendarDays=true,
+        ObservationReadScope observationScope=ObservationReadScope.FactHistory,CatalogueSource? ppaBundle=null,string? dependencyCurve=null)
+    {
+        // Logical-head resolution and exact retained reads are distinct. Native
+        // visibility and exact FK coordinates authorize either; deployment-local
+        // allow-lists cannot decide whether a historical definition exists.
+        if(selectedRevision==Guid.Empty)throw new PreviewDeniedException();
+        if(selectedRevision is null&&ppaBundle is null)
+            ppaBundle=(await new CatalogueStore(Manifest.CatalogId).ReadBound(connection,ct)).RequireRole("primary");
+        if(ppaBundle is {} p && (p.DefinitionRevisionId==Guid.Empty || p.ReferenceCatalogId==Guid.Empty || p.ReferenceRevisionId==Guid.Empty))throw new PreviewDeniedException();
+        var selectedManifest=ppaBundle is {} bundle?Manifest with {RevisionId=bundle.DefinitionRevisionId,ReferenceCatalogId=bundle.ReferenceCatalogId,ReferenceRevisionId=bundle.ReferenceRevisionId}:selectedRevision is {} id?Manifest with {RevisionId=id}:Manifest;
+        ImmutableArray<JsonElement>? exactScopedPins=null;
+        if(dependencyCurve is not null)
+        {
+            if(observationScope!=ObservationReadScope.ExactPins||observationIds is null||referenceScope!=ReferenceReadScope.DefinitionClosure)
+                throw new InvalidOperationException("A dependency read requires exact observation pins and reference closure.");
+            exactScopedPins=await ReadObservationPins(connection,selectedManifest,observationIds.Value,ct);
+        }
+        var definitions=dependencyCurve is null
+            ? await ReadDefinitions(connection,selectedManifest,ct)
+            : await ReadCurveDefinitions(connection,selectedManifest,dependencyCurve,
+                [..exactScopedPins!.Value.Select(row=>row.Id("series_id")).Distinct()],ct);
+        if (definitions["revisions"].Length != 1 || definitions["revisions"][0].Text("state") != "sealed") throw new PreviewDeniedException();
+        if(ppaBundle is null&&selectedRevision is not null)
+            selectedManifest=PreviewData.ResolveBundleManifest(selectedManifest,definitions["revisions"][0]);
+        PreviewData.RequireBundlePin(selectedManifest, definitions["revisions"][0]);
+        AsyncReadVisibility.Bundle(selectedManifest);
+        // Reference reuse is an exact-key optimization for every source path.
+        // A source with different reference pins reads its own authorized rows.
+        if(sharedReferences is not null)
+        {
+            if(sharedReferences.DefinitionRevision.CatalogId!=selectedManifest.CatalogId)
+                throw new MarketDataException("reference_pin_mismatch","Shared reference rows require the same exact authorized catalog.");
+            if(sharedReferences.ReferenceRevision!=new ReferenceRevision(selectedManifest.ReferenceCatalogId,selectedManifest.ReferenceRevisionId))
+                sharedReferences=null;
+        }
+        IReadOnlyDictionary<string,ImmutableArray<JsonElement>> references;
+        async Task RequireSharedReferenceAccess()
+        {
+            if(sharedReferences is null)return;
+            await using var access=ScheduleStore.Command(connection,"SELECT security.reference_access($1,'ReadMarketData') AND security.reference_version_visible($1,$2)",selectedManifest.ReferenceCatalogId,selectedManifest.ReferenceRevisionId);
+            if(!Equals(await access.ExecuteScalarAsync(ct),true))throw new PreviewDeniedException();
+        }
+        await MarketBundle.RequireReferenceVisibility(connection,selectedManifest,ct);
+        await RequireSharedReferenceAccess();
+        references=await ReadReferences(connection,selectedManifest,definitions,referenceScope,includeCalendarDays,sharedReferences,ct,groupCompleteTables:dependencyCurve is not null);
+        var observations = exactScopedPins??await (observationScope switch
+        {
+            ObservationReadScope.ExactPins => ReadObservationPins(connection,selectedManifest,
+                observationIds??throw new ArgumentException("Exact observation reads require explicit pins.",nameof(observationIds)),ct),
+            ObservationReadScope.FactHistory when observationIds is {} pins => ReadObservationFacts(connection,selectedManifest,pins,ct),
+            ObservationReadScope.FactHistory => Rows(connection, "SELECT row_to_json(t)::text FROM (SELECT * FROM market_data.observations WHERE catalog_id=$1 AND definition_revision_id=$2 ORDER BY observed_at,received_at,id) t", [selectedManifest.CatalogId, selectedManifest.RevisionId], ct),
+            _ => throw new ArgumentOutOfRangeException(nameof(observationScope))
+        });
+        Interlocked.Add(ref observationRowsRead,observations.Length);
+        AsyncReadVisibility.Observations(selectedManifest.CatalogId,selectedManifest.RevisionId,observations);
+        await RequireSharedReferenceAccess();
+        return new PreviewData(selectedManifest, definitions, references, observations,Calculations){CalendarDaysRead=includeCalendarDays};
+    }
+
+    private static async Task<IReadOnlyDictionary<string,ImmutableArray<JsonElement>>> ReadReferences(NpgsqlConnection connection,
+        PreviewManifest manifest,IReadOnlyDictionary<string,ImmutableArray<JsonElement>> definitions,
+        ReferenceReadScope scope,bool includeCalendarDays,PreviewData? sharedReferences,CancellationToken ct,bool groupCompleteTables=false)
+    {
+        var loaded=new Dictionary<string,ImmutableArray<JsonElement>>();
+        var bounded=new HashSet<string>(["futures_series","futures_products","futures_milestones","futures_lot_resolutions",
+            "futures_product_terms","futures_basis_settlements","futures_execution_policies","product_evidence","locations","commodity_locations","calendar_days","pipeline_zones","pipeline_delivery_points","gas_delivery_conventions","gas_meter_assignments"]);
+        async Task<ImmutableArray<JsonElement>> ReadTable(string table,string? column=null,IEnumerable<string>? codes=null)
+        {
+            // These immutable tables are complete in every read scope. Reuse
+            // stays within this authorized operation; bounded tables always
+            // resolve against this definition's own explicit relationships.
+            if(column is null&&!bounded.Contains(table)&&sharedReferences is not null)
+                return sharedReferences.References[table];
+            var parameters=new object[]{manifest.ReferenceCatalogId,manifest.ReferenceRevisionId};
+            var predicate="";
+            if(column is not null)
+            {
+                var selected=codes!.Distinct().ToArray();
+                if(selected.Length==0)return ImmutableArray<JsonElement>.Empty;
+                predicate=$" AND {column}=ANY($3::text[])";
+                parameters=[..parameters,selected];
+            }
+            if(scope==ReferenceReadScope.TradeValuation&&table=="futures_milestones")
+                predicate+=" AND milestone IN ('first_trading','last_trading')";
+            return await Rows(connection,$"SELECT row_to_json(t)::text FROM(SELECT * FROM ref_data.{table} WHERE catalog_id=$1 AND revision_id=$2{predicate} ORDER BY {ReferenceKey(table)})t",parameters,ct);
+        }
+        if(scope==ReferenceReadScope.AllVisible)
+        {
+            foreach(var table in ReferenceTables)loaded[table]=await ReadTable(table);
+            return loaded;
+        }
+        var completeTables=ReferenceTables.Where(t=>!bounded.Contains(t));
+        if(groupCompleteTables&&sharedReferences is null)
+        {
+            var statements=completeTables.Select(table=>(table,ReferenceKey(table),
+                $"SELECT * FROM ref_data.{table} WHERE catalog_id=$1 AND revision_id=$2"));
+            loaded=await ReadDefinitionGroups(connection,"",statements,[manifest.ReferenceCatalogId,manifest.ReferenceRevisionId],ct);
+        }
+        else foreach(var table in completeTables)loaded[table]=await ReadTable(table);
+
+        // Follow only exact-version declared settlement links. These metadata
+        // references do not introduce market dependencies or pricing inputs.
+        var pending=Codes(definitions["contracts"],"futures_series_code").ToHashSet();
+        var seen=new HashSet<string>();
+        var series=ImmutableArray.CreateBuilder<JsonElement>();
+        var basis=ImmutableArray.CreateBuilder<JsonElement>();
+        while(pending.Count>0)
+        {
+            var batch=pending.ToArray();seen.UnionWith(batch);
+            series.AddRange(await ReadTable("futures_series","code",batch));
+            var links=await ReadTable("futures_basis_settlements","series_code",batch);
+            basis.AddRange(links);
+            pending=Codes(links,"benchmark_series_code").Where(code=>!seen.Contains(code)).ToHashSet();
+        }
+        loaded["futures_series"]=series.ToImmutable();
+        loaded["futures_basis_settlements"]=basis.ToImmutable();
+        var products=Codes(loaded["futures_series"],"product_code").ToArray();
+        loaded["futures_products"]=await ReadTable("futures_products","code",products);
+        foreach(var table in new[]{"futures_product_terms","product_evidence"})loaded[table]=await ReadTable(table,"product_code",products);
+        foreach(var table in new[]{"futures_milestones","futures_lot_resolutions","futures_execution_policies"})loaded[table]=await ReadTable(table,"series_code",seen);
+        var locations=Codes(definitions["curves"],"location_code")
+            .Concat(Codes(definitions["generation_assets"],"location_code"))
+            .Concat(Codes(definitions["location_valuation_assignments"],"location_code"))
+            .Concat(Codes(loaded["futures_products"],"location_code"))
+            .Concat(Codes(loaded["price_index_definitions"],"location_code")).Distinct().ToArray();
+        loaded["locations"]=await ReadTable("locations","code",locations);
+        loaded["commodity_locations"]=await ReadTable("commodity_locations","location_code",locations);
+        // Network relationships have explicit authorized consumers; ordinary curve pricing does not load a whole physical network.
+        loaded["pipeline_zones"]=ImmutableArray<JsonElement>.Empty;
+        loaded["pipeline_delivery_points"]=ImmutableArray<JsonElement>.Empty;
+        loaded["gas_delivery_conventions"]=ImmutableArray<JsonElement>.Empty;
+        loaded["gas_meter_assignments"]=ImmutableArray<JsonElement>.Empty;
+        loaded["calendar_days"]=includeCalendarDays?await ReadTable("calendar_days"):ImmutableArray<JsonElement>.Empty;
+        return loaded;
+    }
+
+    private static IEnumerable<string> Codes(IEnumerable<JsonElement> rows,string column)=>rows
+        .Where(row=>row.TryGetProperty(column,out var value)&&value.ValueKind==JsonValueKind.String)
+        .Select(row=>row.GetProperty(column).GetString()!).Distinct();
+
+    public async Task<ImmutableDictionary<string,ReferenceSourceSelection>> ReadReferenceSources(NpgsqlConnection connection,CancellationToken ct,DateOnly? effectiveOn=null)
+    {
+        var catalogue=await new CatalogueStore(Manifest.CatalogId).ReadBound(connection,ct,effectiveOn);
+        return ReferenceTables.ToImmutableDictionary(table=>table,table=>
+        {
+            var source=catalogue.RequireRole("reference:"+table);
+            return new ReferenceSourceSelection(new(source.ReferenceCatalogId,source.ReferenceRevisionId),source.DefinitionRevisionId);
+        });
+    }
+    // Current read authority over a table's exact reference revision and proof that the
+    // selected sealed definition revision names that revision; reads repeat it after reading.
+    public async Task<(ReferenceRevision Revision,Guid Definition)> ReferenceScope(NpgsqlConnection connection,string table,CancellationToken ct,DateOnly? effectiveOn=null,Guid? definitionRevisionId=null)
+    {
+        if(!ReferenceTables.Contains(table))throw new MarketDataException("reference_catalog","Choose an available reference category.");
+        if(definitionRevisionId is {} exact)
+        {
+            var selected=await MarketInputSelection.ExactSource(this,connection,exact,ct);
+            return(new(selected.ReferenceCatalogId,selected.ReferenceRevisionId),exact);
+        }
+        var source=(await ReadReferenceSources(connection,ct,effectiveOn))[table];
+        var revision=source.ReferenceRevision;var definition=source.DefinitionRevisionId;
+        await using(var access=ScheduleStore.Command(connection,"SELECT security.reference_access($1,'ReadMarketData')",revision.CatalogId))
+            if(!Equals(await access.ExecuteScalarAsync(ct),true))throw new PreviewDeniedException();
+        var visible=await Rows(connection,"SELECT row_to_json(t)::text FROM(SELECT reference_catalog_id,reference_revision_id FROM market_data.revisions WHERE catalog_id=$1 AND id=$2 AND state='sealed')t",[Manifest.CatalogId,definition],ct);
+        if(visible.Length!=1||visible[0].Id("reference_catalog_id")!=revision.CatalogId||visible[0].Id("reference_revision_id")!=revision.RevisionId)
+            throw new MarketDataException(UnitTables.Contains(table)?"unit_catalog":"reference_catalog","The exact reference catalog is unavailable in this context.");
+        AsyncReadVisibility.Bundle(Manifest with{RevisionId=definition,ReferenceCatalogId=revision.CatalogId,ReferenceRevisionId=revision.RevisionId});
+        return(revision,definition);
+    }
+
+    // Searchable categories in workspace order, with the column naming each row, the futures product it belongs to and its
+    // one-line summary. A search matches only a row's code and name. Identifiers and summaries come only from this list.
+    private static readonly (string Table,string Label,string? Product,string? Summary)[] SearchTables=
+    [
+        ("futures_products","name","code",FuturesProductSummary),("futures_series","series_label","product_code",null),("price_index_definitions","code",null,null),
+        ("exchanges","name",null,null),("clearing_houses","name",null,null),("interest_rate_definitions","code",null,null),("sources","code",null,null),
+        ("commodities","name",null,null),("units","symbol",null,null),("currencies","name",null,null),("measurement_bases","code",null,null),
+        ("quantity_specifications","code",null,null),("value_specifications","code",null,null),("locations","name",null,null),
+        ("location_types","description",null,null),("calendars","code",null,null),("clock_rules","code",null,null),("quote_specifications","code",null,null),
+        ("settlement_targets","code",null,null),("delivery_profiles","code",null,null)
+    ];
+    // A futures product's exchange, location, lot size and quote unit, named by rows of the product's own revision.
+    private const string FuturesProductSummary="""
+        jsonb_build_array(
+          jsonb_build_object('label','Exchange','value',(SELECT x.name FROM ref_data.exchanges x WHERE(x.catalog_id,x.revision_id,x.code)=(r.catalog_id,r.revision_id,r.exchange_code))),
+          jsonb_build_object('label','Location','value',(SELECT l.name FROM ref_data.locations l WHERE(l.catalog_id,l.revision_id,l.code)=(r.catalog_id,r.revision_id,r.location_code))),
+          jsonb_build_object('label','Lot size','value',r.contract_size::text||' '||(SELECT u.symbol FROM ref_data.units u WHERE(u.catalog_id,u.revision_id,u.code)=(r.catalog_id,r.revision_id,r.lot_unit_code))
+            ||CASE r.lot_basis WHEN 'fixed_total' THEN '' WHEN 'per_delivery_day' THEN ' per delivery day' WHEN 'per_delivery_hour' THEN ' per delivery hour' END),
+          jsonb_build_object('label','Quote unit','value',(SELECT c.display_code FROM ref_data.currencies c WHERE(c.catalog_id,c.revision_id,c.code)=(r.catalog_id,r.revision_id,r.quote_currency_code))
+            ||'/'||(SELECT u.symbol FROM ref_data.units u WHERE(u.catalog_id,u.revision_id,u.code)=(r.catalog_id,r.revision_id,r.quote_unit_code))))
+        """;
+    private const int SearchHitsPerTable=10,SearchHitLimit=60;
+    public async Task<ReferenceSearch> SearchReferences(NpgsqlConnection connection,string query,CancellationToken ct)
+    {
+        query=query.Trim();
+        if(query.Length is 0 or >160)
+            throw new MarketDataException("reference_search","Enter search text of 1 to 160 characters.");
+        // Tables can resolve to different exact revisions; each distinct source is proven once.
+        var sources=await ReadReferenceSources(connection,ct);
+        var scoped=SearchTables.Select(t=>t.Table).DistinctBy(table=>sources[table]).ToArray();
+        async Task ProveScopes(){foreach(var table in scoped)await ReferenceScope(connection,table,ct);}
+        await ProveScopes();
+        // Working data shows and matches applied display labels, as every other read does: each source's display revision is
+        // its complete copy with those labels. A historical context has none and keeps the source's original labels.
+        var shown=new Dictionary<ReferenceRevision,ReferenceRevision>();
+        foreach(var source in SearchTables.Select(t=>sources[t.Table].ReferenceRevision).Distinct())
+            shown[source]=(await ReferenceEditors.Display(connection,source,ct))?.DisplayRevision??source;
+        // Search is literal, including SQL wildcard characters; each table reads one row past its cap.
+        var selects=SearchTables.Select((t,i)=>$"""
+            (SELECT {i} position,'{t.Table}' category,r.code::text code,r.{t.Label}::text label,{(t.Product is null?"NULL":"r."+t.Product)}::text product_code,
+               {t.Summary??"'[]'::jsonb"} summary
+             FROM ref_data.{t.Table} r WHERE r.catalog_id=${2*i+2} AND r.revision_id=${2*i+3}
+               AND(strpos(lower(r.code::text),lower($1))>0 OR strpos(lower(r.{t.Label}::text),lower($1))>0)
+             ORDER BY label,code LIMIT {SearchHitsPerTable+1})
+            """);
+        var revisions=SearchTables.Select(t=>shown[sources[t.Table].ReferenceRevision]).SelectMany(r=>new object[]{r.CatalogId,r.RevisionId});
+        var found=await Rows(connection,$"SELECT row_to_json(t)::text FROM({string.Join(" UNION ALL ",selects)})t ORDER BY position,label,code",
+            [query,..revisions],ct);
+        var hits=found.Select(r=>new ReferenceHit(r.Text("category"),r.Text("code"),r.Text("label"),r.OptionalText("product_code"),
+                [..r.GetProperty("summary").EnumerateArray().Select(f=>new ReferenceSummaryField(f.Text("label"),f.OptionalText("value")))]))
+            .GroupBy(h=>h.Table).SelectMany(g=>g.Take(SearchHitsPerTable)).ToArray();
+        await ProveScopes();
+        return new(query,[..hits.Take(SearchHitLimit)],hits.Length<found.Length||hits.Length>SearchHitLimit);
+    }
+
+    public async Task<ReferencePage> ReadReferencePage(NpgsqlConnection connection,string table,int offset,string? search,string? code,CancellationToken ct,DateOnly? effectiveOn=null,Guid? definitionRevisionId=null)
+    {
+        search??="";
+        if(!ReferenceTables.Contains(table)||offset is <0 or >ReferenceMaximumOffset||search.Length>160)
+            throw new MarketDataException("reference_page",$"Choose a supported reference table, an offset from 0 to {ReferenceMaximumOffset} and search text up to 160 characters.");
+        // An exact item read names one code-keyed record; it is never a search or a later page.
+        if(code is not null&&(ReferenceKey(table)!="code"||code.Length is 0 or >160||search!=""||offset!=0))
+            throw new MarketDataException("reference_page","Read one item by its exact code from a code-keyed table, without search text or an offset.");
+        var (revision,definition)=await ReferenceScope(connection,table,ct,effectiveOn,definitionRevisionId);
+        const int pageSize=200;
+        // Table and key identifiers come only from the fixed public catalog.
+        // Search is literal, including SQL wildcard characters, and never runs
+        // a full-result count before returning the bounded selected page.
+        var found=await Rows(connection,$"""
+            SELECT row_to_json(t)::text FROM (
+                SELECT r.* FROM ref_data.{table} r
+                WHERE catalog_id=$1 AND revision_id=$2
+                  AND ($3='' OR strpos(lower(row_to_json(r)::text),lower($3))>0)
+                  {(code is null?"":"AND code=$5")}
+                ORDER BY {ReferenceKey(table)} LIMIT 201 OFFSET $4
+            ) t
+            """,code is null?[revision.CatalogId,revision.RevisionId,search,offset]:[revision.CatalogId,revision.RevisionId,search,offset,code],ct);
+        var rows=found.Take(pageSize).ToImmutableArray();
+        var references=ImmutableDictionary.CreateBuilder<string,ImmutableArray<JsonElement>>();
+        references.Add(table,rows);
+        await LinkReferences(connection,revision,rows,references,ct,table);
+        await ReferenceScope(connection,table,ct,effectiveOn,definitionRevisionId);
+        // Absence is reported only after current authority is proven again.
+        if(code is not null&&rows.IsEmpty)throw ReferenceItemMissing();
+        return new(table,rows,references.ToImmutable(),offset,pageSize,ReferenceMaximumOffset,found.Length>pageSize,search,revision,definition);
+    }
+
+    // Names for linked codes are exact-version rows of the same revision, not labels
+    // borrowed from the business catalog or a preceding page/context.
+    private static async Task LinkReferences(NpgsqlConnection connection,ReferenceRevision revision,ImmutableArray<JsonElement> rows,
+        ImmutableDictionary<string,ImmutableArray<JsonElement>>.Builder references,CancellationToken ct,string? table=null)
+    {
+        var gasProduct=table is "gas_delivery_conventions" or "gas_meter_assignments";
+        foreach(var (target,columns) in ReferenceLabels)
+        {
+            var selected=gasProduct?target switch
+            {
+                "commodities"=>[..columns,"product_code"],
+                "futures_products"=>Array.Empty<string>(),
+                _=>columns
+            }:columns;
+            var codes=selected.SelectMany(column=>Codes(rows,column)).Distinct().ToArray();
+            if(codes.Length==0)continue;
+            var linked=await Rows(connection,$"SELECT row_to_json(t)::text FROM(SELECT * FROM ref_data.{target} WHERE catalog_id=$1 AND revision_id=$2 AND code=ANY($3::text[]) ORDER BY {ReferenceKey(target)})t",[revision.CatalogId,revision.RevisionId,codes],ct);
+            references[target]=references.TryGetValue(target,out var existing)
+                ? existing.Concat(linked).DistinctBy(row=>row.GetProperty("code").GetString()).ToImmutableArray():linked;
+        }
+    }
+
+    private const int FuturesSeriesLimit=1000;
+    private static readonly string[] FuturesProductTables=["futures_products","futures_series","futures_milestones","futures_execution_policies"];
+    // One futures product with its contracts, their dates and execution eligibility, all from one exact revision.
+    public async Task<FuturesProductRead> ReadFuturesProduct(NpgsqlConnection connection,string code,CancellationToken ct)
+    {
+        if(code.Length is 0 or >160)throw new MarketDataException("reference_page","Read one futures product by its exact code of 1 to 160 characters.");
+        async Task<ReferenceRevision> ProveScopes()
+        {
+            var revisions=new HashSet<ReferenceRevision>();
+            foreach(var table in FuturesProductTables)revisions.Add((await ReferenceScope(connection,table,ct)).Revision);
+            if(revisions.Count!=1)throw new MarketDataException("reference_catalog","A futures product and its contracts must share one exact reference revision.");
+            return revisions.Single();
+        }
+        var revision=await ProveScopes();
+        Task<ImmutableArray<JsonElement>> Read(string table,string filter,object codes,string order)=>Rows(connection,
+            $"SELECT row_to_json(t)::text FROM(SELECT * FROM ref_data.{table} WHERE catalog_id=$1 AND revision_id=$2 AND {filter} ORDER BY {order})t",
+            [revision.CatalogId,revision.RevisionId,codes],ct);
+        var product=await Read("futures_products","code=$3",code,"code");
+        var series=product.IsEmpty?[]:await Read("futures_series","product_code=$3",code,$"delivery_from,code LIMIT {FuturesSeriesLimit+1}");
+        if(series.Length>FuturesSeriesLimit)
+            throw new MarketDataException("reference_limit",$"A futures product read is limited to {FuturesSeriesLimit} contracts.");
+        var codes=Codes(series,"code").ToArray();
+        var milestones=codes.Length==0?[]:await Read("futures_milestones","series_code=ANY($3::text[])",codes,ReferenceKey("futures_milestones"));
+        var policies=codes.Length==0?[]:await Read("futures_execution_policies","series_code=ANY($3::text[])",codes,ReferenceKey("futures_execution_policies"));
+        var references=ImmutableDictionary.CreateBuilder<string,ImmutableArray<JsonElement>>();
+        await LinkReferences(connection,revision,product,references,ct);
+        await ProveScopes();
+        // Absence is reported only after current authority is proven again.
+        if(product.IsEmpty)throw ReferenceItemMissing();
+        return new(product[0],series,milestones,policies,references.ToImmutable(),revision,(await ReferenceScope(connection,"futures_products",ct)).Definition);
+    }
+
+    private static MarketDataException ReferenceItemMissing()=>new("reference_item","The reference item does not exist in this context's exact revision.");
+
+    private static readonly (string Table,string[] Columns)[] ReferenceLabels=
+    [
+        ("commodities",["commodity_code","fuel_commodity_code","output_commodity_code"]),
+        ("currencies",["currency_code","quote_currency_code"]),
+        ("units",["unit_code","lot_unit_code","from_unit_code","to_unit_code","quote_unit_code","fuel_unit_code","output_unit_code"]),
+        ("locations",["location_code","pipeline_code","zone_code","point_code"]),("location_types",["type_code"]),
+        ("exchanges",["exchange_code"]),("clearing_houses",["clearing_house_code"]),
+        ("sources",["source_code","qualification_source_code"]),("futures_products",["product_code"]),("futures_series",["series_code"]),
+        ("clock_rules",["clock_code","market_clock_code"]),("calendars",["calendar_code","trading_calendar_code","delivery_calendar_code","settlement_calendar_code"]),
+        ("quantity_specifications",["quantity_code","numerator_quantity_code","denominator_quantity_code"]),
+        ("measurement_bases",["basis_code"]),("price_index_definitions",["index_a_code","index_b_code"])
+    ];
+
+    internal static Task<ImmutableArray<JsonElement>> ReadObservationPins(NpgsqlConnection connection,PreviewManifest manifest,ImmutableArray<Guid> pins,CancellationToken ct)=>
+        ReadObservationPins(connection,manifest.CatalogId,manifest.RevisionId,pins,ct);
+
+    private static Task<ImmutableArray<JsonElement>> ReadObservationPins(NpgsqlConnection connection,Guid catalog,Guid revision,ImmutableArray<Guid> pins,CancellationToken ct)
+    {
+        if(pins.IsEmpty)return Task.FromResult(ImmutableArray<JsonElement>.Empty);
+        return Rows(connection,"""
+            SELECT row_to_json(t)::text FROM (
+                SELECT * FROM security.read_observation_pins($1,$2,$3::uuid[])
+                ORDER BY observed_at,received_at,id
+            ) t
+            """,[catalog,revision,pins.ToArray()],ct);
+    }
+
+    private static Task<ImmutableArray<JsonElement>> ReadObservationFacts(NpgsqlConnection connection,PreviewManifest manifest,ImmutableArray<Guid> pins,CancellationToken ct)=>
+        ReadObservationFacts(connection,manifest.CatalogId,manifest.RevisionId,pins,ct);
+
+    internal static Task<ImmutableArray<JsonElement>> ReadObservationFacts(NpgsqlConnection connection,Guid catalog,Guid revision,ImmutableArray<Guid> pins,CancellationToken ct)
+    {
+        if(pins.IsEmpty)return Task.FromResult(ImmutableArray<JsonElement>.Empty);
+        // One bounded visibility set authorizes both the requested anchors and
+        // their same-fact versions. This does not select a newer pricing input.
+        return Rows(connection,"""
+            SELECT row_to_json(t)::text FROM (
+                SELECT * FROM security.read_observation_facts($1,$2,$3::uuid[])
+                ORDER BY observed_at,received_at,id
+            ) t
+            """,[catalog,revision,pins.ToArray()],ct);
+    }
+
+    public async Task<UnitCatalogData> ReadUnitCatalog(NpgsqlConnection connection,PreviewData selected,CancellationToken ct)
+    {
+        var sources=await ReadReferenceSources(connection,ct);
+        var configured=sources[UnitTables[0]];
+        var revision=configured.ReferenceRevision;
+        if(UnitTables.Any(table=>sources[table].ReferenceRevision!=revision))
+            throw new MarketDataException("unit_catalog","Unit categories require one exact shared reference revision.");
+        // This exact published bundle must be visible under the same bound
+        // effective/knowledge context. Never substitute the current unit version.
+        var visible=await Rows(connection,"SELECT row_to_json(t)::text FROM(SELECT reference_catalog_id,reference_revision_id FROM market_data.revisions WHERE catalog_id=$1 AND id=$2 AND state='sealed')t",[Manifest.CatalogId,configured.DefinitionRevisionId],ct);
+        if(visible.Length!=1 || visible[0].Id("reference_catalog_id")!=revision.CatalogId || visible[0].Id("reference_revision_id")!=revision.RevisionId)
+            throw new MarketDataException("unit_catalog","The exact configured unit catalog is unavailable in this context.");
+        var references=ImmutableDictionary.CreateBuilder<string,ImmutableArray<JsonElement>>();
+        foreach(var table in UnitTables)
+            references.Add(table,await Rows(connection,$"SELECT row_to_json(t)::text FROM(SELECT * FROM ref_data.{table} WHERE catalog_id=$1 AND revision_id=$2 ORDER BY {ReferenceKey(table)})t",[revision.CatalogId,revision.RevisionId],ct));
+        return new(revision,references.ToImmutable());
+    }
+
+    public async Task<ImmutableArray<(PreviewData Data,InputFrame Frame)>> ReadInputMarkets(NpgsqlConnection connection,InputFrame selected,CancellationToken ct,PreviewData? sharedReferences=null,
+        IReadOnlySet<Guid>? requiredRevisions=null,ReferenceReadScope referenceScope=ReferenceReadScope.DefinitionClosure)
+    {
+        var result=ImmutableArray.CreateBuilder<(PreviewData,InputFrame)>();
+        if(selected.OriginCloseId is not null&&selected.SourceInputs is null)
+            throw new MarketDataException("market_inputs","A recorded close requires its exact source input matrix.");
+        if(selected.SourceInputs is {} matrix)
+        {
+            if(requiredRevisions is not null&&requiredRevisions.Any(id=>!matrix.ContainsKey(id)))
+                throw new MarketDataException("market_inputs","A required source is absent from the exact input matrix.");
+            foreach(var part in matrix.Values.OrderBy(p=>p.Source.DefinitionRevisionId))
+            {
+                if(requiredRevisions is not null&&!requiredRevisions.Contains(part.Source.DefinitionRevisionId))continue;
+                var data=await Read(connection,ct,ppaBundle:part.Source,sharedReferences:sharedReferences,
+                    observationIds:part.ObservationIds,referenceScope:referenceScope,observationScope:ObservationReadScope.ExactPins);
+                result.Add((data,part.Project(selected)));
+            }
+            return result.ToImmutable();
+        }
+        var physical=new[]{Manifest.GasMarket,Manifest.CrudeMarket,Manifest.LngMarket}.OfType<PreviewPhysicalMarket>()
+            .Concat(Manifest.RetainedGasMarkets??[]).Concat(Manifest.RetainedCrudeMarkets??[]).Concat(Manifest.RetainedLngMarkets??[]);
+        var ppas=Manifest.Frames.Where(f=>f.PpaBundle is not null).GroupBy(f=>f.PpaBundle!.DefinitionRevisionId)
+            .Select(g=>new PreviewInputMarket(g.Key,[..g]));
+        var declared=new[]{new PreviewInputMarket(Manifest.RevisionId,[..Manifest.Frames.Where(f=>f.PpaBundle is null)])}
+            .Concat(Manifest.InputMarkets??[]).Concat(physical.Select(m=>new PreviewInputMarket(m.RevisionId,m.Frames))).Concat(ppas).ToArray();
+        if(declared.Select(m=>m.RevisionId).Distinct().Count()!=declared.Length)
+            throw new MarketDataException("market_inputs","Declare each exact input source once.");
+        foreach(var market in declared)
+        {
+            if(requiredRevisions is not null&&!requiredRevisions.Contains(market.RevisionId))continue;
+            if(!await InputMarketAvailable(connection,market,ct))continue;
+            var seed=market.Frames.SingleOrDefault(f=>f.At==selected.At);
+            if(seed is null)
+            {
+                if(requiredRevisions is not null)throw new MarketDataException("swap_context","No explicit market frame exists for a required retained bundle at this As of time.");
+                continue;
+            }
+            var pins=InputMarketPins(selected,market)!.Value;
+            var data=await Read(connection,ct,market.RevisionId,sharedReferences,pins,referenceScope);
+            var frozenInputs=seed.FrozenObservationIds is {} frozen?frozen.ToImmutableArray():throw new MarketDataException("market_inputs","Declare frozen observations explicitly for every source frame.");
+            var frame=selected.ForMarketSource(pins,seed.CurveContracts.ToImmutableDictionary(p=>p.Key,p=>p.Value.ToImmutableArray()),data.SelectFrozen(pins,frozenInputs))
+                with{Source=new(data.DefinitionRevision.RevisionId,data.ReferenceRevision.CatalogId,data.ReferenceRevision.RevisionId)};
+            // A snapshot prices its exact pins; only a certified context's own frames apply its
+            // latest-correction policy at that cutoff (D172).
+            result.Add((data,selected.ResolvesLatestCorrection?data.SelectPinned(frame):frame));
+        }
+        return result.ToImmutable();
+    }
+
+    public async Task<bool> InputMarketAvailable(NpgsqlConnection connection,PreviewInputMarket market,CancellationToken ct)
+    {
+        await using var available=ScheduleStore.Command(connection,"SELECT count(*) FROM market_data.revisions WHERE catalog_id=$1 AND id=$2",Manifest.CatalogId,market.RevisionId);
+        return (long)(await available.ExecuteScalarAsync(ct))!>0;
+    }
+
+    // A separate swap bundle uses the pins its snapshot selected, otherwise the bundle
+    // frame declared for the snapshot's instant; null when neither exists (D172).
+    public ImmutableArray<Guid>? InputMarketPins(InputFrame frame,PreviewInputMarket market)=>
+        frame.SwapMarketSelections is {} selections&&selections.TryGetValue(market.RevisionId,out var pins)?pins:
+        market.Frames.SingleOrDefault(f=>f.At==frame.At)?.ObservationIds.ToImmutableArray();
+
+    // The main market revision or an explicitly allow-listed supplemental swap bundle.
+    private bool DeclaredBundle(Guid revision)=>revision==Manifest.RevisionId||revision==Manifest.CrudeMarket?.RevisionId||(Manifest.RetainedCrudeMarkets??[]).Any(m=>m.RevisionId==revision)||revision==Manifest.LngMarket?.RevisionId||(Manifest.RetainedLngMarkets??[]).Any(m=>m.RevisionId==revision)||revision==Manifest.GasMarket?.RevisionId||(Manifest.RetainedGasMarkets??[]).Any(m=>m.RevisionId==revision)||(Manifest.InputMarkets??[]).Any(m=>m.RevisionId==revision);
+
+    public async Task<Guid> Correct(NpgsqlConnection connection, Guid revision, Guid observationId, string value, CancellationToken ct)
+    {
+        if (!DeclaredBundle(revision)) throw new PreviewDeniedException();
+        var parsed = ExactDecimal.Parse(value);
+        var id = Guid.NewGuid();
+        await using var command = new NpgsqlCommand("""
+            INSERT INTO market_data.observations
+              (catalog_id,id,definition_revision_id,series_id,reference_catalog_id,reference_revision_id,source_code,
+               source_event_id,source_revision_id,role,publication_state,observed_at,received_at,value,corrects_id)
+            SELECT catalog_id,$1,definition_revision_id,series_id,reference_catalog_id,reference_revision_id,source_code,
+               source_event_id,$2,role,publication_state,observed_at,clock_timestamp(),$3::numeric,id
+            FROM market_data.observations WHERE catalog_id=$4 AND definition_revision_id=$5 AND id=$6
+            """, connection);
+        foreach (var parameter in new object[] { id, id.ToString(), parsed.ToString(), Manifest.CatalogId, revision, observationId })
+            command.Parameters.Add(new NpgsqlParameter { Value = parameter });
+        if (await command.ExecuteNonQueryAsync(ct) != 1) throw new MarketDataException("missing_observation", "The selected observation is unavailable.");
+        return id;
+    }
+
+    internal static async Task<ImmutableArray<JsonElement>> Rows(NpgsqlConnection connection, string sql, object[] parameters, CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(sql, connection);
+        foreach (var value in parameters) command.Parameters.Add(new NpgsqlParameter { Value = value });
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        var rows = ImmutableArray.CreateBuilder<JsonElement>();
+        while (await reader.ReadAsync(ct))rows.Add(ReferenceJson.PreserveNumericLexemes(reader.GetString(0)));
+        return rows.ToImmutable();
+    }
+    public async ValueTask DisposeAsync()
+    {
+        if(!ownsSources)return;
+        foreach(var source in new[]{runtime,authenticator,agentRuntime,agentAuthenticator,calculationRuntime})if(source is not null)await source.DisposeAsync();
+    }
+}
+
+public sealed class PreviewData
+{
+    private readonly PreviewManifest manifest;
+    private readonly Dictionary<(string Table,string Field),ILookup<string,JsonElement>> referenceRows,definitionRows;
+    private readonly ILookup<Guid,JsonElement> observationRows,observationSeriesRows,contractDefinitions;
+    private readonly ILookup<(Guid? Contract,string? Quote),JsonElement> quotedSeriesRows;
+    private readonly ILookup<Guid?,JsonElement> correctionRows;
+    private readonly ILookup<Guid,MarketContract> contractRows;
+    private readonly ILookup<string,QuoteSpecification> quoteRows;
+    private readonly HashSet<(string Curve,Guid Contract)> curveMembers;
+    public ImmutableDictionary<string, ImmutableArray<JsonElement>> Definitions { get; }
+    public ImmutableDictionary<string, ImmutableArray<JsonElement>> References { get; }
+    public FuturesExecutionPolicies ExecutionPolicies { get; }
+    public string FuturesConvention => manifest.FuturesConvention;
+    public ImmutableArray<JsonElement> Observations { get; }
+    public CurveModel Model { get; }
+    // Whether this read loaded calendar days; without them no holiday is known, which is not the same as none.
+    public bool CalendarDaysRead { get; init; }
+    internal ImmutableDictionary<ReferenceKey,CalendarDefinition> CapturedCalendars { get; private init; }=ImmutableDictionary<ReferenceKey,CalendarDefinition>.Empty;
+    internal PreviewData WithCalendars(ImmutableDictionary<ReferenceKey,CalendarDefinition> calendars)=>new(this,Observations,CompletePins){CapturedCalendars=calendars};
+    public ImmutableArray<MarketContract> Contracts { get; }
+    public ImmutableArray<QuoteSpecification> Quotes { get; }
+    public ImmutableArray<FuturesSeriesSpecification> FuturesSeries { get; }
+    public ImmutableArray<FuturesOptionSeriesSpecification> FuturesOptionSeries { get; }
+    private readonly DefinitionRevision revision;
+    public DefinitionRevision DefinitionRevision => revision;
+    private readonly ReferenceRevision reference;
+    public ReferenceRevision ReferenceRevision=>reference;
+    // One authorized operation may reuse immutable model metadata while reading
+    // different input selections. No observation or correction index is shared.
+    internal PreviewData WithObservations(ImmutableArray<JsonElement> observations,bool completePins=true)=>new(this,observations,completePins);
+    internal bool CompletePins{get;}=true;
+    private PreviewData(PreviewData metadata,ImmutableArray<JsonElement> observations,bool completePins)
+    {
+        CompletePins=completePins;manifest=metadata.manifest;Definitions=metadata.Definitions;References=metadata.References;
+        ExecutionPolicies=metadata.ExecutionPolicies;Model=metadata.Model;CalendarDaysRead=metadata.CalendarDaysRead;CapturedCalendars=metadata.CapturedCalendars;
+        Contracts=metadata.Contracts;Quotes=metadata.Quotes;FuturesSeries=metadata.FuturesSeries;FuturesOptionSeries=metadata.FuturesOptionSeries;
+        revision=metadata.revision;reference=metadata.reference;
+        referenceRows=metadata.referenceRows;definitionRows=metadata.definitionRows;contractDefinitions=metadata.contractDefinitions;
+        contractRows=metadata.contractRows;quoteRows=metadata.quoteRows;curveMembers=metadata.curveMembers;
+        quotedSeriesRows=metadata.quotedSeriesRows;
+        Observations=observations;observationRows=observations.ToLookup(row=>row.Id("id"));
+        observationSeriesRows=observations.ToLookup(row=>row.Id("series_id"));
+        correctionRows=observations.ToLookup(row=>row.OptionalId("corrects_id"));
+    }
+    private ReferenceKey R(string code) => new(reference, code);
+    private ContractKey K(Guid id) => new(revision, id);
+    private SeriesKey S(Guid id) => new(revision, id);
+    public PreviewData(PreviewManifest manifest, IReadOnlyDictionary<string, ImmutableArray<JsonElement>> definitions,
+        IReadOnlyDictionary<string, ImmutableArray<JsonElement>> references, ImmutableArray<JsonElement> observations,
+        OpenEtrm.MarketData.Calculation.ConnectedCalculationCache? calculations=null)
+    {
+        RequireBundlePin(manifest,Single(definitions["revisions"]));
+        this.manifest=manifest; Definitions=definitions.ToImmutableDictionary(); References=references.ToImmutableDictionary(); ExecutionPolicies=new(References); Observations=observations;
+        // Index only the rows captured by this authorized read. Grouping retains
+        // duplicate keys so each consumer still applies its exact cardinality rule.
+        referenceRows=IndexRows(References,[("quantity_specifications","code"),("quote_specifications","code"),
+            ("settlement_targets","code"),("price_index_definitions","code"),("futures_series","code"),("futures_products","code"),
+            ("futures_milestones","series_code"),("futures_product_terms","product_code"),
+            ("futures_lot_resolutions","series_code"),("futures_basis_settlements","series_code"),
+            ("futures_option_series","code"),("futures_option_products","code"),
+            ("units","code"),("currencies","code"),("commodities","code"),("exchanges","code"),("sources","code"),("interest_rate_definitions","code"),
+            ("delivery_profiles","code"),("clock_rules","code")]);
+        definitionRows=IndexRows(Definitions,[("curves","code"),("curve_members","curve_code"),
+            ("curve_inputs","curve_code"),("rate_curves","code"),("rate_curve_tenors","curve_code"),
+            ("curve_blocks","curve_code"),("shaped_curves","code"),("shaped_curve_blocks","shaped_curve_code")]);
+        contractDefinitions=Definitions["contracts"].ToLookup(row=>row.Id("id"));
+        quotedSeriesRows=Definitions["series"].ToLookup(row=>(row.OptionalId("contract_id"),row.OptionalText("quote_code")));
+        curveMembers=Definitions["curve_members"].Select(row=>(row.Text("curve_code"),row.Id("contract_id"))).ToHashSet();
+        observationRows=observations.ToLookup(row=>row.Id("id"));
+        observationSeriesRows=observations.ToLookup(row=>row.Id("series_id"));
+        correctionRows=observations.ToLookup(row=>row.OptionalId("corrects_id"));
+        revision=new(manifest.CatalogId,manifest.RevisionId); reference=new(manifest.ReferenceCatalogId,manifest.ReferenceRevisionId);
+        var quantities=references["quantity_specifications"].Select(q => new QuantitySpecification(R(q.Text("code")),R(q.Text("commodity_code")),R(q.Text("basis_code")),R(q.Text("unit_code")),R(q.Text("dimension_code")))).ToImmutableArray();
+        var quantitiesByUnit=quantities.ToLookup(q=>(q.Commodity.Code,q.Unit.Code));
+        var quotes=Quotes=references["quote_specifications"].Select(q => new QuoteSpecification(R(q.Text("code")),q.Text("kind") switch {"outright"=>QuoteKind.Outright,"basis"=>QuoteKind.Basis,_=>throw Unsupported()},R(q.Text("currency_code")),R(q.Text("quantity_code")),q.Number("multiplier"),q.Number("trading_tick"),q.Number("clearing_increment"),q.Number("minimum"),q.Number("maximum"))).ToImmutableArray();
+        quoteRows=quotes.ToLookup(q=>q.Key.Code,StringComparer.Ordinal);
+        var intervals=definitions["contract_intervals"].ToDictionary(i=>i.Id("contract_id"),i=>new DeliveryInterval(i.Instant("starts_at"),i.Instant("ends_at"),
+            DateOnly.ParseExact(i.Text("operating_date"),"yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture),
+            int.Parse(i.Text("hour_beginning"),System.Globalization.CultureInfo.InvariantCulture),
+            int.Parse(i.Text("minute"),System.Globalization.CultureInfo.InvariantCulture),int.Parse(i.Text("occurrence"),System.Globalization.CultureInfo.InvariantCulture)));
+        var contracts=Contracts=definitions["contracts"].Select(c => ListedContract(c,intervals.GetValueOrDefault(c.Id("id")))).ToImmutableArray();
+        contractRows=contracts.ToLookup(c=>c.Key.Id);
+        var mappings=definitions["constituent_mappings"].ToLookup(row=>(row.Text("curve_code"),row.Text("slot")));
+        var curves=definitions["curves"].Select(c =>
+        {
+            var code=c.Text("code"); var members=DefinitionRows("curve_members","curve_code",code).OrderBy(m=>m.GetProperty("ordinal").GetInt32()).Select(m=>K(m.Id("contract_id"))).ToImmutableArray();
+            var target=Single(ReferenceRows("settlement_targets","code",c.Text("settlement_target_code")));
+            var inputs=DefinitionRows("curve_inputs","curve_code",code).ToImmutableArray();
+            var numeric=inputs.Where(i=>i.Text("slot")=="multiplier").ToImmutableArray();
+            NumericInput? multiplier=null;
+            if (numeric.Length!=0)
+            {
+                var n=Single(numeric);
+                multiplier=new(n.OptionalId("source_series_id") is {} id ? S(id):null,
+                    n.OptionalText("value_specification_code") is {} spec ? R(spec):null,
+                    n.OptionalText("constant_value") is {} constant ? ExactDecimal.Parse(constant):null,
+                    n.OptionalText("numeric_role") is {} role ? ParseRole(role):null,
+                    n.OptionalText("numeric_source_code") is {} source ? R(source):null);
+            }
+            return new Curve(new(revision,code),R(c.Text("quote_code")),R(c.Text("location_code")),R(c.Text("profile_code")),
+                new(target.Text("kind") switch {"future_series"=>SettlementKind.FutureSeries,"index"=>SettlementKind.Index,"index_difference"=>SettlementKind.IndexDifference,_=>throw Unsupported()},target.OptionalText("index_a_code") is {} a?R(a):null,target.OptionalText("index_b_code") is {} b?R(b):null),
+                ParseRule(c.Text("rule")),members,
+                inputs.Where(i=>i.Text("slot")!="multiplier").Select(i=>new CurveInput(i.Text("slot") switch {"base"=>InputSlot.Base,"spread"=>InputSlot.Spread,_=>throw Unsupported()},new(revision,i.Text("source_curve_code")),i.Text("expiry_rule") switch {"require_live"=>SourceExpiryRule.RequireLive,"freeze_final_future"=>SourceExpiryRule.FreezeFinalFuture,_=>throw Unsupported()},
+                    mappings[(code,i.Text("slot"))].Select(m=>new ConstituentMapping(K(m.Id("target_contract_id")),K(m.Id("source_contract_id")))).ToImmutableArray())).ToImmutableArray(),
+                c.OptionalText("direct_role") is {} directRole?ParseRole(directRole):null,c.OptionalText("direct_source_code") is {} directSource?R(directSource):null,multiplier)
+            {ConstituentExpiry=Definitions["curve_expiry_rules"].Where(r=>r.Text("curve_code")==code).Select(r=>r.Text("rule_version")).SingleOrDefault() switch
+                {null=>ConstituentExpiryRule.RequireLive,"freeze_final_settlement_v1"=>ConstituentExpiryRule.FreezeFinalSettlement,_=>throw Unsupported()}};
+        }).ToImmutableArray();
+        var closes=new ConfiguredCloses(references);
+        var futures=FuturesSeries=contracts.Where(c=>c.Kind==ContractKind.Future).Select(c=>
+        {
+            var series=Single(ReferenceRows("futures_series","code",c.FuturesSeries!.Value.Code));
+            var product=Single(ReferenceRows("futures_products","code",series.Text("product_code")));
+            var milestones=ReferenceRows("futures_milestones","series_code",series.Text("code"));
+            var expiry=Single(milestones.Where(m=>m.Text("milestone")=="last_trading"));
+            var first=Single(milestones.Where(m=>m.Text("milestone")=="first_trading"));
+            var terms=Single(ReferenceRows("futures_product_terms","product_code",series.Text("product_code")));
+            ReferenceKey Quantity(string unit)=>Single(quantitiesByUnit[(product.Text("commodity_code"),unit)]).Key;
+            var resolution=references.ContainsKey("futures_lot_resolutions")?ReferenceRows("futures_lot_resolutions","series_code",series.Text("code")).ToArray():[];
+            if(resolution.Length>1)throw Unsupported();
+            var lot=resolution.SingleOrDefault();
+            FuturesLotResolution? resolved=lot.ValueKind==JsonValueKind.Undefined?null:new(new(lot.Number("amount"),R(lot.Text("quantity_code"))),lot.Number("factor"),lot.Text("implementation"));
+            var basis=ReferenceRows("futures_basis_settlements","series_code",series.Text("code")).SingleOrDefault();
+            if(basis.ValueKind!=JsonValueKind.Undefined&&terms.OptionalText("index_code") is not null)throw new MarketDataException("futures_definition","A basis settlement index is retained once on the exact dated series.");
+            FuturesBasisSettlement? basisSettlement=basis.ValueKind==JsonValueKind.Undefined?null:new(R(basis.Text("index_code")),R(basis.Text("benchmark_series_code")),basis.Text("implementation"));
+            var lastTrading=SchedulePreview.RequiredMilestoneInstant(expiry);
+            if(closes.Configured("last_trading",product.Text("code")))closes.Require("last_trading",product.Text("code"),Date(expiry.Text("business_date")),lastTrading);
+            return new FuturesSeriesSpecification(c.FuturesSeries!.Value,Quantity(product.Text("quote_unit_code")),R(product.Text("quote_currency_code")),product.Number("quote_multiplier"),product.Number("outright_tick_size"),R(product.Text("location_code")),R(terms.Text("profile_code")),
+                DateOnly.ParseExact(series.Text("delivery_from"),"yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture),DateOnly.ParseExact(series.Text("delivery_to"),"yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture),lastTrading,Quantity(product.Text("lot_unit_code")),product.Number("contract_size"),
+                product.Text("lot_basis") switch {"fixed_total"=>LotBasis.FixedTotal,"per_delivery_day"=>LotBasis.PerDeliveryDay,"per_delivery_hour"=>LotBasis.PerDeliveryHour,_=>throw Unsupported()},first.OptionalText("event_at") is null?null:SchedulePreview.RequiredMilestoneInstant(first),product.Text("settlement_method"),resolved,basisSettlement);
+        }).ToImmutableArray();
+        FuturesOptionSeries=[..contracts.Where(c=>c.Kind==ContractKind.FutureOption).Select(c=>OptionSeries(c,closes))];
+        var valueSpecs=references["value_specifications"].Select(v=>new ValueSpecification(R(v.Text("code")),v.Text("kind") switch {"quantity_ratio"=>NumericKind.QuantityRatio,"dimensionless"=>NumericKind.Dimensionless,_=>throw Unsupported()},v.OptionalText("numerator_quantity_code") is {} a?R(a):null,v.OptionalText("denominator_quantity_code") is {} b?R(b):null,v.Number("minimum"),v.Number("maximum"))).ToImmutableArray();
+        var seriesDefinitions=definitions["series"].Select(s=>new MarketSeries(S(s.Id("id")),s.OptionalId("contract_id") is {} id?K(id):null,s.OptionalText("quote_code") is {} q?R(q):null,s.OptionalText("value_specification_code") is {} v?R(v):null)).ToImmutableArray();
+        Model=new(revision,reference,quantities,quotes,contracts,curves,futures,valueSpecs,seriesDefinitions,calculations);
+    }
+    private static Dictionary<(string Table,string Field),ILookup<string,JsonElement>> IndexRows(
+        ImmutableDictionary<string,ImmutableArray<JsonElement>> tables,(string Table,string Field)[] keys)
+        =>keys.Where(key=>tables.ContainsKey(key.Table)).ToDictionary(key=>key,
+            key=>tables[key.Table].ToLookup(row=>row.Text(key.Field),StringComparer.Ordinal));
+    public IEnumerable<JsonElement> ReferenceRows(string table,string field,string key)=>referenceRows[(table,field)][key];
+    public IEnumerable<JsonElement> DefinitionRows(string table,string field,string key)=>definitionRows[(table,field)][key];
+    public IEnumerable<MarketContract> ContractRows(Guid id)=>contractRows[id];
+    public IEnumerable<QuoteSpecification> QuoteRows(string code)=>quoteRows[code];
+    public bool HasCurveMember(string curve,Guid contract)=>curveMembers.Contains((curve,contract));
+    public static PreviewManifest ResolveBundleManifest(PreviewManifest selected,JsonElement row)
+    {
+        if(row.Id("catalog_id")!=selected.CatalogId||row.Id("id")!=selected.RevisionId||
+            row.Id("reference_catalog_id")==Guid.Empty||row.Id("reference_revision_id")==Guid.Empty||row.Text("state")!="sealed")
+            throw new MarketDataException("reference_pin_mismatch","The admitted market requires its exact persisted sealed definition.");
+        return selected with{ReferenceCatalogId=row.Id("reference_catalog_id"),ReferenceRevisionId=row.Id("reference_revision_id")};
+    }
+    // The commodity a curve belongs to: the code and name its commodity reference has, as the curve directory's category
+    // for the curve has them before any reviewed display label. A curve whose commodity reference is missing or ambiguous
+    // fails the read; a position's commodity is never defaulted or read from a name.
+    public PositionCommodity Commodity(string curve)
+    {
+        var code=Single(DefinitionRows("curves","code",curve)).Text("commodity_code");
+        var commodity=Single(ReferenceRows("commodities","code",code));
+        return new(commodity.Text("code"),commodity.Text("name"));
+    }
+    // The unit a curve's prices are quoted in, named as the Blotter names the price units of its pivots.
+    public string PriceUnit(string curve)
+    {
+        var quote=Single(QuoteRows(Single(DefinitionRows("curves","code",curve)).Text("quote_code")));
+        return PriceUnitLabel(Single(ReferenceRows("currencies","code",quote.Currency.Code)).Text("display_code"),QuantityUnit(quote.Quantity.Code),quote.Multiplier.ToString());
+    }
+    // The symbol of the unit a quantity specification measures in.
+    public string QuantityUnit(string specification)=>Single(ReferenceRows("units","code",Single(ReferenceRows("quantity_specifications","code",specification)).Text("unit_code"))).Text("symbol");
+    // Currency, then unit, then a price multiplier other than one.
+    public static string PriceUnitLabel(string currency,string unit,string? multiplier)=>currency+"/"+unit+(multiplier is not (null or "1")?" × "+multiplier:"");
+    public static void RequireBundlePin(PreviewManifest manifest, JsonElement row)
+    {
+        if (row.Id("catalog_id") != manifest.CatalogId || row.Id("id") != manifest.RevisionId ||
+            row.Id("reference_catalog_id") != manifest.ReferenceCatalogId || row.Id("reference_revision_id") != manifest.ReferenceRevisionId ||
+            row.Text("state") != "sealed")
+            throw new MarketDataException("reference_pin_mismatch", "The persisted sealed bundle must match every exact manifest reference pin.");
+    }
+    public static CurveRule ParseRule(string rule) => rule switch {"direct"=>CurveRule.Direct,"add"=>CurveRule.Add,"scale_add"=>CurveRule.ScaleAdd,_=>throw Unsupported()};
+    // The kind of a stored market curve from its rule and direct role.
+    public static string CurveKind(string rule,string? directRole)=>CurveKinds.Of(ParseRule(rule),directRole is null?null:ParseRole(directRole));
+    internal static string RoleCode(ObservationRole role)=>role switch
+    {ObservationRole.TraderMark=>"trader_mark",ObservationRole.DailySettlement=>"daily_settlement",ObservationRole.FinalContractSettlement=>"final_contract_settlement",ObservationRole.Parameter=>"parameter",ObservationRole.IndexFixing=>"index_fixing",_=>throw Unsupported()};
+    public static ObservationRole ParseRole(string role) => role switch {"trader_mark"=>ObservationRole.TraderMark,"daily_settlement"=>ObservationRole.DailySettlement,"final_contract_settlement"=>ObservationRole.FinalContractSettlement,"parameter"=>ObservationRole.Parameter,"index_fixing"=>ObservationRole.IndexFixing,_=>throw Unsupported()};
+    // An option series' terms from its exact series and product rows; its expiry is the product's configured close on the
+    // series' expiry date, which the stored series and contract must both carry.
+    private FuturesOptionSeriesSpecification OptionSeries(MarketContract contract,ConfiguredCloses closes)
+    {
+        var series=Single(ReferenceRows("futures_option_series","code",contract.FuturesSeries!.Value.Code));
+        var product=Single(ReferenceRows("futures_option_products","code",series.Text("product_code")));
+        var quote=Single(QuoteRows(product.Text("quote_code")));
+        var expiry=closes.Require("option_expiry",product.Text("code"),Date(series.Text("last_trading_date")),series.Instant("expiry_at"));
+        if(contract.Expiry!=expiry)throw new MarketDataException("close_time_mismatch",$"Option contract {contract.Key.Id} does not expire at its series' configured close.");
+        var right=series.Text("option_right") switch{"call"=>OpenEtrm.MarketData.Options.OptionRight.Call,"put"=>OpenEtrm.MarketData.Options.OptionRight.Put,_=>throw Unsupported()};
+        return new(contract.FuturesSeries!.Value,R(product.Text("code")),R(series.Text("underlying_series_code")),
+            new(right,series.Number("strike"),expiry,product.Text("exercise_style"),product.Text("settlement_method")),
+            product.Number("multiplier"),quote.Currency,R(product.Text("lot_quantity_code")),quote.ClearingIncrement,
+            product.Text("automatic_exercise_rule_code"),product.GetProperty("contrary_instructions_allowed").GetBoolean(),
+            series.OptionalText("instruction_cutoff_at") is null?null:series.Instant("instruction_cutoff_at"),product.Text("premium_style"));
+    }
+    private static DateOnly Date(string value)=>DateOnly.ParseExact(value,"yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture);
+    // A future names exactly its futures series and a futures option exactly its option series; a forward names neither.
+    private MarketContract ListedContract(JsonElement c,DeliveryInterval? interval)
+    {
+        var (kind,series)=(c.Text("kind"),c.OptionalText("futures_series_code"),c.OptionalText("futures_option_series_code")) switch
+        {
+            ("future",{} future,null)=>(ContractKind.Future,R(future)),
+            ("future_option",null,{} option)=>(ContractKind.FutureOption,R(option)),
+            ("forward",null,null)=>(ContractKind.Forward,(ReferenceKey?)null),
+            _=>throw Unsupported(),
+        };
+        return new(K(c.Id("id")),kind,DateOnly.ParseExact(c.Text("delivery_from"),"yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture),
+            DateOnly.ParseExact(c.Text("delivery_to"),"yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture),c.Instant("expiry_at"),series,interval);
+    }
+    private static MarketDataException Unsupported()=>new("unsupported_definition","The selected definition uses an unsupported kind.");
+    private static T Single<T>(IEnumerable<T> source)
+    { var values=source.Take(2).ToArray(); return values.Length==1?values[0]:throw new MarketDataException("ambiguous_reference","A required exact reference is missing or ambiguous."); }
+    public JsonElement Observation(Guid id)=>Single(observationRows[id]);
+    internal IEnumerable<JsonElement> SeriesObservations(Guid series)=>observationSeriesRows[series];
+    internal IEnumerable<JsonElement> QuotedSeries(Guid contract,string quote)=>quotedSeriesRows[(contract,quote)];
+    public bool HasObservation(Guid id)=>observationRows.Contains(id);
+    internal ImmutableArray<Guid> SelectFrozen(ImmutableArray<Guid> selected,ImmutableArray<Guid> declared)
+    {
+        if(selected.IsDefault||declared.IsDefault||declared.Distinct().Count()!=declared.Length)throw new MarketDataException("snapshot_inputs","Select exact frozen input declarations.");
+        static (Guid,string,string) Identity(JsonElement row)=>(row.Id("series_id"),row.Text("source_code"),row.Text("role"));
+        var inputs=selected.Select(id=>(Id:id,Key:Identity(Observation(id)))).ToLookup(p=>p.Key);
+        return [..declared.Select(id=>
+        {
+            var matches=inputs[Identity(Observation(id))].ToArray();
+            return matches.Length==1?matches[0].Id:throw new MarketDataException("snapshot_inputs","Every declared frozen fact requires one exact selected observation of that input.");
+        })];
+    }
+    public InputFrame SelectPinned(InputFrame frame)
+    {
+        var pins=frame.ObservationIds.Select(id=>
+        {
+            if(!frame.FrozenObservationIds.IsDefault&&frame.FrozenObservationIds.Contains(id))return id;
+            var current=Observation(id);
+            var indexFixing=current.Text("role")=="index_fixing";
+            Guid? eligibleFinal=null;
+            while(true){var successors=correctionRows[current.Id("id")].ToArray();
+                if(indexFixing&&current.Text("publication_state")=="final"&&current.Instant("observed_at")<=frame.At)eligibleFinal=current.Id("id");
+                if(successors.Length==0)return eligibleFinal??current.Id("id");
+                if(successors.Length!=1)throw new MarketDataException("revision_conflict","An observation has conflicting successors.");
+                current=successors[0];}
+        }).ToImmutableArray();
+        return frame with {ObservationIds=pins,FrozenObservationIds=frame.FrozenObservationIds.IsDefault?default:SelectFrozen(pins,frame.FrozenObservationIds)};
+    }
+    internal MarketObservation ReadObservation(JsonElement row)=>new(new(manifest.CatalogId,row.Id("id")),S(row.Id("series_id")),R(row.Text("source_code")),ParseRole(row.Text("role")),
+        row.Text("publication_state") switch{"final"=>PublicationState.Final,"preliminary"=>PublicationState.Preliminary,_=>throw Unsupported()},row.Instant("observed_at"),row.Number("value"));
+    public MarketSnapshot Snapshot(InputFrame frame)
+    {
+        if(frame.ObservationIds.Distinct().Count()!=frame.ObservationIds.Length)
+            throw new MarketDataException("snapshot_inputs","A frame must name each native observation once; mixed uses of the same observation require a distinct explicit input contract.");
+        var selections=frame.ObservationIds.Select(id=>
+        {
+            var o=Observation(id);
+            return new SelectedObservation(new(S(o.Id("series_id")),o.Text("role")=="index_fixing"||!frame.FrozenObservationIds.IsDefault&&frame.FrozenObservationIds.Contains(id)?InputUse.FrozenFact:InputUse.Variable),ReadObservation(o));
+        }).ToImmutableArray();
+        return new(frame.Id,revision,frame.At,frame.At,InputSelectionPolicy.ExactPinnedFinalObservationsNoAgeFiltering,selections);
+    }
+    public CurveBuild Build(InputFrame frame,string code)=>Build(frame,[code]);
+    // The requests for the contracts the frame selects for a curve, none when its view explicitly selects none.
+    public ImmutableArray<CurveRequest> Requests(InputFrame frame,string code)
+    {
+        if (string.IsNullOrEmpty(code) || !DefinitionRows("curves","code",code).Any()) throw new MarketDataException("missing_curve","Select an exact curve definition.");
+        if(!frame.CurveContracts.TryGetValue(code,out var members) || members.IsDefault)
+            throw new MarketDataException("missing_curve_view","An explicit contract selection is required for this market date.");
+        return [..members.Select(id=>new CurveRequest(new(revision,code),K(id)))];
+    }
+    // One build of each curve's selected contracts in the frame.
+    public CurveBuild Build(InputFrame frame,IReadOnlyList<string> codes)
+    {
+        var requests=ImmutableArray.CreateBuilder<CurveRequest>();
+        foreach(var code in codes)
+        {
+            var selected=Requests(frame,code);
+            if(selected.IsEmpty)throw new MarketDataException("empty_curve_view","This market date has no remaining contracts in the selected view.");
+            requests.AddRange(selected);
+        }
+        return Model.Build(Snapshot(frame),requests.ToImmutable());
+    }
+    // A rate curve's pinned date list (D359): its tenors' maturities resolve from it at each close.
+    public (Guid Mapping,int Version) RateDateList(string code)
+    {
+        var curve=Single(DefinitionRows("rate_curves","code",code));
+        return (curve.Id("mapping_definition_id"),int.Parse(curve.Text("mapping_version"),System.Globalization.CultureInfo.InvariantCulture));
+    }
+    // A rate curve at one close. An admitted curve's tenors take the maturities its date list resolves to there, by label.
+    public RateCurveDefinition RateDefinition(string code,IReadOnlyDictionary<string,DateOnly> maturities)
+    {
+        var curve=Single(DefinitionRows("rate_curves","code",code));
+        var rows=DefinitionRows("rate_curve_tenors","curve_code",code).OrderBy(t=>t.GetProperty("ordinal").GetInt32()).ToArray();
+        if(rows.Length!=maturities.Count)throw new MarketDataException("rate_definition","The curve's tenors and its date list's labels differ.");
+        var tenors=rows.Select(t=>new RateTenor(t.Text("label"),S(t.Id("series_id")),maturities.TryGetValue(t.Text("label"),out var date)?date:
+            throw new MarketDataException("rate_definition",$"Tenor '{t.Text("label")}' is not in the curve's date list."))).ToImmutableArray();
+        return new(new(revision,code),R(curve.Text("currency_code")),R(curve.Text("source_code")),
+            RateConventionSet.Parse(curve.Text("day_count"),curve.Text("compounding"),curve.Text("interpolation"),curve.Text("extrapolation"),curve.Text("mark_unit")),
+            tenors,curve.Id("definition_id"),int.Parse(curve.Text("definition_version"),System.Globalization.CultureInfo.InvariantCulture));
+    }
+    public ZeroRateBuild BuildRates(InputFrame frame,RateCurveDefinition definition) => new ZeroRateCurve(definition).Build(Snapshot(frame));
+    public bool IsRateCurve(string code)=>DefinitionRows("rate_curves","code",code).Any();
+    // Every rate curve's tenor series, without resolving maturities: history follows a tenor's own series across closes.
+    ImmutableArray<Guid> RateSeries(string code)=>[..DefinitionRows("rate_curve_tenors","curve_code",code).Select(t=>t.Id("series_id"))];
+    internal ImmutableArray<Guid> HistorySeries(string code,Guid? contract,Guid? series)
+    {
+        if(IsRateCurve(code))
+        {
+            if(contract is not null||series is null)throw new MarketDataException("history_request","Select an exact rate sample.");
+            return RateSeries(code);
+        }
+        if(series is not null||contract is null)throw new MarketDataException("history_request","Select an exact market contract.");
+        return [..Model.RequiredSeries([new(new(revision,code),K(contract.Value))]).Select(key=>key.Id)];
+    }
+    internal InputFrame HistoryFrame(InputFrame frame)
+    {
+        if(!CompletePins)throw new MarketDataException("ambiguous_reference","A selected frame pin is unavailable under the authorized context.");
+        if(frame.ObservationIds.Distinct().Count()!=frame.ObservationIds.Length)
+            throw new MarketDataException("snapshot_inputs","A frame must name each native observation once.");
+        return frame with
+        {
+            ObservationIds=[..frame.ObservationIds.Where(HasObservation)],
+            FrozenObservationIds=frame.FrozenObservationIds.IsDefault?[]:[..frame.FrozenObservationIds.Where(HasObservation)]
+        };
+    }
+    public (string Value,Guid[] Inputs) HistoryValue(InputFrame frame,string code,Guid? contract,Guid? series)
+    {
+        if(IsRateCurve(code))
+        {
+            if(contract is not null||series is null)throw new MarketDataException("history_request","Select an exact rate sample.");
+            if(!RateSeries(code).Contains(series.Value))throw new MarketDataException("missing_rate_point","Rate sample does not belong to this curve.");
+            // A tenor's history is its own mark at each close, in the curve's mark unit.
+            var mark=Snapshot(frame).Selections.SingleOrDefault(s=>s.Input.Series.Id==series&&s.Input.Use==InputUse.Variable)?.Observation
+                ??throw new MarketDataException("missing_observation","This tenor has no mark at this close.");
+            return (mark.Value.ToString(),[mark.Key.Id]);
+        }
+        if(series is not null||contract is null)throw new MarketDataException("history_request","Select an exact market contract.");
+        // History follows the exact dated member, even outside another frame's
+        // displayed window. Never replace it with that frame's rolling selection.
+        var value=Model.Build(Snapshot(frame),[new(new(revision,code),K(contract.Value))]).Values[0];
+        return (value.Price.Value.ToString(),value.Lineage.Select(k=>k.Id).Order().ToArray());
+    }
+    // The summary the browser states for a curve (D233): counts and the front contract come from here, never from its points.
+    static object ContractSummary(int contractCount,CurveFront? front,string? availability)=>new{kind="contracts",contractCount,front,availability};
+    static object RateSummary(ZeroRateBuild rates)
+    {
+        var first=rates.Values.OrderBy(p=>p.Maturity).FirstOrDefault();
+        return new{kind="rates",maturityCount=rates.Values.Length,firstMaturity=first?.Maturity.ToString("yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture),
+            firstMark=first?.Mark,markUnitLabel=rates.MarkUnitLabel,dayCount=RateChoiceLabel("dayCount",rates.Conventions.DayCount)};
+    }
+    static string RateChoiceLabel(string field,string code)=>RateCurveMath.Choices.Single(c=>c.Field==field&&c.Code==code).Label;
+    // A rate curve's inspection view at one close (D359): each tenor's maturity, mark in its declared unit and discount factor.
+    public object Result(InputFrame frame,string code,RateCurveDefinition? rateDefinition=null,CurveBuild? viewBuild=null)
+    {
+        if(IsRateCurve(code))
+        {
+            var definition=rateDefinition??throw new MarketDataException("rate_definition","Resolve this rate curve at the close first.");
+            var rates=BuildRates(frame,definition);
+            return new {kind="rates",snapshotId=frame.Id,frame.Name,at=frame.At,curve=code,referenceDate=rates.ReferenceDate.ToString("yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture),currency=rates.Currency.Code,numericalPolicy=rates.NumericalPolicy,
+                convention=new {dayCount=RateChoiceLabel("dayCount",rates.Conventions.DayCount),compounding=RateChoiceLabel("compounding",rates.Conventions.Compounding),
+                    interpolation=RateChoiceLabel("interpolation",rates.Conventions.Interpolation),extrapolation=RateChoiceLabel("extrapolation",rates.Conventions.Extrapolation)},
+                markUnitLabel=rates.MarkUnitLabel,definition=new{id=definition.DefinitionId,version=definition.DefinitionVersion},
+                summary=RateSummary(rates),
+                points=rates.Values.Select(p=>new {seriesId=p.Series.Id,label=p.Label,maturity=p.Maturity.ToString("yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture),mark=p.Mark,value=p.Mark,discountFactor=p.DiscountFactor,displayDiscountFactor=p.DisplayDiscountFactor,actualDays=p.Days,lineage=new[]{p.Observation.Id}}).ToArray()};
+        }
+        if(frame.CurveContracts.TryGetValue(code,out var selected) && selected.IsEmpty)
+        {
+            if(!DefinitionRows("curves","code",code).Any())throw new MarketDataException("missing_curve","Select an exact curve definition.");
+            return EmptyContractResult(frame,code);
+        }
+        var build=viewBuild??Build(frame,code);
+        var nodeIds=build.Evaluations.Select((e,i)=>(e,i)).ToDictionary(p=>(p.e.Result.Request,p.e.Use),p=>"step_"+p.i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var trace=build.Evaluations.Select(e=>
+        {
+            var v=e.Result;
+            var c=Single(contractDefinitions[v.Request.Contract.Id]);
+            var definition=Single(DefinitionRows("curves","code",v.Request.Curve.Code));
+            var multiplier=DefinitionRows("curve_inputs","curve_code",v.Request.Curve.Code).SingleOrDefault(i=>i.Text("slot")=="multiplier");
+            return new {id=nodeIds[(v.Request,e.Use)],curve=v.Request.Curve.Code,contractId=v.Request.Contract.Id,
+                deliveryFrom=c.Text("delivery_from"),deliveryTo=c.Text("delivery_to"),priceTick=c.Text("kind")=="future"?QuoteRows(v.Quote.Code).Single(q=>q.Key==v.Quote).ClearingIncrement.ToString():null,value=v.Price.Value.ToString(),quote=v.Quote.Code,
+                rule=definition.Text("rule"),use=e.Use==InputUse.FrozenFact?"frozen":"variable",
+                source=definition.OptionalText("direct_source_code"),role=e.Use==InputUse.FrozenFact?"final_contract_settlement":definition.OptionalText("direct_role"),
+                inputs=e.Inputs.Select(i=>new {slot=i.Slot==InputSlot.Base?"base":"spread",id=nodeIds[(i.Source,i.Use)]}).ToArray(),
+                multiplier=e.Multiplier is {} factor?new {value=factor.Value.ToString(),observationId=(Guid?)e.MultiplierObservation?.Id,valueSpecification=multiplier.ValueKind==JsonValueKind.Undefined?null:multiplier.OptionalText("value_specification_code")}:null,
+                lineage=v.Lineage.Select(k=>k.Id).Order().ToArray()};
+        }).ToArray();
+        // The display count describes the complete resolved trace, including
+        // memoized results. Physical work remains in the graph's work counters.
+        var contracts=build.Values.Select(v=>
+        {
+            var c=Single(contractDefinitions[v.Request.Contract.Id]);
+            return new CurveShapePoint(v.Request.Contract.Id,c.Text("delivery_from"),c.Text("delivery_to"),v.Price.Value.ToString(),null);
+        }).ToArray();
+        return new { snapshotId=frame.Id, frame.Name, at=frame.At, curve=code, evaluated=build.Evaluations.Length, numericalPolicy=build.NumericalPolicy,
+            summary=ContractSummary(contracts.Length,CurveFront.First(contracts),null),
+            trace, points=build.Values.Select(v=>
+            {
+                var c=Single(contractDefinitions[v.Request.Contract.Id]);
+                return new { contractId=v.Request.Contract.Id,instrumentId=c.OptionalText("futures_series_code") is {} future?(Guid?)ContractIdentity.Futures(R(future)):null, deliveryFrom=c.Text("delivery_from"),deliveryTo=c.Text("delivery_to"),expiry=c.Text("expiry_at"),priceTick=c.Text("kind")=="future"?QuoteRows(v.Quote.Code).Single(q=>q.Key==v.Quote).ClearingIncrement.ToString():null,value=v.Price.Value.ToString(),quote=v.Quote.Code,lineage=v.Lineage.Select(k=>k.Id).Order().ToArray(),
+                    interval=IntervalCurveDefinitions.Label(contractRows[v.Request.Contract.Id].Single().Interval) };
+            }).ToArray(), observationIds=frame.ObservationIds };
+    }
+    internal object EmptyContractResult(InputFrame frame,string code)=>new {snapshotId=frame.Id,frame.Name,at=frame.At,curve=code,availability="no_remaining_contracts",
+        evaluated=0,numericalPolicy=CurveModel.NumericalPolicy,summary=ContractSummary(0,null,CurveSummary.NoRemainingContracts),trace=Array.Empty<object>(),points=Array.Empty<object>(),observationIds=frame.ObservationIds};
+}
+public static class JsonFields
+{
+    public static string Text(this JsonElement row,string field)=>row.GetProperty(field).ValueKind==JsonValueKind.String?row.GetProperty(field).GetString()!:row.GetProperty(field).GetRawText();
+    public static string? OptionalText(this JsonElement row,string field)=>row.GetProperty(field).ValueKind==JsonValueKind.Null?null:row.Text(field);
+    public static Guid Id(this JsonElement row,string field)=>Guid.Parse(row.Text(field));
+    public static Guid? OptionalId(this JsonElement row,string field)=>row.OptionalText(field) is {} s?Guid.Parse(s):null;
+    public static ExactDecimal Number(this JsonElement row,string field)=>ExactDecimal.Parse(row.Text(field));
+    public static DateTimeOffset Instant(this JsonElement row,string field)=>DateTimeOffset.Parse(row.Text(field),System.Globalization.CultureInfo.InvariantCulture).ToUniversalTime();
+}

@@ -1,0 +1,634 @@
+import {viewEvents} from './workspace-view.js';
+// The assistant panel (docs/ai-assistant.md §8, §10.1, D191): the agent picker, the conversation with its steps, answers,
+// targets and usage, the composer, consent and History. A tab keeps one stream while its conversation has an unfinished
+// turn, open or closed; an idle panel holds none. Only a target arriving live for a question this tab asked moves the
+// page, and only when it keeps the page's context and leaves nothing unsaved; any other shows Go.
+import {publicText,displayInstant} from './market-view.js';
+import {PendingCommand} from './pending-command.js';
+import type {Vendor} from './agent-grants.js';
+import {streamFrame,streamOrder,readEvents,newTurnView,applyEvent,type TurnView,type TurnEvent,type Target,type StreamItem} from './assistant-events.js';
+import {lookingAt,askKnowledge,changesContext,targetAction,NavigationHistory,stepLine,endingLine,startsOver,usageLine,consentText,grantExpiry,
+  lookingKey,agentChoice,preselect,conversationChoice,panelMessage,keptAsk,isUuid,type Place,type Names,type UsableAgent} from './assistant-pages.js';
+import {answerBlocks,renderBlocks} from './assistant-text.js';
+import {setupWalkthrough,type PresentationStep,type Walkthrough} from './assistant-walkthroughs.js';
+import {setupAssistantActions} from './assistant-actions.js';
+import {follow} from './conversation-follow.js';
+
+type Api=<T>(path:string,body?:unknown)=>Promise<T>;
+type Turn={id:string;conversationId:string;ordinal:number;agentId:string;version:number;question:string;state:string;askedAt:string;hidden?:string|null};
+type Read={conversation:{id:string;agentId:string;readThrough:number};turns:Turn[];events:unknown[]};
+type Listed={id:string;agentName:string;unread:boolean;latestTurn:Turn};
+// A target's notice: whether the page moved there, the place Back restores, why it waits, and the action the person was
+// told leaves the unsaved changes of a page, which that page's next click of it then takes.
+type Notice={moved:boolean;key?:string;reason?:string;confirm?:{action:'go'|'back';page:string}};
+export type PanelOptions={launcherHidden?:()=>boolean;launcherMinimized?:()=>boolean;restoreLauncher?:()=>void;api:Api;root:string;identity:()=>string;zone:()=>string;available:()=>boolean;pageAvailable?:()=>boolean;pageBusy:()=>boolean;
+  act:(work:()=>Promise<void>)=>Promise<void>;place:()=>Place;names:()=>Names;trade:()=>string|undefined;unsaved:()=>boolean;
+  // Moves the page to a target in the context it shows; selects a target's context, then moves; and restores a place.
+  open:(target:Target)=>Promise<void>;go:(target:Target)=>Promise<void>;restore:(place:Place)=>Promise<void>;changed?:()=>Promise<void>;presentationRevision?:()=>string;presentationLocate?:(step:PresentationStep)=>HTMLElement|null;presentation?:(step:PresentationStep,signal:AbortSignal)=>Promise<HTMLElement>};
+
+const streamed=['accepted','step','navigation','walkthrough','text','usage','completed','failed','cancelled','interrupted','replaced','refused'];
+const terminal=['completed','failed','cancelled','interrupted'];
+// Answers that say nothing of whether a command was written; any other refusal proves it was not.
+const uncertain=['response_unknown','request_cancelled','preview_error','grant_outcome_unknown'];
+const definite=(code:string|undefined)=>!!code&&!uncertain.includes(code);
+const changesView='Go changes the knowledge or As of date the page shows.',leavesEdits='Go would leave unsaved changes on this page.';
+const backLeavesEdits='Back would leave unsaved changes on this page.';
+const unconfirmedAsk='We could not confirm that your question was received. Retry sends the same question; Discard forgets it.';
+
+// A target the person reviews under the page's own header, never moved to by itself: a proposed curve, or a draft the assistant saved (D260).
+const canonical=(value:unknown):unknown=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).map(([key,v])=>[key,canonical(v)])):value;
+const reviewed=(target:Target)=>target.kind==='proposal'||target.kind==='draft';
+export function setupAssistant(options:PanelOptions){
+  const available=()=>options.available()&&options.pageAvailable?.()!==false;
+  const actions=setupAssistantActions({api:options.api,identity:options.identity,changed:async()=>{await options.changed?.();}});
+  const get=<T extends HTMLElement=HTMLElement>(id:string)=>document.getElementById(id) as T;
+  const text=(id:string,value:string)=>{get(id).textContent=publicText(value);};
+  function el<K extends keyof HTMLElementTagNameMap>(tag:K,className:string,content?:string){
+    const node=document.createElement(tag);node.className=className;if(content!==undefined)node.textContent=publicText(content);return node;
+  }
+  function button(label:string,name:string,run:()=>void,className='secondary'){
+    const node=el('button',className,label);node.type='button';node.setAttribute('aria-label',publicText(name));node.onclick=run;return node;
+  }
+  const panel=get('assistant-panel'),launcher=get<HTMLButtonElement>('assistant-launcher'),picker=get<HTMLSelectElement>('assistant-agent');
+  const question=get<HTMLTextAreaElement>('assistant-question'),send=get<HTMLButtonElement>('assistant-send'),handle=get('assistant-resize');
+  const asking=new PendingCommand(definite),granting=new PendingCommand(definite),history=new NavigationHistory();
+  let agents:UsableAgent[]=[],vendors:Vendor[]=[],agentsError='';
+  let conversation:{id:string;agentId:string;version:number;readThrough:number}|undefined,views:TurnView[]=[];
+  // Each target's notice by its event's sequence; the turns this tab asked since it loaded, whose live targets may move it.
+  let notices=new Map<number,Notice>(),askedHere=new Set<string>();
+  // The stream this tab follows, the last sequence it read, and the stream an ask opened, the only one whose targets arrive
+  // live: a stream resumed or opened again replays targets that were sent while another tab or a read had the turn.
+  let source:EventSource|undefined,streamLast=0,live:EventSource|undefined,reopened=false,opened=false,unread=false,working=false,askable=false,lookedAt='';
+  let note:{text:string;resume:boolean;reload:boolean}|undefined,consent:UsableAgent|undefined,error='',moving=Promise.resolve();
+  // An identity change ends everything this panel started; a conversation change ends what started for the one it left.
+  let identity=0,conversationGeneration=0;
+  const stepsOpen=new Set<string>(),items=new Map<string,HTMLLIElement>();
+  const stored=(kind:'agent'|'panel'|'ask')=>`openetrm.assistant.${kind}.${options.identity()}`;
+  const latest=()=>views.at(-1);
+  const running=()=>{const view=latest();return !!view&&!view.ending;};
+  const lastSequence=()=>Math.max(0,...views.map(v=>v.lastSequence));
+  const chosen=()=>agents.find(a=>`${a.id}:${a.version}`===picker.value);
+  const message=(caught:unknown,fallback:string)=>panelMessage((caught as {code?:string}).code)??(caught instanceof Error?caught.message:fallback);
+
+  let presenting:{turnId:string;sequence:number;value:Walkthrough;key:string;autoKey:string}|undefined;
+  const suppressed=new Set<string>();
+  const turnKey=(turnId:string)=>JSON.stringify([options.identity(),conversation?.id,turnId]);
+  const presented=new Set<string>(),progress=new Map<string,number>(),resumeReports=new Map<string,string>(),takenOver=new Set<string>();
+  const planKey=(turnId:string,sequence:number)=>JSON.stringify([options.identity(),conversation?.id,turnId,sequence]);
+  const reportKey=()=>JSON.stringify([canonical(options.place().report),options.presentationRevision?.()??null]);
+  async function reviewReady(step:Extract<PresentationStep,{kind:'open'}>,signal:AbortSignal){
+    signal.throwIfAborted();const own=presenting;if(!own)throw Error('The walkthrough ended.');
+    const available=()=>presenting===own&&(options.place().report.page.startsWith('blotter')?'blotter':options.place().report.page)===(step.page.startsWith('blotter')?'blotter':step.page)&&!changesContext(own.value.plan.context,options.place().context);
+    while(!views.find(v=>v.id===own.turnId)?.ending){await reread();signal.throwIfAborted();if(!available())throw Error('The page changed before Review opened.');await new Promise(resolve=>setTimeout(resolve,100));}
+    if(!available()||views.find(v=>v.id===own.turnId)?.ending?.state!=='completed')throw Error('The proposal turn did not complete here.');
+    return {own,available};
+  }
+  const walkthroughHost=el('div','assistant-walkthrough-controls');get('assistant-composer').before(walkthroughHost);
+  const walkthrough=setupWalkthrough({host:walkthroughHost,locate:async(step,signal)=>{
+    if(step.kind==='open'&&step.pane==='review'){
+      const {own}=await reviewReady(step,signal);
+      return [...(items.get(own.turnId)?.querySelectorAll<HTMLElement>('[data-assistant-review-step]')??[])].find(button=>button.dataset.assistantReviewStep===String(step.proposalStep))??null;
+    }
+    return options.presentationLocate?.(step)??null;
+  },identity:options.identity,context:()=>JSON.stringify(options.place().context),
+    verify:async()=>{
+      const own=presenting,held=conversation;if(!own||!held)return false;
+      const read=await options.api<Read>(`assistant/conversations/${held.id}?after=${own.sequence-1}`);
+      const event=readEvents(read).find(e=>e.turnId===own.turnId&&e.sequence===own.sequence);
+      if(event?.hidden){const view=views.find(v=>v.id===own.turnId);if(view){view.hidden=event.hidden;view.text='';view.targets=[];view.walkthroughs=[];update(view);}}
+      return conversation?.id===held.id&&presenting===own&&event?.kind==='walkthrough'&&!event.hidden&&event.payload.unavailable!==true;
+    },
+    perform:async(step,signal)=>{
+      signal.throwIfAborted();const own=presenting;if(!own)throw Error('The walkthrough ended.');
+      if(step.kind!=='go'){const actual=options.place().report.page,canonical=(page:string)=>page.startsWith('blotter')?'blotter':page;if(canonical(actual)!==canonical(step.page))throw Error('The page changed.');}
+      if(step.kind==='open'&&step.pane==='review'){
+        // A review is an ordinary owner read. It cannot select consent or invoke authorization.
+        const {available}=await reviewReady(step,signal);
+        await actions.review({turnId:own.turnId,step:step.proposalStep!},signal,available);signal.throwIfAborted();
+        return document.querySelector<HTMLElement>('.assistant-action-review')!;
+      }
+      if(!options.presentation)throw Error('This page has no presentation adapter.');
+      return options.presentation(step,signal);
+    },takenOver:()=>{if(presenting)takenOver.add(presenting.key);},progress:(index,status)=>{
+      const own=presenting;if(!own)return;
+      progress.set(own.key,index);
+      try{resumeReports.set(own.key,reportKey());}catch{takenOver.add(own.key);resumeReports.delete(own.key);}
+      if(status.startsWith('Stopped')){suppressed.add(own.autoKey);announce(status);}
+      if(status.startsWith('Walkthrough complete')){progress.delete(own.key);presenting=undefined;}
+      // Plans on other turns may have rendered while this one owned presentation.
+      for(const control of get('assistant-turns').querySelectorAll<HTMLButtonElement>('[data-assistant-walkthrough-control]'))control.disabled=walkthrough.active();
+      refresh(own.turnId);
+    }});
+  async function present(turnId:string,item:{sequence:number;value:Walkthrough},resume=false){
+    if(walkthrough.active()||options.pageBusy()||document.querySelector('dialog[open]'))return;
+    const place=options.place();if(changesContext(item.value.plan.context,place.context)){announce('Select the walkthrough context before starting it.');return;}
+    const key=planKey(turnId,item.sequence),from=resume?(progress.get(key)??0):0;
+    if(resume&&(takenOver.has(key)||resumeReports.get(key)!==reportKey())){announce('The page changed after Stop. Ask again from this view.');return;}
+    if(!from&&JSON.stringify(canonical(place.report))!==JSON.stringify(canonical(item.value.plan.pageReport))){announce('The page selection changed. Ask again from this view.');return;}
+    if(options.unsaved()&&!resume){announce('Finish your unsaved changes before starting this walkthrough.');return;}
+    for(const other of progress.keys())if(other!==key)takenOver.add(other);
+    presented.add(key);takenOver.delete(key);presenting={turnId,sequence:item.sequence,value:item.value,key,autoKey:turnKey(turnId)};
+    await walkthrough.start(item.value,from);
+  }
+  function persist(){try{sessionStorage.setItem(stored('panel'),JSON.stringify({conversationId:conversation?.id??null,open:opened}));}catch{/* This visit keeps the panel in memory. */}}
+  // An ask whose outcome is unconfirmed is kept, through reloads too, until Retry confirms it or Discard forgets it.
+  function keep(){
+    try{const command=asking.command;if(command)sessionStorage.setItem(stored('ask'),JSON.stringify({operationId:command.operationId,path:command.path,body:command.body}));
+      else sessionStorage.removeItem(stored('ask'));}
+    catch{/* The ask is kept for this visit. */}
+  }
+  function announce(value:string){text('assistant-status',value);}
+
+  // The usable versions and their vendors; the launcher shows only with one to choose.
+  async function readAgents(){
+    const started=identity;
+    try{
+      const read=await options.api<{agents:UsableAgent[];vendors:Vendor[]}>('assistant/agents');
+      if(started!==identity)return;
+      for(const agent of read.agents)agentChoice(agent,read.vendors);
+      const keep=`${picker.value}`;agents=read.agents;vendors=read.vendors;agentsError='';
+      let saved:string|null=null;try{saved=localStorage.getItem(stored('agent'));}catch{/* Nothing is preselected. */}
+      const listed=agents.find(a=>`${a.id}:${a.version}`===keep);
+      renderPicker(listed??(conversation?conversationChoice(agents,conversation.agentId,conversation.version):preselect(agents,saved)));
+    }catch(caught){
+      if(started!==identity)return;
+      agents=[];agentsError=message(caught,'The agents you may use could not be read.');renderPicker(undefined);
+    }
+    sync();
+  }
+  function renderPicker(selected:UsableAgent|undefined){
+    picker.replaceChildren(new Option('Choose an agent',''),...agents.map(a=>new Option(publicText(agentChoice(a,vendors)),`${a.id}:${a.version}`)));
+    picker.value=selected?`${selected.id}:${selected.version}`:'';
+  }
+
+  function show(open:boolean,focus=true){
+    if(open&&!available())return;
+    if(!open)walkthrough.stop();
+    opened=open;panel.hidden=!open;document.body.classList.toggle('assistant-open',open);launcher.setAttribute('aria-expanded',String(open));
+    if(open){hideHistory();unread=false;void markRead();void readAgents();}
+    persist();sync();
+    if(focus)(open?picker.value?question:picker:launcher).focus();
+  }
+
+  // The conversation: questions, collapsible steps, answers, targets, endings and usage.
+  function render(always=false){
+    follow(get('assistant-conversation'),()=>{
+      items.clear();
+      get('assistant-turns').replaceChildren(...views.map(view=>{const item=el('li','assistant-turn');items.set(view.id,item);fill(item,view);return item;}));
+      get('assistant-empty').hidden=views.length>0;
+    },always);
+  }
+  function update(view:TurnView){const item=items.get(view.id);if(item)follow(get('assistant-conversation'),()=>fill(item,view));else render();}
+  function fill(item:HTMLLIElement,view:TurnView){
+    const parts:Node[]=[el('p','assistant-question',view.question)];
+    if(view.steps.length){
+      const details=el('details','assistant-steps'),list=el('ul','');details.open=stepsOpen.has(view.id);
+      details.ontoggle=()=>{if(details.open)stepsOpen.add(view.id);else stepsOpen.delete(view.id);};
+      for(const step of view.steps)list.append(el('li','',stepLine(step)));
+      details.append(el('summary','',`${view.steps.length} step${view.steps.length===1?'':'s'}`),list);parts.push(details);
+    }
+    if(view.hidden)parts.push(el('p','assistant-hidden','This answer is hidden: what it read can no longer be read for you.'));
+    else if(view.text){const answer=el('div','assistant-answer');answer.append(renderBlocks(answerBlocks(publicText(view.text)),document));parts.push(answer);}
+    else if(!view.ending)parts.push(el('p','assistant-waiting','Answering…'));
+    for(const target of view.targets)parts.push(targetNotice(target));
+    if(!view.hidden&&view.unavailableAction)parts.push(el('p','assistant-target-reason','A saved walkthrough or navigation action is unavailable in this version. Your chat messages are still shown.'));
+    if(!view.hidden)for(const item of view.walkthroughs){const key=planKey(view.id,item.sequence),resume=progress.has(key);
+      const narration=item.value.plan.steps.filter((step):step is Extract<PresentationStep,{kind:'say'}>=>step.kind==='say');
+      if(narration.length){
+        const guidance=el('div','assistant-walkthrough-guidance'),lines=el('ol','');
+        for(const step of narration)lines.append(el('li','',step.text));
+        guidance.append(el('strong','','Walkthrough guidance'),lines);parts.push(guidance);
+      }
+      if(presenting?.key===key&&walkthrough.active())continue;
+      const label=resume?'Resume walkthrough':presented.has(key)?'Replay walkthrough':'Start walkthrough';
+      const control=button(label,label,()=>{void present(view.id,item,resume).catch(error=>announce(message(error,'The walkthrough could not start.')));});control.dataset.assistantWalkthroughControl='true';control.disabled=walkthrough.active();parts.push(control);}
+
+    if(!view.hidden&&view.ending?.state==='completed')for(const step of view.steps)
+      if('tool' in step&&step.tool==='propose_page_action'&&step.code===null)
+      {
+        const control=button('Review proposed change','Review the exact proposed change before authorization',()=>{
+          void actions.review({turnId:view.id,step:step.ordinal}).catch(error=>announce(error instanceof Error?error.message:'The proposal could not be opened.'));
+        });control.dataset.assistantReviewStep=String(step.ordinal);parts.push(control);
+      }
+    if(view.ending?.incomplete)parts.push(el('p','assistant-incomplete','Incomplete answer'));
+    const ending=view.ending&&endingLine(view.ending);
+    if(ending)parts.push(el('p','assistant-ending',ending));
+    if(view.ending&&startsOver(view.ending)&&view===latest())parts.push(button('New conversation','Start a new conversation',startOver));
+    if(view.usage)parts.push(el('p','assistant-usage',usageLine(view.usage)));
+    item.replaceChildren(...parts);
+  }
+  function targetNotice(item:{sequence:number;target:Target}){
+    const notice=notices.get(item.sequence)??{moved:false},box=el('div','assistant-target'),label=publicText(item.target.label);
+    box.append(el('span','',notice.moved?`Took you to ${label}`:label));
+    if(notice.reason)box.append(el('span','assistant-target-reason',notice.reason));
+    if(!notice.moved)box.append(notice.confirm?.action==='go'?button('Go anyway',`Leave unsaved changes and go to ${label}`,()=>go(item))
+      :button(item.target.kind==='proposal'?'Review proposed curve':item.target.kind==='draft'?'Open saved draft':'Go',`Go to ${label}`,()=>go(item)));
+    // A move that failed once it had changed the page keeps its Back too.
+    if(notice.key&&history.origin(notice.key))box.append(notice.confirm?.action==='back'?button('Back anyway',`Leave unsaved changes and go back from ${label}`,()=>back(item))
+      :button('Back',`Back from ${label}`,()=>back(item)));
+    return box;
+  }
+  function refresh(turnId:string){const view=views.find(v=>v.id===turnId);if(view)update(view);}
+  // Moves the page with `move`, recording the place it leaves for Back once the page has changed, whether or not the move
+  // then finished; a place showing an unapplied historical selection, which a move discards, is not restorable. A move that
+  // never ran, on a page busy with something else, leaves the notice as it was.
+  async function moveFrom(item:{sequence:number},move:()=>Promise<void>){
+    const started=conversationGeneration,origin=options.place(),left=JSON.stringify(origin);let moved=false;
+    await options.act(async()=>{await move();moved=true;});
+    if(started!==conversationGeneration||!moved&&JSON.stringify(options.place())===left)return;
+    notices.set(item.sequence,{moved,key:origin.context.mode!=='unapplied'?history.record(origin):undefined});
+  }
+  // On a page with unsaved changes, Go and Back first say so, keeping the notice's Back, and act once that page's person
+  // asks again; whether to ask is judged by the page they would leave when they click.
+  function unconfirmed(item:{sequence:number},action:'go'|'back',turnId:string){
+    const notice=notices.get(item.sequence)??{moved:false},page=options.place().page;
+    if(!options.unsaved()||notice.confirm?.action===action&&notice.confirm.page===page)return false;
+    notices.set(item.sequence,{...notice,reason:action==='go'?leavesEdits:backLeavesEdits,confirm:{action,page}});refresh(turnId);return true;
+  }
+  // Go selects the target's context and opens it.
+  function go(item:{sequence:number;target:Target}){
+    const view=views.find(v=>v.targets.some(t=>t.sequence===item.sequence));if(!view||unconfirmed(item,'go',view.id))return;
+    void moveFrom(item,()=>options.go({...item.target,sourceTurnId:view.id})).catch(()=>{notices.set(item.sequence,{moved:false});}).then(()=>refresh(view.id));
+  }
+  // Back restores the place the move left.
+  function back(item:{sequence:number}){
+    const view=views.find(v=>v.targets.some(t=>t.sequence===item.sequence)),notice=notices.get(item.sequence),origin=notice?.key&&history.origin(notice.key);
+    if(!view||!notice||!origin||unconfirmed(item,'back',view.id))return;
+    const started=conversationGeneration;
+    void options.act(()=>options.restore(origin)).then(()=>{if(started===conversationGeneration){notices.set(item.sequence,{moved:notice.moved,key:notice.key});refresh(view.id);}});
+  }
+  // A live target moves the page, in order after any earlier one, when the panel is open on an idle page with no dialog,
+  // the target keeps the page's context and nothing on the page is unsaved; otherwise, or once Go has handled it, its
+  // notice offers Go.
+  function consider(turnId:string,item:{sequence:number;target:Target}){
+    const started=conversationGeneration;
+    moving=moving.then(async()=>{
+      if(started!==conversationGeneration||notices.has(item.sequence))return;
+      if(suppressed.has(turnKey(turnId))){notices.set(item.sequence,{moved:false,reason:'You stopped this walkthrough. Choose Go to move yourself.'});refresh(turnId);return;}
+      try{
+        const place=options.place(),review=reviewed(item.target),context=!review&&changesContext(item.target.context,place.context),unsaved=options.unsaved();
+        const shown=opened&&!options.pageBusy()&&!document.querySelector('dialog[open]');
+        if(targetAction({live:shown,changesContext:context,unsaved,review})==='go')
+          notices.set(item.sequence,{moved:false,reason:context?changesView:unsaved?leavesEdits:undefined,confirm:!context&&unsaved?{action:'go',page:place.page}:undefined});
+        else await moveFrom(item,()=>options.open(item.target));
+      }catch{notices.set(item.sequence,{moved:false});}
+      if(started===conversationGeneration)refresh(turnId);
+    });
+  }
+
+  // One event for a turn this panel shows; a repeated sequence changes nothing.
+  function apply(event:TurnEvent,live:boolean){
+    const index=views.findIndex(v=>v.id===event.turnId);
+    if(index<0)throw Error('The assistant’s stream sent an event the panel cannot read.');
+    const before=views[index],after=applyEvent(before,event);
+    if(after===before)return undefined;
+    views[index]=after;
+    if(after.hidden&&presenting?.turnId===after.id)walkthrough.stop('Stopped because access changed.');
+    if(live&&event.kind==='walkthrough'&&askedHere.has(after.id)&&!suppressed.has(turnKey(after.id))&&opened&&!presented.has(planKey(after.id,event.sequence))){const item=after.walkthroughs.at(-1);if(item)void present(after.id,item).catch(error=>announce(message(error,'The walkthrough could not start.')));}
+    if(live&&event.kind==='navigation'&&after.targets.length>before.targets.length&&askedHere.has(after.id)&&!suppressed.has(turnKey(after.id)))consider(after.id,after.targets.at(-1)!);
+    return after;
+  }
+  // A read of the conversation: its turns as their owner reads them, with their events after the panel's last.
+  function take(read:Read){
+    const latestTurn=read.turns.at(-1);
+    conversation={id:read.conversation.id,agentId:read.conversation.agentId,version:latestTurn?.version??conversation?.version??0,
+      readThrough:Math.max(read.conversation.readThrough,conversation?.id===read.conversation.id?conversation.readThrough:0)};
+    for(const turn of read.turns){const prior=views.find(v=>v.id===turn.id);if(!prior)views.push(newTurnView(turn));else if(turn.hidden){prior.hidden=turn.hidden;prior.text='';prior.targets=[];prior.walkthroughs=[];}}
+    views.sort((a,b)=>a.ordinal-b.ordinal);
+    for(const event of readEvents(read))apply(event,false);
+    render();
+  }
+  // A re-read that finds the turn ended finishes it here, as its terminal event would have.
+  async function reread(){
+    if(!conversation)return;
+    const started=conversationGeneration,id=conversation.id,wasRunning=running();
+    try{
+      const read=await options.api<Read>(`assistant/conversations/${id}?after=${lastSequence()}`);
+      if(started===conversationGeneration){take(read);if(wasRunning&&!running())finished();}
+    }
+    catch(caught){if(started===conversationGeneration)refuse(caught,'The conversation could not be read.');}
+    sync();
+  }
+  function refuse(caught:unknown,fallback:string){
+    const code=(caught as {code?:string}).code;
+    if(code==='session_ended'){closeStream();note={text:message(caught,fallback),resume:false,reload:true};}
+    else error=message(caught,fallback);
+  }
+
+  // The stream (§8): fixed names only, each payload validated; terminal, replaced and refused close it, a failure re-reads
+  // once, replay_unavailable re-reads and opens one new stream, and session_ended offers a reload instead of retrying.
+  function openStream(after:number,asked=false){
+    closeStream();if(!conversation)return;
+    const stream=viewEvents(`${options.root}assistant/conversations/${conversation.id}/events?after=${after}`);
+    source=stream;streamLast=after;if(asked)live=stream;
+    for(const name of streamed)stream.addEventListener(name,event=>receive(stream,name,event as MessageEvent<string>));
+    stream.onmessage=()=>broken(stream);
+    stream.onerror=()=>{if(stream.readyState===EventSource.CLOSED)broken(stream);};
+    sync();
+  }
+  function closeStream(){source?.close();source=undefined;}
+  function receive(stream:EventSource,name:string,event:MessageEvent<string>){
+    if(stream!==source)return;
+    let item:StreamItem;
+    try{item=streamFrame(name,name==='replaced'||name==='refused'?null:event.lastEventId||null,event.data);}catch{broken(stream);return;}
+    if(item.kind==='replaced'){closeStream();note={text:'This answer is continuing in another tab or window.',resume:true,reload:false};sync();return;}
+    if(item.kind==='refused'){refused(item.code,item.message);return;}
+    // Every stored event of the turn arrives in sequence; one past a gap means the panel missed one, which a re-read fills.
+    const order=streamOrder(streamLast,item.sequence);
+    if(order==='repeat')return;
+    if(order==='gap'){broken(stream);return;}
+    streamLast=item.sequence;
+    let view:TurnView|undefined;
+    try{view=apply(item,stream===live);}catch{broken(stream);return;}
+    const ends=terminal.includes(item.kind);
+    if(ends)closeStream();
+    if(view)update(view);
+    if(ends)finished();
+    sync();
+  }
+  function broken(stream:EventSource){
+    if(stream!==source)return;
+    closeStream();
+    void reread().then(()=>{if(running()){note={text:'Live updates of this answer stopped. Resume follows it again.',resume:true,reload:false};sync();}});
+  }
+  function refused(code:string,text:string){
+    closeStream();
+    if(code==='session_ended'){note={text,resume:false,reload:true};sync();return;}
+    if(code==='replay_unavailable'&&!reopened){reopened=true;void reread().then(()=>{if(running())openStream(lastSequence());});return;}
+    if(code!=='turn_not_running')note={text,resume:false,reload:false};
+    void reread().then(()=>{if(running()&&note)note={...note,resume:true};sync();});
+  }
+  function finished(){
+    const view=latest();
+    announce(view?.ending&&endingLine(view.ending)||'The answer is complete.');
+    if(opened)void markRead();else unread=true;
+  }
+  // A conversation is marked read once the open panel shows it, not while History covers it.
+  async function markRead(){
+    if(!opened||!conversation||!get('assistant-history').hidden)return;
+    const read=conversation,through=lastSequence();if(through<=read.readThrough)return;
+    try{await options.api('assistant/conversations/read',{conversationId:read.id,through});read.readThrough=Math.max(read.readThrough,through);}
+    catch{/* The conversation stays marked unread in History until a later read mark lands. */}
+  }
+
+  // Asking (§8): a new question has its own request identity; Retry sends the kept one exactly as first sent, whose outcome
+  // a repeat answers. grant_required asks for consent; Allow grants and sends the question again as a new request.
+  async function ask(retry:boolean){
+    if(!available()||working||running())return;
+    let command=retry?asking.command:undefined,agent:UsableAgent|undefined;
+    // A kept request asks the version it named; consent, if the server asks for it, is for that version.
+    if(command){const named=command.body as {agentId:string;version:number};agent=agents.find(a=>a.id===named.agentId&&a.version===named.version);}
+    else{
+      agent=chosen();if(!agent)return;
+      const place=options.place(),knowledge=askKnowledge(place.context);
+      if(lookingKey(place)!==lookedAt){error='The page changed. Check Looking at, then send again.';sync();return;}
+      if(!knowledge||!askable||options.pageBusy()||!question.value.trim()||asking.command)return;
+      command=asking.begin('assistant/turns/ask',{conversationId:conversation?.id??null,agentId:agent.id,version:agent.version,question:question.value,
+        pageReport:place.report,knowledge});
+    }
+    working=true;error='';consent=undefined;sync();
+    const started=identity,previouslyUncertain=asking.sending();keep();
+    try{
+      const answer=await options.api<{turn:Turn}>(command.path,{...command.body,operationId:command.operationId});
+      if(started!==identity)return;
+      asking.clear();keep();if(question.value===command.body.question)question.value='';await accept(answer.turn);
+    }catch(caught){
+      if(started!==identity)return;
+      const code=(caught as {code?:string}).code;
+      asking.failed(code,previouslyUncertain);keep();
+      if(code==='grant_required'&&agent)consent=agent;
+      else{refuse(caught,'Your question could not be sent.');if(asking.command)error=unconfirmedAsk;}
+    }finally{if(started===identity){working=false;sync();}}
+  }
+  // An admitted ask is followed live: in the conversation shown, or in any other, a new one or the one a kept ask named,
+  // read whole first.
+  async function accept(turn:Turn){
+    askedHere.add(turn.id);note=undefined;reopened=false;announce('Answering…');
+    if(conversation?.id!==turn.conversationId){await load(turn.conversationId,true);return;}
+    conversation.version=turn.version;
+    const after=lastSequence();
+    if(!views.some(v=>v.id===turn.id))views.push(newTurnView(turn));
+    persist();render(true);openStream(after,true);
+  }
+  async function stop(){
+    const view=latest();if(!view||view.ending||working)return;
+    working=true;sync();
+    const started=identity;
+    try{await options.api('assistant/turns/stop',{turnId:view.id});}
+    catch(caught){if(started===identity)refuse(caught,'The answer could not be stopped.');}
+    finally{if(started===identity){working=false;sync();if(!source)void reread();}}
+  }
+  async function allow(){
+    const agent=consent;if(!agent||working||options.pageBusy())return;
+    const body={agentId:agent.id,version:agent.version};
+    if(granting.command&&JSON.stringify(granting.command.body)!==JSON.stringify(body))granting.clear();
+    const command=granting.command??granting.begin('assistant/grants/grant',body);
+    working=true;error='';sync();
+    const started=identity,shown=conversationGeneration,previouslyUncertain=granting.sending();
+    try{
+      await options.api(command.path,{...command.body,operationId:command.operationId});
+      if(started!==identity)return;
+      granting.clear();consent=undefined;await readAgents();
+      // The question goes again only to the conversation it was written for.
+      if(started===identity&&shown===conversationGeneration){working=false;await ask(false);}
+    }catch(caught){
+      if(started!==identity)return;
+      granting.failed((caught as {code?:string}).code,previouslyUncertain);
+      refuse(caught,'The agent could not be allowed.');
+      if(granting.command)error='We could not confirm the grant. Allow sends the same grant again.';
+    }finally{if(started===identity){working=false;sync();}}
+  }
+
+  // History (§10.1): each conversation with its agent, latest question and markers; a tab learns of unread answers here.
+  async function openHistory(){
+    get('assistant-history').hidden=false;get('assistant-conversation').hidden=true;get('assistant-history-list').replaceChildren();
+    text('assistant-history-status','Reading your conversations…');get('assistant-history-close').focus();
+    const started=identity;
+    try{
+      const read=await options.api<{conversations:Listed[]}>('assistant/conversations');
+      if(started!==identity||get('assistant-history').hidden)return;
+      text('assistant-history-status',read.conversations.length?running()||working?'Stop or wait for the current answer to open another conversation.':'':'You have no conversations yet.');
+      get('assistant-history-list').replaceChildren(...read.conversations.map(c=>{
+        const item=el('li',c.unread?'unread':''),open=el('button','assistant-history-item');open.type='button';
+        const markers=[displayInstant(c.latestTurn.askedAt,options.zone()),['queued','running','cancel_requested'].includes(c.latestTurn.state)?'Answering':'',
+          c.unread?'Unread':''].filter(Boolean).join(' · ');
+        open.append(el('strong','',c.agentName),el('span','',c.latestTurn.question),el('small','',markers));
+        open.disabled=running()||working;open.onclick=()=>void openConversation(c.id);item.append(open);return item;
+      }));
+    }catch(caught){if(started===identity)text('assistant-history-status',message(caught,'Your conversations could not be read.'));}
+  }
+  function hideHistory(){get('assistant-history').hidden=true;get('assistant-conversation').hidden=false;}
+  function closeHistory(){hideHistory();void markRead();}
+  // Shows a conversation as its owner reads it, following an unfinished turn; `asked` marks the turn as this tab's ask,
+  // whose stream is live.
+  async function load(id:string,asked:boolean){
+    closeStream();conversationGeneration++;walkthrough.clear();presenting=undefined;
+    conversation=undefined;views=[];notices=new Map();note=undefined;error=asking.command?unconfirmedAsk:'';render();sync();
+    const started=conversationGeneration;
+    try{
+      const read=await options.api<Read>(`assistant/conversations/${id}?after=0`);
+      if(started!==conversationGeneration)return;
+      take(read);persist();
+      const keep=chosen();renderPicker(keep?.id===conversation!.agentId?keep:conversationChoice(agents,conversation!.agentId,conversation!.version));
+      if(running()){reopened=false;openStream(lastSequence(),asked);}
+      if(opened)void markRead();else if(lastSequence()>conversation!.readThrough)unread=true;
+    }catch(caught){
+      if(started!==conversationGeneration)return;
+      if((caught as {code?:string}).code==='conversation_not_found'){conversation=undefined;persist();}
+      refuse(caught,'The conversation could not be read.');
+    }
+    sync();
+  }
+  async function openConversation(id:string){if(!running()&&!working){hideHistory();await load(id,false);}}
+  function startOver(){
+    if(running()||working)return;
+    closeStream();conversationGeneration++;walkthrough.clear();presenting=undefined;conversation=undefined;views=[];notices=new Map();note=undefined;error=asking.command?unconfirmedAsk:'';
+    persist();render();sync();question.focus();
+  }
+
+  function renderLooking(){
+    try{
+      const place=options.place(),seen=lookingAt(place.report,place.context,options.names(),{trade:options.trade()});
+      text('assistant-looking-page',seen.page);text('assistant-looking-shows',seen.shows);text('assistant-looking-context',seen.context);
+      get('assistant-looking-layout').hidden=seen.layout===undefined;text('assistant-looking-layout',seen.layout??'');
+      lookedAt=lookingKey(place);askable=seen.askable;
+    }catch{
+      text('assistant-looking-page','This page');text('assistant-looking-shows','The assistant cannot tell what this page shows. Reload it.');
+      text('assistant-looking-context','');get('assistant-looking-layout').hidden=true;text('assistant-looking-layout','');lookedAt='';askable=false;
+    }
+  }
+  function sync(){
+    if(!available()&&opened){show(false,false);return;}
+    launcher.hidden=!available()||!agents.length||!!options.launcherHidden?.();get('assistant-hide').hidden=launcher.hidden||opened||!!options.launcherMinimized?.();launcher.classList.toggle('is-minimized',!!options.launcherMinimized?.());launcher.disabled=false;get('assistant-dot').hidden=!unread;
+    launcher.setAttribute('aria-label',unread?'Assistant · a new answer':'Assistant');
+    if(panel.hidden)return;
+    renderLooking();
+    const turn=running(),agent=chosen(),retained=!!asking.command;
+    picker.disabled=turn||working;question.disabled=false;
+    get<HTMLButtonElement>('assistant-new').disabled=turn||working||!conversation;get<HTMLButtonElement>('assistant-history-open').disabled=false;
+    get<HTMLButtonElement>('assistant-close').disabled=false;
+    send.type=turn?'button':'submit';send.textContent=turn?'Stop answering':'Send';
+    send.disabled=turn?working:working||!agent||!askable||retained||options.pageBusy()||!question.value.trim();
+    get('assistant-retry').hidden=get('assistant-discard').hidden=!retained;
+    get<HTMLButtonElement>('assistant-retry').disabled=get<HTMLButtonElement>('assistant-discard').disabled=working||turn;
+    text('assistant-composer-note',!agents.length?agentsError||'No agent is available to you.':!agent?'Choose an agent to ask.':'');
+    get('assistant-consent').hidden=!consent;
+    if(consent)text('assistant-consent-text',consentText(consent,vendors,grantExpiry(new Date(),consent.grantDays,options.zone())));
+    get<HTMLButtonElement>('assistant-allow').disabled=working||options.pageBusy();get<HTMLButtonElement>('assistant-deny').disabled=working;
+    text('assistant-error',error);get('assistant-error').hidden=!error;
+    get('assistant-stream').hidden=!note;text('assistant-stream-text',note?.text??'');
+    get('assistant-resume').hidden=!note?.resume;get('assistant-reload').hidden=!note?.reload;
+    get<HTMLButtonElement>('assistant-resume').disabled=get<HTMLButtonElement>('assistant-reload').disabled=false;
+    get('assistant-conversation').setAttribute('aria-busy',String(turn));
+  }
+
+  // Keep a usable workspace beside the dock. When both panes cannot fit, overlay the assistant;
+  // temporary window/navigation constraints never replace the browser's chosen width (D45).
+  const widthKey='openetrm.assistant.width';
+  const workspace=document.querySelector('main');
+  const availableWidth=()=>document.documentElement.clientWidth-(workspace?.getBoundingClientRect().left??0);
+  let measuredAvailable=availableWidth(),scrollbarRoom=0;
+  const bounds=()=>{
+    const viewportWidth=document.documentElement.clientWidth,gutter=window.innerWidth-viewportWidth;
+    const available=availableWidth(),min=320;measuredAvailable=available;
+    // Overlaying can shorten the page and remove its scrollbar. Keep room for an
+    // observed gutter when choosing the mode so that it cannot flip back and forth.
+    scrollbarRoom=Math.max(scrollbarRoom,gutter);
+    const dockAvailable=available+gutter-scrollbarRoom;
+    const overlay=window.innerWidth<=760||dockAvailable<640+min;
+    document.body.classList.toggle('assistant-overlay',overlay);
+    return {min,max:Math.max(min,Math.min(720,overlay?Math.round(viewportWidth*.6):available-640))};
+  };
+  let chosenWidth=400;try{chosenWidth=Number(localStorage.getItem(widthKey))||400;}catch{/* The default width is used. */}
+  function setWidth(value:number,save:boolean){
+    const {min,max}=bounds(),next=Math.min(max,Math.max(min,Math.round(value)));
+    document.documentElement.style.setProperty('--assistant-width',`${next}px`);
+    handle.setAttribute('aria-valuemin',String(min));handle.setAttribute('aria-valuemax',String(max));handle.setAttribute('aria-valuenow',String(next));
+    if(!save)return;
+    chosenWidth=next;try{localStorage.setItem(widthKey,String(next));}catch{/* The width holds for this visit. */}
+  }
+  handle.onpointerdown=event=>{
+    event.preventDefault();handle.setPointerCapture(event.pointerId);
+    handle.onpointermove=move=>setWidth(panel.getBoundingClientRect().right-move.clientX,false);
+    const finish=(save:boolean)=>{
+      handle.onpointermove=handle.onpointerup=handle.onpointercancel=null;
+      setWidth(save?Number(handle.getAttribute('aria-valuenow')):chosenWidth,save);
+    };
+    handle.onpointerup=()=>finish(true);
+    handle.onpointercancel=()=>finish(false);
+  };
+  handle.onkeydown=event=>{
+    const step=event.shiftKey?64:16,{min,max}=bounds(),shown=Number(handle.getAttribute('aria-valuenow'));
+    const next=event.key==='ArrowLeft'?shown+step:event.key==='ArrowRight'?shown-step:event.key==='Home'?min:event.key==='End'?max:undefined;
+    if(next!==undefined){event.preventDefault();setWidth(next,true);}
+  };
+  window.addEventListener('resize',()=>setWidth(chosenWidth,false));
+  // Content can add/remove a reserved scrollbar without resizing the window. The
+  // available-width guard ignores the main-width changes caused by dragging itself.
+  let geometryFrame=0;
+  const geometry=new ResizeObserver(()=>{
+    if(availableWidth()===measuredAvailable||geometryFrame)return;
+    geometryFrame=requestAnimationFrame(()=>{
+      geometryFrame=0;
+      if(availableWidth()!==measuredAvailable)setWidth(chosenWidth,false);
+    });
+  });
+  if(workspace)geometry.observe(workspace);
+  const navigation=document.getElementById('app-sidebar');
+  if(navigation)geometry.observe(navigation);
+  setWidth(chosenWidth,false);
+
+  launcher.onclick=()=>{if(options.launcherMinimized?.())options.restoreLauncher?.();show(!opened);};
+  get('assistant-close').onclick=()=>show(false);
+  panel.addEventListener('keydown',event=>{if(event.defaultPrevented)return;if(event.key==='Escape'&&!event.isComposing&&!get('assistant-history').hidden)closeHistory();else if(event.key==='Escape'&&!event.isComposing)show(false);});
+  picker.onchange=()=>{
+    const agent=chosen();
+    try{if(agent)localStorage.setItem(stored('agent'),JSON.stringify({agentId:agent.id,version:agent.version}));else localStorage.removeItem(stored('agent'));}
+    catch{/* The choice holds for this visit. */}
+    consent=undefined;
+    if(conversation&&agent&&agent.id!==conversation.agentId)startOver();else sync();
+  };
+  question.addEventListener('input',()=>{if(error&&!asking.command)error='';sync();});
+  question.addEventListener('keydown',event=>{
+    if(event.key!=='Enter'||event.shiftKey||event.isComposing)return;
+    event.preventDefault();if(!running())get<HTMLFormElement>('assistant-composer').requestSubmit();
+  });
+  get<HTMLFormElement>('assistant-composer').onsubmit=event=>{event.preventDefault();void ask(false);};
+  send.onclick=()=>{if(running())void stop();};
+  get('assistant-retry').onclick=()=>void ask(true);
+  get('assistant-discard').onclick=()=>{if(!working){asking.clear();keep();error='';sync();}};
+  get('assistant-allow').onclick=()=>void allow();
+  get('assistant-deny').onclick=()=>{if(!working){consent=undefined;sync();question.focus();}};
+  get('assistant-history-open').onclick=()=>void openHistory();
+  get('assistant-history-close').onclick=closeHistory;
+  get('assistant-new').onclick=startOver;
+  get('assistant-resume').onclick=()=>{note=undefined;reopened=false;if(running())openStream(lastSequence());else void reread();sync();};
+  get('assistant-reload').onclick=()=>location.reload();
+
+  return {sync,working:()=>working,
+    /** Opens the panel with `text` in the composer to start from, unless it already holds a question. */
+    draft(text:string){
+      if(!available())return;
+      show(true,false);
+      if(!question.value&&!asking.command)question.value=publicText(text);
+      sync();question.focus();
+    },
+    // An identity starts with nothing of the last one: its own agents, and the conversation and open panel this tab kept.
+    reset(){
+      identity++;conversationGeneration++;walkthrough.clear();closeStream();presenting=undefined;actions.reset();
+      suppressed.clear();presented.clear();progress.clear();resumeReports.clear();takenOver.clear();
+      agents=[];vendors=[];agentsError='';conversation=undefined;views=[];notices=new Map();askedHere=new Set();history.clear();stepsOpen.clear();
+      granting.clear();consent=undefined;note=undefined;error='';unread=false;working=false;moving=Promise.resolve();live=undefined;
+      opened=false;panel.hidden=true;document.body.classList.remove('assistant-open');hideHistory();render();renderPicker(undefined);question.value='';
+      asking.clear();sync();if(!options.available())return;
+      let saved:{conversationId?:unknown;open?:unknown}|null=null,kept:string|null=null;
+      try{saved=JSON.parse(sessionStorage.getItem(stored('panel'))??'null');kept=sessionStorage.getItem(stored('ask'));}catch{/* Invalid browser state restores nothing. */}
+      asking.command=keptAsk(kept);if(asking.command){question.value=String(asking.command.body.question);error=unconfirmedAsk;}
+      const started=identity;
+      void readAgents().then(async()=>{
+        if(started!==identity||!agents.length)return;
+        if(isUuid(saved?.conversationId))await load(saved!.conversationId as string,false);
+        if(started===identity&&saved?.open===true)show(true,false);
+      });
+    }};
+}

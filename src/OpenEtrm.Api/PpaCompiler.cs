@@ -1,0 +1,352 @@
+using System.Collections.Immutable;
+using System.Text.Json;
+using System.Globalization;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.Power;
+using OpenEtrm.MarketData.Trading;
+using OpenEtrm.Shared.Temporal;
+
+namespace OpenEtrm.Api;
+
+// Compilation reads sealed definitions only. Market inputs and quantity histories belong to preview.
+internal static class PpaCompiler
+{
+    internal const int MaximumMembers=8,MaximumAssets=100,MaximumBindings=256;
+    internal const long MaximumRequestRows=2_000_000,MaximumDetailRows=35_136;
+    internal const int MaximumResponseBytes=8*1024*1024;
+    internal static MarketDataException Error(string code,string message)=>new(code,message);
+    internal static DateOnly Day(string? value)=>DateOnly.TryParseExact(value,"yyyy-MM-dd",CultureInfo.InvariantCulture,DateTimeStyles.None,out var day)?day:throw Error("ppa_term","Use an explicit ISO operating date.");
+    internal static ExactDecimal Number(string? value)=>ExactDecimal.Parse(value??"");
+    internal static ExactDecimal Mw(string? value)
+    {var n=Number(value);if(n.CompareTo(default)<=0)throw Error("ppa_quantity","Contract MW must be positive.");return n;}
+    internal static PpaRole Role(string? value)=>value switch {
+        "energy_delivery"=>PpaRole.EnergyDelivery,"certificate_delivery"=>PpaRole.CertificateDelivery,"capacity_delivery"=>PpaRole.CapacityDelivery,
+        "strike_payment"=>PpaRole.StrikePayment,"indexed_payment"=>PpaRole.IndexedPayment,"fixed_charge"=>PpaRole.FixedCharge,
+        "certificate_payment"=>PpaRole.CertificatePayment,"capacity_payment"=>PpaRole.CapacityPayment,_=>throw Error("ppa_side","Select an explicit supported role.")};
+    internal static string Role(PpaRole value)=>value switch {PpaRole.EnergyDelivery=>"energy_delivery",PpaRole.CertificateDelivery=>"certificate_delivery",PpaRole.CapacityDelivery=>"capacity_delivery",PpaRole.StrikePayment=>"strike_payment",PpaRole.IndexedPayment=>"indexed_payment",PpaRole.FixedCharge=>"fixed_charge",PpaRole.CertificatePayment=>"certificate_payment",PpaRole.CapacityPayment=>"capacity_payment",_=>throw Error("ppa_side","Unknown role.")};
+    internal static void Size(PpaTermsInput? input)
+    {
+        if(input is null || input.Delivery is null || input.Memberships is null || input.NormalizationAssets is null)throw Error("ppa_term","Supply complete instrument terms.");
+        if(input.Memberships.Length is <2 or >MaximumMembers || input.NormalizationAssets.Length>MaximumAssets)throw Error("ppa_limit","Instrument composition exceeds the bounded consumer.");
+        var from=Day(input.Delivery.From);var to=Day(input.Delivery.To);var minutes=input.Delivery.IntervalMinutes;
+        if(minutes is not(15 or 60))throw Error("ppa_cadence","Select native 15- or 60-minute delivery.");
+        if((to.Year-from.Year)*12+to.Month-from.Month>(minutes==60?360:120))throw Error("ppa_size","Delivery exceeds the selected cadence limit.");
+        foreach(var m in input.Memberships)
+        {
+            if(m?.Side?.Quantity is not {} q || m.Side.PaymentRule is null || q.Sources is null || q.Assets is null || q.Slots is null || q.Slots.Any(x=>x is null) || q.Sources.Any(string.IsNullOrWhiteSpace) || q.Assets.Any(string.IsNullOrWhiteSpace))throw Error("ppa_term","Supply complete side terms.");
+            if(q.Sources.Length>MaximumAssets || q.Assets.Length>MaximumAssets || q.Slots.Length>MaximumMembers || m.Side.FixedPrice?.Steps is {Length:>360})throw Error("ppa_limit","Side arrays exceed supported limits.");
+        }
+    }
+    internal static async Task<ImmutableDictionary<VolumeSourceKey,ReferenceKey>> ReadQuantityTypes(Npgsql.NpgsqlConnection connection,
+        PreviewData data,PpaTermsInput input,CancellationToken ct)
+    {
+        Size(input);
+        var sources=input.Memberships.Where(m=>m.Side.Quantity.Kind=="volume").SelectMany(m=>m.Side.Quantity.Sources)
+            .Distinct(StringComparer.Ordinal).Select(code=>PpaQuantitiesStore.Source(data,code)).ToArray();
+        if(sources.Length==0)return ImmutableDictionary<VolumeSourceKey,ReferenceKey>.Empty;
+        var metadata=await PreviewDatabase.Rows(connection,"SELECT market_data.read_interval_series_header(id)::text FROM unnest($1::uuid[])id",
+            [sources.Select(s=>s.MeteredSeries).Distinct().ToArray()],ct);
+        if(metadata.Any(row=>row.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)||metadata.Length!=sources.Select(s=>s.MeteredSeries).Distinct().Count())
+            throw new PreviewDeniedException();
+        var headers=metadata.ToDictionary(row=>row.Id("id"));
+        return sources.ToImmutableDictionary(source=>source.Key,source=>
+        {
+            var header=headers[source.MeteredSeries];
+            if(header.Id("catalog_id")!=data.DefinitionRevision.CatalogId||header.Id("reference_catalog_id")!=data.ReferenceRevision.CatalogId||
+                header.Id("reference_revision_id")!=data.ReferenceRevision.RevisionId)
+                throw Error("ppa_reference_revision","Every selected quantity source header must retain the exact definition and reference catalogs.");
+            if(header.Text("kind")!="metered_energy"||header.Text("clock_code")!=source.Clock.Code||
+                int.Parse(header.Text("interval_minutes"),CultureInfo.InvariantCulture)!=source.IntervalMinutes||header.OptionalText("quantity_code") is not {} code)
+                throw Error("ppa_quantity_unit","Every selected meter must declare its exact native energy unit, clock and cadence.");
+            return PpaQuantitiesStore.Quantity(data,code).Key;
+        });
+    }
+    internal static PpaInstrument Compile(PreviewData data,PpaTermsInput input,IReadOnlyList<TouProductVersion> products,
+        IReadOnlyDictionary<VolumeSourceKey,ReferenceKey> quantityTypes,Guid? instrumentId=null,IReadOnlyDictionary<SideSlot,Guid>? sideIds=null)
+    {
+        Size(input);
+        if(quantityTypes is null)throw Error("ppa_quantity_unit","Supply the explicitly selected quantity source headers before compiling sides.");
+        if(input.DefinitionRevisionId!=data.DefinitionRevision.RevisionId)throw Error("ppa_definition_revision","Instrument terms require the selected exact definition revision.");
+        if(new ReferenceRevision(input.ReferenceCatalogId,input.ReferenceRevisionId)!=data.ReferenceRevision)throw Error("ppa_reference_revision","Instrument terms require the selected exact reference revision.");
+        ReferenceKey R(string code)=>new(data.ReferenceRevision,code);
+        ReferenceKey Reference(string table,string code){One(data.References[table],code);return R(code);}
+        var currency=Reference("currencies",input.Currency);var unit=PpaQuantitiesStore.Quantity(data,input.UnitQuantity);
+        if(unit.Unit.Code!="megawatt" || unit.Dimension.Code!="power")throw Error("ppa_quantity_unit","The contract unit is exactly one MW.");
+        var clock=input.RetainedClock??PpaQuantitiesStore.Clock(data,input.Delivery.Clock).CaptureForDelivery(Day(input.Delivery.From),Day(input.Delivery.To));
+        var delivery=new PpaDelivery(R(input.Delivery.Clock),input.Delivery.IntervalMinutes,Day(input.Delivery.From),Day(input.Delivery.To));
+        var allAssets=input.NormalizationAssets.Length==0?ImmutableArray<GenerationAsset>.Empty:PpaQuantitiesStore.Assets(data,input.NormalizationAssets);
+        var normalization=new PpaNormalization([..allAssets.Select(a=>a.Key)],unit.Key,
+            allAssets.IsEmpty?PpaNormalizationPolicy.ContractUnit:PpaNormalizationPolicy.SumCapacityInForce);
+        VolumeQuantity Volume(PpaQuantityInput quantity)
+        {
+            var sources=quantity.Sources.Select(code=>PpaQuantitiesStore.Source(data,code).Key).ToImmutableArray();
+            var energies=sources.Select(source=>quantityTypes.TryGetValue(source,out var energy)?energy:
+                throw Error("ppa_quantity_unit","A selected volume source has no exact authorized quantity header.")).Distinct().ToArray();
+            if(energies.Length!=1)throw Error("ppa_quantity_unit","Volume contributions require one identical exact native energy unit.");
+            return new(sources,PpaQuantitiesStore.Stage(quantity.Stage),energies[0]);
+        }
+        ImmutableArray<ExactDecimal> HourlyFactors(PpaQuantityInput q)
+        {
+            var value=q.HourlyProfile;
+            if(value.ValueKind==System.Text.Json.JsonValueKind.Undefined)return [];
+            if(q.Kind!="profile"||value.ValueKind!=System.Text.Json.JsonValueKind.Object||value.EnumerateObject().Count()!=2||
+                !value.TryGetProperty("implementation",out var implementation)||implementation.ValueKind!=System.Text.Json.JsonValueKind.String||implementation.GetString()!=ContractProfileQuantity.HourlyProfile||
+                !value.TryGetProperty("factors",out var factors)||factors.ValueKind!=System.Text.Json.JsonValueKind.Array||factors.GetArrayLength()!=24||
+                factors.EnumerateArray().Any(v=>v.ValueKind!=System.Text.Json.JsonValueKind.String))
+                throw Error("ppa_profile_shape","Supply the versioned 24-local-hour contractual MW profile explicitly.");
+            return [..factors.EnumerateArray().Select(v=>Number(v.GetString()))];
+        }
+        PpaQuantity Quantity(PpaQuantityInput q,SideCalendarPolicy policy)
+        {
+            var hourly=HourlyFactors(q);
+            if(q.Sources.Distinct().Count()!=q.Sources.Length || q.Assets.Distinct().Count()!=q.Assets.Length)throw Error("ppa_quantity_reference","Quantity references must be distinct.");
+            return q.Kind switch {
+                "volume" when q.Sources.Length>0 && q.Assets.Length==0 && q.Slots.Length==0 && q.Capacity is null && q.Energy is null && q.Hours is null => Volume(q),
+                "profile" when q.Sources.Length==0 && q.Assets.Length==0 && q.Slots.Length==0 && q.Stage is null && q.Capacity is not null && q.Energy is not null && q.Hours is not null=>new ProfileQuantity(PpaQuantitiesStore.Quantity(data,q.Capacity).Key,PpaQuantitiesStore.Quantity(data,q.Energy).Key,Hours(data,q.Hours,delivery,products,policy)){HourlyFactors=hourly},
+                "slots" when q.Sources.Length==0 && q.Assets.Length==0 && q.Slots.Length>0 && q.Stage is null && q.Capacity is null && q.Energy is null && q.Hours is null=>new SlotQuantity([..q.Slots.Select(t=>new SideSlot(Role(t.Role),t.Ordinal))]),
+                "accredited" when q.Sources.Length==0 && q.Assets.Length>0 && q.Slots.Length==0 && q.Stage is null && q.Capacity is null && q.Energy is null && q.Hours is null=>new AccreditedQuantity([..PpaQuantitiesStore.Assets(data,q.Assets).Select(a=>a.Key)]),
+                _=>throw Error("ppa_quantity_reference","Select exactly one explicit quantity variant, with unused fields null or empty.")};
+        }
+        var slots=input.Memberships.Select(m=>new SideSlot(Role(m.Role),m.Ordinal)).ToArray();
+        if(slots.Distinct().Count()!=slots.Length)throw Error("ppa_instrument","Side slots must be unique.");
+        var calendars=input.Memberships.Select((m,n)=>(Slot:slots[n],Policy:SideCalendarPolicies.Resolve(data,m.Side.CalendarPolicy))).ToDictionary(p=>p.Slot,p=>p.Policy);
+        foreach(var member in input.Memberships)calendars[new(Role(member.Role),member.Ordinal)].RequirePurposes(member.Side.Quantity.Kind!="slots",member.Side.Kind=="indexed",true);
+        var quantities=input.Memberships.Select((m,n)=>(Slot:slots[n],Quantity:Quantity(m.Side.Quantity,calendars[slots[n]]))).ToDictionary(p=>p.Slot,p=>p.Quantity);
+        var schedules=new Dictionary<SideSlot,IntervalScheduleParameters>();var resolving=new HashSet<SideSlot>();
+        IntervalScheduleParameters Schedule(SideSlot slot)
+        {
+            if(schedules.TryGetValue(slot,out var retained))return retained;
+            if(!quantities.TryGetValue(slot,out var quantity)||!resolving.Add(slot))throw Error("ppa_quantity_reference","Every quantity slot must resolve to a declared acyclic delivery schedule.");
+            IntervalScheduleParameters result;
+            if(quantity is SlotQuantity linked)
+            {
+                if(linked.Slots.IsDefaultOrEmpty)throw Error("ppa_quantity_reference","Select explicit delivery slots.");
+                var selected=linked.Slots.Select(Schedule).ToArray();result=selected[0];
+                var identity=DefinitionIdentity.For(result);
+                if(selected.Any(s=>DefinitionIdentity.For(s)!=identity))throw Error("ppa_cadence","Bound delivery slots require identical native schedules.");
+            }
+            else result=quantity switch
+            {
+                AccreditedQuantity=>new(delivery,clock,IntervalScheduleCadence.OperatingMonths,null),
+                ProfileQuantity profile=>new(delivery,clock,IntervalScheduleCadence.NativeIntervals,profile.Hours),
+                VolumeQuantity=>new(delivery,clock,IntervalScheduleCadence.NativeIntervals,new(BlockMembership.All,null,[])),
+                _=>throw Error("ppa_quantity_reference","Select a supported explicit quantity schedule.")
+            };
+            resolving.Remove(slot);schedules.Add(slot,result);return result;
+        }
+        var members=input.Memberships.Select(m=>
+        {
+            var slot=new SideSlot(Role(m.Role),m.Ordinal);var s=m.Side;var quantity=quantities[slot];var policy=calendars[slot];
+            var fixedPrice=s.FixedPrice is null?null:Fixed(data,currency,s.FixedPrice);
+            var indexedPrice=s.IndexPrice is null?null:Index(data,currency,s.IndexPrice,delivery);
+            var denominator=fixedPrice?.Unit.Quantity??indexedPrice?.Adder.Unit.Quantity;
+            ReferenceKey NativeQuantity()=>s.Kind switch
+            {
+                "fixed" or "indexed"=>denominator??throw Error("ppa_quantity_unit","A payment requires its explicit native price denominator."),
+                "certificate" or "capacity" when s.Attribute is {} attribute=>PpaQuantitiesStore.Quantity(data,attribute.Quantity).Key,
+                "energy" when quantity is ProfileQuantity profile=>profile.Energy,
+                "energy" when quantity is VolumeQuantity volume=>volume.Energy,
+                _=>throw Error("ppa_quantity_unit","Select an explicit native quantity output for this side.")
+            };
+            var ports=quantity is SlotQuantity linked
+                ?linked.Slots.Select(target=>new ScheduleInputPort(target,denominator??throw Error("ppa_quantity_reference","A quantity input port requires an explicit price denominator."),Schedule(target))).ToImmutableArray()
+                :ImmutableArray<ScheduleInputPort>.Empty;
+            var terms=new PpaSideTerms(delivery,quantity,currency,new(Number("1"),unit.Key),Payment(data,s.PaymentRule,policy),Schedule(slot),NativeQuantity(),normalization,ports);
+            var id=sideIds is not null && sideIds.TryGetValue(slot,out var retained)?retained:Guid.NewGuid();
+            Side side=s.Kind switch {
+                "energy" when s.Location is not null && s.FixedPrice is null && s.IndexPrice is null && s.Attribute is null=>new PowerPhysicalSide(id,terms,Reference("locations",s.Location),policy),
+                "fixed" when s.Location is null && fixedPrice is not null && s.IndexPrice is null && s.Attribute is null=>new FixedSide(id,terms,fixedPrice,policy),
+                "indexed" when s.Location is null && s.FixedPrice is null && indexedPrice is not null && s.Attribute is null=>new FloatingSide(id,terms,indexedPrice,policy),
+                "certificate" when s.Location is null && s.FixedPrice is null && s.IndexPrice is null && s.Attribute is {Rule:null,Conversion:not null,Eligibility:not null,Holding:not null,Disposition:not null} a=>new CertificateDeliverySide(id,terms,PpaQuantitiesStore.Quantity(data,a.Quantity).Key,Number(a.Conversion),a.Eligibility,a.Holding,a.Disposition,policy),
+                "capacity" when s.Location is null && s.FixedPrice is null && s.IndexPrice is null && s.Attribute is {Rule:not null,Conversion:null,Eligibility:null,Holding:null,Disposition:null} a=>new CapacityDeliverySide(id,terms,PpaQuantitiesStore.Quantity(data,a.Quantity).Key,a.Rule,policy),
+                _=>throw Error("ppa_side","Select exactly one explicit side variant, with unused fields null.")};
+            return new PpaMembership(slot,side,Number(m.Coefficient));
+        }).ToImmutableArray();
+        var instrument=new PpaInstrument(instrumentId??Guid.NewGuid(),data.DefinitionRevision,data.ReferenceRevision,members,input.Discounting,input.Implementation);
+        // Validate calendar generation and price coverage without reading any market observations.
+        foreach(var member in instrument.Memberships)
+            for(var month=delivery.From;month<delivery.To;month=month.AddMonths(1))
+            {member.Side.Terms.DateRule.Generate(month,month.AddMonths(1));if(member.Side is FixedSide fixedSide){fixedSide.Price.At(month);fixedSide.Price.At(month.AddMonths(1).AddDays(-1));}}
+        return instrument;
+    }
+    internal static async Task ValidateDefinitions(Npgsql.NpgsqlConnection connection,PreviewData data,PpaInstrument instrument,CancellationToken ct)
+    {
+        var assets=instrument.NormalizationAssets.IsEmpty?ImmutableArray<GenerationAsset>.Empty:PpaQuantitiesStore.Assets(data,[..instrument.NormalizationAssets.Select(a=>a.Code)]);
+        var outputs=new Dictionary<SideSlot,ReferenceKey>();
+        foreach(var m in instrument.Memberships.Where(m=>m.Side.Terms.Quantity is not SlotQuantity))
+        {
+            var side=m.Side;ReferenceKey output;
+            switch(side.Terms.Quantity)
+            {
+                case ProfileQuantity p:
+                    _=new ContractProfileQuantity(PpaQuantitiesStore.Clock(data,instrument.Delivery.Clock.Code),instrument.Delivery.IntervalMinutes,p.Hours,PpaQuantitiesStore.Quantity(data,p.Capacity.Code),PpaQuantitiesStore.Quantity(data,p.Energy.Code));output=p.Energy;break;
+                case VolumeQuantity v:
+                    var sources=v.Sources.Select(s=>PpaQuantitiesStore.Source(data,s.Code)).ToArray();
+                    if(sources.Length!=assets.Length || sources.Select(s=>s.Asset).Distinct().Count()!=sources.Length || !sources.Select(s=>s.Asset).ToHashSet().SetEquals(instrument.NormalizationAssets))throw Error("ppa_normalization","Every volume side requires one contribution from every declared normalization asset.");
+                    if(sources.Any(s=>s.Clock!=instrument.Delivery.Clock || s.IntervalMinutes!=instrument.Delivery.IntervalMinutes) || assets.Any(a=>a.Clock!=instrument.Delivery.Clock))throw Error("ppa_cadence","Sources and assets must retain the exact native delivery clock and cadence.");
+                    var metadata=await PreviewDatabase.Rows(connection,"SELECT market_data.read_interval_series_header(id)::text FROM unnest($1::uuid[])id",[sources.Select(s=>s.MeteredSeries).ToArray()],ct);
+                    if(metadata.Any(r=>r.ValueKind==JsonValueKind.Null)||metadata.Length!=sources.Select(s=>s.MeteredSeries).Distinct().Count())throw new PreviewDeniedException();
+                    var energies=metadata.Select(r=>r.OptionalText("quantity_code")).Distinct().ToArray();
+                    if(energies.Length!=1 || energies[0] is not {} code)throw Error("ppa_quantity_unit","Every meter declares one identical exact energy specification.");
+                    var energy=PpaQuantitiesStore.Quantity(data,code);output=energy.Key;
+                    foreach(var asset in assets)_=new ContractProfileQuantity(asset.OperatingClock,instrument.Delivery.IntervalMinutes,new(BlockMembership.All,null,[]),asset.CapacityQuantity,energy);
+                    if(side is PowerPhysicalSide physical && assets.Any(a=>a.Location!=physical.Location))throw Error("ppa_delivery_location","Every energy asset must deliver at the declared physical location.");
+                    break;
+                case AccreditedQuantity a when side is CapacityDeliverySide capacity:
+                    if(!a.Assets.ToHashSet().SetEquals(instrument.NormalizationAssets) || assets.Any(asset=>asset.Clock!=instrument.Delivery.Clock))throw Error("ppa_normalization","Capacity requires the same exact asset set and delivery clock.");
+                    var target=PpaQuantitiesStore.Quantity(data,capacity.CapacityQuantity.Code);
+                    if(target.Unit.Code!="megawatt_day" || target.Dimension.Code!="energy" || assets.Any(asset=>asset.CapacityQuantity.Commodity!=target.Commodity))throw Error("ppa_quantity_unit","Capacity entitlement requires MW-day of the same exact commodity.");output=target.Key;break;
+                default:throw Error("ppa_quantity_reference","Unsupported side quantity binding.");
+            }
+            if(side is CertificateDeliverySide certificate)
+            {
+                var target=PpaQuantitiesStore.Quantity(data,certificate.CertificateQuantity.Code);
+                if(target.Dimension.Code!="certificate" || target.Commodity!=PpaQuantitiesStore.Quantity(data,output.Code).Commodity)throw Error("ppa_quantity_unit","Certificate output requires the same commodity and certificate dimension.");output=target.Key;
+            }
+            outputs.Add(m.Slot,output);
+        }
+        var declared=instrument.Memberships.SelectMany(m=>m.Side.Terms.Quantity switch {VolumeQuantity v=>v.Sources.Select(s=>PpaQuantitiesStore.Source(data,s.Code).Asset),AccreditedQuantity a=>a.Assets,_=>[]}).ToHashSet();
+        if(!declared.SetEquals(instrument.NormalizationAssets))throw Error("ppa_normalization","Normalization assets must equal the instrument's declared asset-derived sources.");
+        foreach(var m in instrument.Memberships)
+        {
+            var output=m.Side.Terms.Quantity is SlotQuantity slots?slots.Slots.Select(s=>outputs[s]).Distinct().ToArray():[outputs[m.Slot]];
+            if(output.Length!=1)throw Error("ppa_quantity_unit","Bound delivery slots require one exact quantity specification.");
+            var price=m.Side switch {FixedSide f=>f.Price.Unit,FloatingSide f=>f.Price.Adder.Unit,_=>null};
+            if(price is not null && price.Quantity!=output[0])throw Error("ppa_quantity_unit","The price denominator must match the bound quantity.");
+            if(m.Side is FloatingSide floating)
+            {
+                var code=floating.Price.Curve.Code;
+                if(IntervalCurveDefinitions.IsShaped(data,code))code=data.Definitions["shaped_curve_blocks"].First(b=>b.Text("shaped_curve_code")==code && b.Text("anchor_role")=="period").Text("block_curve_code");
+                var row=One(data.Definitions["curves"],code);var quote=PriceUnit.FromQuote(data.QuoteRows(row.Text("quote_code")).Single());
+                if(quote!=price)throw Error("ppa_quantity_unit","Indexed price units must match the exact curve quote.");
+            }
+        }
+    }
+    internal static DeliveryCoverage Coverage(PpaInstrument instrument,PowerClock clock,string? from,string? to)
+    {
+        var span=new DeliveryCoverage(IntervalSeriesStore.ParseInstant(from??""),IntervalSeriesStore.ParseInstant(to??""));
+        var term=new DeliveryCoverage(clock.StartOfDay(instrument.Delivery.From).ToUniversalTime(),clock.StartOfDay(instrument.Delivery.To).ToUniversalTime());
+        if(!term.Contains(span.From,span.To))throw Error("ppa_segment_coverage","Coverage must remain inside the full instrument term.");
+        DeliveryCoverage.ValidateForwardBoundary(span.From,term.From,clock,instrument.Delivery.IntervalMinutes);
+        DeliveryCoverage.ValidateForwardBoundary(span.To,term.From,clock,instrument.Delivery.IntervalMinutes);
+        if(instrument.Memberships.Any(m=>m.Side is CapacityDeliverySide) && (!MonthBoundary(clock,span.From) || !MonthBoundary(clock,span.To)))throw Error("ppa_segment_boundary","Capacity coverage requires whole operating months.");
+        return span;
+    }
+    private static bool MonthBoundary(PowerClock clock,DateTimeOffset value)
+    {var day=DateOnly.FromDateTime(value.UtcDateTime);return Enumerable.Range(-1,3).Select(day.AddDays).Any(d=>d.Day==1 && clock.StartOfDay(d).ToUniversalTime()==value);}
+    internal const long MaximumPreparationCells=4_000_000;
+    internal static void PreflightWork(IEnumerable<(PpaTermsInput Terms,string From,string To,string Identity)> bindings)
+    {
+        long cells=0;foreach(var b in bindings.DistinctBy(b=>(b.Identity,b.From,b.To)))
+        {
+            Size(b.Terms);var from=IntervalSeriesStore.ParseInstant(b.From);var to=IntervalSeriesStore.ParseInstant(b.To);
+            if(from>=to)throw Error("ppa_segment_coverage","Coverage must be ordered.");
+            // Preparation and evaluated schedule rows have separate budgets. Monthly
+            // capacity never expands into hourly valuation rows; asset contributions
+            // do not multiply the instrument's normalized output schedule.
+            var native=b.Terms.Memberships.Any(m=>m.Side.Quantity.Kind is "volume" or "profile");
+            var capacity=b.Terms.Memberships.Any(m=>m.Side.Quantity.Kind=="accredited");
+            if(!native&&!capacity)throw Error("ppa_quantity_reference","Preparation requires explicit native or accredited quantity sources.");
+            // Repeated memberships reuse the same source grid. A separately
+            // declared daily grid does not replace native source preparation.
+            var cellsPerAsset=(native?(long)Math.Ceiling((to-from).TotalMinutes/b.Terms.Delivery.IntervalMinutes):0)+
+                (capacity?(long)Math.Ceiling((to-from).TotalDays)+1:0);
+            cells=checked(cells+cellsPerAsset*Math.Max(1,b.Terms.NormalizationAssets.Length));
+            if(cells>MaximumPreparationCells)throw Error("ppa_limit","The complete request exceeds the explicit quantity-preparation cell budget.");
+        }
+    }
+    internal static long Work(IEnumerable<(PpaInstrument Instrument,DeliveryCoverage Coverage)> bindings,ImmutableHashSet<DateOnly> detailMonths,Func<PpaInstrument,PowerClock> clock)
+    {
+        var selected=bindings.ToArray();long rows=0,detail=0;
+        var counts=new Dictionary<(Guid,DeliveryCoverage),(long Rows,long Detail)>();
+        foreach(var (i,c) in selected)
+        {
+            if(!counts.TryGetValue((i.Id,c),out var count))
+            {
+                var operatingClock=clock(i);long total=0,detailed=0;
+                for(var month=i.Delivery.From;month<i.Delivery.To;month=month.AddMonths(1))
+                {
+                    var first=operatingClock.StartOfDay(month).ToUniversalTime();var last=operatingClock.StartOfDay(month.AddMonths(1)).ToUniversalTime();
+                    var from=first>c.From?first:c.From;var to=last<c.To?last:c.To;if(from>=to)continue;
+                    var native=(to-from).Ticks/TimeSpan.FromMinutes(i.Delivery.IntervalMinutes).Ticks;
+                    var bySlot=new Dictionary<SideSlot,long>();
+                    long Count(PpaMembership member)
+                    {
+                        if(bySlot.TryGetValue(member.Slot,out var result))return result;
+                        result=member.Side.Terms.Quantity switch
+                        {
+                            AccreditedQuantity=>1,
+                            VolumeQuantity=>native,
+                            ProfileQuantity p when p.Hours.Membership==BlockMembership.All=>native,
+                            ProfileQuantity p=>PowerHours.Compile(month,month.AddMonths(1),operatingClock,IntervalBlocks.Mask(p.Hours.Membership,i.Delivery.IntervalMinutes,p.Hours.Peak),
+                                [..p.Hours.Holidays.Where(d=>d>=month && d<month.AddMonths(1))],i.Delivery.IntervalMinutes).LongCount(p=>p.Start>=from && p.End<=to),
+                            SlotQuantity q=>Count(i.Memberships.Single(m=>m.Slot==q.Slots[0])),
+                            _=>throw Error("ppa_quantity","Select a supported explicit quantity schedule.")
+                        };
+                        bySlot.Add(member.Slot,result);return result;
+                    }
+                    foreach(var member in i.Memberships){var n=Count(member);total=checked(total+n);if(detailMonths.Contains(month))detailed=checked(detailed+n);}
+                }
+                count=(total,detailed);counts.Add((i.Id,c),count);rows=checked(rows+total);
+            }
+            // Returned rows expand per binding even when its calculation reuses.
+            detail=checked(detail+count.Detail);
+            if(rows>MaximumRequestRows || detail>MaximumDetailRows)throw Error("ppa_limit","The complete request exceeds its evaluated-row or returned detail-row budget.");
+        }
+        return rows;
+    }
+    private static DeliveryHours Hours(PreviewData data,PpaHoursInput h,PpaDelivery d,IReadOnlyList<TouProductVersion> products,SideCalendarPolicy policy)
+    {
+        if(h.Calendar is not null)throw Error("side_calendar_conflict","Select delivery calendars in the Side policy.");
+        var membership=PowerPreview.Membership(h.Membership);TouPeak? peak=null;
+        if(membership==BlockMembership.All){if(h.TouProduct is not null || h.TouVersion is not null)throw Error("ppa_term","All hours has no TOU product.");}
+        else
+        {
+            var p=products.SingleOrDefault(p=>p.Id==h.TouProduct && p.Version==h.TouVersion && p.State=="published")??throw Error("ppa_term","Select an exact published TOU version.");
+            return p.Binding(data.DefinitionRevision.CatalogId).Bind(membership,d.Clock,policy,d.From,d.To);
+        }
+        return new(membership,peak,policy.For(CalendarPurpose.Delivery).Closures(d.From,d.To));
+    }
+    private static PaymentRule Payment(PreviewData data,PpaPaymentInput p,SideCalendarPolicy policy)
+    {
+        if(p.Calendar is not null)throw Error("side_calendar_conflict","Select payment calendars in the Side policy.");
+        var binding=policy.For(CalendarPurpose.Payment);
+        PaymentCalendar? calendar=p.DayBasis=="business_days"||p.Adjustment!="unadjusted"?new(binding.Key,binding.BusinessDays):null;
+        return new(SwapPaymentOptions.Parse(SwapPaymentOptions.Frequencies,p.Frequency),SwapPaymentOptions.Parse(SwapPaymentOptions.Rules,p.Rule),p.Days,p.DayOfMonth,
+            p.DayBasis is null?null:SwapPaymentOptions.Parse(SwapPaymentOptions.DayBases,p.DayBasis),p.ShortMonth is null?null:SwapPaymentOptions.Parse(SwapPaymentOptions.ShortMonths,p.ShortMonth),SwapPaymentOptions.Parse(SwapPaymentOptions.Adjustments,p.Adjustment),calendar,p.Implementation);
+    }
+    private static FixedPriceTerm Fixed(PreviewData data,ReferenceKey currency,PpaFixedInput p)
+    {
+        if(p.Steps is null || p.Steps.Any(x=>x is null))throw Error("ppa_price_rule","Explicit strike steps are required.");
+        var unit=new PriceUnit(currency,PpaQuantitiesStore.Quantity(data,p.Quantity).Key,Number(p.Multiplier));
+        return p.Kind switch {
+            "flat" when p.Price is not null && p.Rate is null && p.BaseDate is null && p.Basis is null && p.Steps.Length==0=>new FlatPrice(new(Number(p.Price),unit)),
+            "escalated" when p.Price is not null && p.Rate is not null && p.BaseDate is not null && p.Basis=="anniversary_step_v1" && p.Steps.Length==0=>new EscalatedPrice(new(Number(p.Price),unit),Number(p.Rate),Day(p.BaseDate),ContractYearBasis.AnniversaryStep),
+            "stepped" when p.Price is null && p.Rate is null && p.BaseDate is null && p.Basis is null && p.Steps.Length>0=>new SteppedPrice([..p.Steps.Select(s=>new PriceStep(Day(s.From),new(Number(s.Price),unit)))]),
+            _=>throw Error("ppa_price_rule","Select one explicit supported fixed price variant.")};
+    }
+    private static IndexPrice Index(PreviewData data,ReferenceKey currency,PpaIndexInput p,PpaDelivery delivery)
+    {
+        var curves=data.Definitions["curves"].Where(r=>r.Text("code")==p.Curve).ToArray();
+        var shaped=data.Definitions["shaped_curves"].Count(r=>r.Text("code")==p.Curve);
+        if(curves.Length+shaped!=1)throw Error("ppa_price_rule","Select one visible exact index curve.");
+        PriceSettlementSelection? settlement=null;
+        if(shaped==0)
+        {
+            var ids=data.Definitions["curve_members"].Where(r=>r.Text("curve_code")==p.Curve).Select(r=>r.Id("contract_id")).ToHashSet();
+            var contracts=data.Contracts.Where(c=>ids.Contains(c.Key.Id)).ToArray();
+            if(contracts.Length==0 || contracts.Any(c=>c.Interval is null)!=contracts.All(c=>c.Interval is null))throw Error("ppa_price_rule","The price source must have a complete single native contract type.");
+            if(contracts.All(c=>c.Interval is null))
+            {
+                var quote=data.Quotes.Single(q=>q.Key.Code==curves[0].Text("quote_code"));
+                settlement=PriceSettlementInputs.Resolve(data,curves[0],quote,p.Settlement);
+                var selected=contracts.Where(c=>c.DeliveryFrom<delivery.To && c.DeliveryTo>delivery.From).ToImmutableArray();
+                if(selected.IsEmpty)throw Error("ppa_price_rule","The selected period curve has no contracts for the side term.");
+                _=PriceSettlementInputs.Fixings(data,settlement,quote,selected);
+            }
+        }
+        if(settlement is null && p.Settlement is not null)throw Error("price_settlement_selection","Interval curves take no period settlement selection.");
+        return new(new(data.DefinitionRevision,p.Curve),Number(p.IndexMultiplier),new(Number(p.Adder),new PriceUnit(currency,PpaQuantitiesStore.Quantity(data,p.Quantity).Key,Number(p.Multiplier))),settlement);
+    }
+    private static System.Text.Json.JsonElement One(IEnumerable<System.Text.Json.JsonElement> rows,string code)=>rows.SingleOrDefault(r=>r.Text("code")==code) is var row && row.ValueKind!=System.Text.Json.JsonValueKind.Undefined?row:throw Error("ppa_term","Select a visible exact reference code.");
+}

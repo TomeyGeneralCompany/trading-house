@@ -1,0 +1,472 @@
+# Markets desk
+
+D345 grouped the existing views under one **Curves & prices** Markets entry. Its
+workspace switch now offers **Contract prices** and **Hourly / sub-hourly prices**;
+D365 moved **Curve builder** and price setup to Reference Data, where D399 lists
+**Contract pricing** and **Publications** as entries of their own under Pricing and
+**Date rules** under Calendars. The
+builder retains its saved-curve library,
+Build, Details, Versions, Lineage, History and Preview views, visual/formula
+authoring and native save/publish controls. Views load
+on demand and keep their existing context and unsaved-edit guards. Returning
+from another page restores the last curve view; clicking the active workspace
+entry does not reload it. Native agent/page identities remain distinct beneath
+the shared navigation. Owned browser checks cover the three view switches, exact
+selected close, active-entry no-op, remembered view, computed preview/graph and
+both keep/discard outcomes of the real unsaved-edit guard.
+
+Status: implemented in the local mainline preview, with the follow-ups listed
+under [Remaining work](#remaining-work). The decisions it introduces are D231 to
+D235 in [decisions.md](decisions.md). Its capability is recorded in
+[implementation.md](implementation.md) and verified by the browser and backend
+checks named under Verification; the page benchmark covers all three pages.
+
+## Why
+
+The Blotter became a desk ([blotter-desk.md](blotter-desk.md)): summary tiles,
+charts, grouped rows and a side panel beside them. Before this implementation,
+the Markets pages used the older layout described below:
+
+- **Curves & prices** opens on an empty "Select a curve" card. Its summary strip
+  counts contracts and picks the front contract in the browser from the order
+  of the evaluated points. A contract's price history opens as a card below the
+  table.
+- **Custom curves** stacks a long definition form, two accordions and a
+  three-column workbench. Saving, publishing and the effective timeline sit in
+  different places, and leaving the page with unsaved edits does not ask.
+- **Delivery prices** hides every filter inside a Context popover, chooses the
+  opening source and day in the browser, and shows a bare table with no chart.
+
+This design gives the three pages the desk's structure and visual system, adds
+a price-over-time chart with analytics overlays, and moves every derived figure
+the pages show to the backend.
+
+## Goals
+
+1. Each page opens on something useful: a market board, the selected custom
+   curve, or the newest delivery day. Every opening choice is stated on screen.
+2. Summary tiles on each page, fed only by backend fields.
+3. Prices over time are drawn with KLineChart (`klinecharts`), with analytics
+   overlays the server computes and drawing tools the user controls.
+4. Detail opens in the shared side panel instead of cards below tables or
+   accordions.
+5. One visual system with the Blotter: tokens, tiles, commodity identity,
+   sparklines, chart theme.
+
+## Non-goals
+
+- New pricing, curve or collection behavior.
+- Hourly / sub-hourly prices (the interval-curves switch) and Interval data.
+  They keep their layout and gain only the shared tokens.
+- **Positions on this curve** ([blotter-desk.md](blotter-desk.md#curves-connection)).
+  It needs a trading read keyed by curve and stays in the plan.
+- Assistant coverage of Delivery prices (D151 stands).
+- Bollinger bands or any overlay that needs a square root. They wait for an
+  explicit irrational-number policy.
+
+## Anti-goals
+
+The redesign fails, even if it renders, if any of these happen:
+
+- The browser computes a count, front contract, statistic or overlay value, or
+  chooses a default source, date or close.
+- A missing price is drawn as zero, interpolated, or bridged by a line or
+  overlay.
+- An overlay value appears without its definition and window on screen.
+- Existing safety behavior is lost: generation and scope guards, retained
+  custom-curve requests with retry, optimistic versions, read-only historical
+  contexts, live-correction refresh and the assistant page reports.
+
+## Constraints
+
+- AGENTS.md: TypeScript is presentation only; no silent defaults; a dependency
+  needs a named consumer; TDD; adversarial review for numerical and temporal
+  changes.
+- D162 and D219: closes are never substituted. Delivery prices keeps its own
+  cutoff and market clock and does not join the As of dock.
+- D188: live corrections refresh Curves & prices and Curve builder through the
+  existing refresh path, including any open panel.
+- D190 and D191: assistant reports state exactly what the page shows.
+- The page benchmark keeps each page under one second from navigation to usable
+  on the standard fixture.
+
+## Shared pieces
+
+### Time chart (KLineChart)
+
+`klinecharts` 10.0.3 (Apache-2.0, no runtime dependencies) draws prices over
+time in a shared module, `time-chart.ts`. Consumers: a contract's price history
+on Curves & prices, and interval prices on Delivery prices. Forward curves and
+custom-curve previews are cross-sections by delivery period, not time, and stay
+on the shared ECharts component, which preserves gaps between periods.
+
+- **Data.** Each bar is one backend point. Its value is the exact decimal string,
+  turned into a number only for pixels, as the existing charts do. A point
+  without a price is passed as a gap. The chart draws no line across it.
+  The custom indicator renderer draws even a single two-point segment, which
+  the library’s native indicator renderer omits.
+  A priced point with no priced neighbour gets a dot, since a line joins only
+  neighbours. Hovering shows the exact backend string for the instant, for the
+  price and every overlay series, never a rounded number.
+- **Theme.** Colors, fonts and grid come from the CSS tokens of the app's one dark theme (D383).
+- **Overlays.** The overlay menu lists the backend's overlay catalog. Choosing an
+  overlay through its Show switch asks for its parameters (the window, with no prefilled value), sends
+  them with the read, and draws the values the backend returns as a registered
+  indicator whose `calc` only looks values up by instant. The legend names the
+  definition and parameters, for example "Simple moving average · 5".
+  Unchecking the final overlay can be applied as an empty selection. Remove
+  overlays clears both the request and menu fields. Missing window
+  values say "Waiting for a complete window".
+- **Drawing tools.** Horizontal price line, trend line, ray and text note, from
+  the library. Drawings are presentation state for the open chart. They are not
+  saved, and the toolbar says so. A compact selector chooses the line tool.
+  Resizing preserves zoom; Fit chart explicitly restores the full extent.
+- **Values as text.** The latest value, and every overlay's latest value, show
+  below the full-width plot. The table remains the accessible record.
+
+### Server-computed overlays
+
+A shared C# module (`OpenEtrm.Shared/Analytics`) computes overlays from an
+ordered series of `(instant, exact value or missing)`. Definitions, versioned:
+
+| Code | Parameters | Value at point *i* |
+| --- | --- | --- |
+| `simple_moving_average_v1` | window *n* (2–250) | mean of points *i−n+1…i* |
+| `exponential_moving_average_v1` | window *n* (2–250) | α·x*i* + (1−α)·EMA*i−1*, α = 2/(n+1), where EMA*i−1* is the previously reported (rounded) value; seeded by the rounded simple mean of the first *n* points |
+| `rolling_range_v1` | window *n* (2–250) | highest and lowest of points *i−n+1…i* |
+
+- Arithmetic is exact signed rational (the module's private ratio, rounded with
+  `IntegerRounding`), rounded half to even at 18
+  decimal places under `exact_rational_half_even_18_v1`; the response names the
+  policy and the definition version.
+- A window that contains a missing point has no value, with reason
+  `window_incomplete`. An EMA restarts its seed after a missing point.
+- The input series holds at most 35,136 points (366 days of quarter-hour
+  intervals); more is an `overlay_input` refusal, as are unordered instants and
+  values that are not plain ASCII decimals.
+- The history read states the series it is charted from as `chart`: either
+  `{points:[{at,value|null,unavailableReason}]}`, one point per instant, or
+  `{conflict:{at,message}}`. Under `as_known_at_cutoff_v1` (D237) the points
+  hold one sample per instant, resolved to the latest revision recorded at or
+  before the read's knowledge cutoff. Under `exact_snapshot_pins_v1` several
+  samples may share an instant: samples that agree on value and availability
+  are one point, and samples that differ make the chart a conflict naming the
+  first such instant. No frame is ever chosen and the returned points are
+  unchanged either way; the browser draws only `chart`, and shows a conflict's
+  message with the values table instead of a chart.
+- Overlays run over the chart's points, so the chart and the overlays show the
+  same series, aligned by instant. Over a conflicting series the read returns
+  its points and the conflict with no `overlays` (status 200); the overlay
+  parameters are still checked (the read computes overlays over no points), so
+  a bad parameter remains an `overlay_parameter` refusal; the series is not
+  checked as an overlay input there. The panel then says that
+  overlays cannot be drawn over a series with different prices at one instant.
+- The delivery period read (`power-imports/period`) instead gives overlays one
+  point per expected interval of its operating days, each the interval's price
+  as known at the read's cutoff. An unpublished interval is a missing point, so
+  windows that touch it have no value (`window_incomplete`) rather than
+  bridging the gap.
+- Parameters are required. A missing, out-of-range or unknown parameter is a
+  structured `overlay_parameter` refusal, never a default.
+- `GET analytics/overlays` returns the catalog (code, label, parameters with
+  bounds, value series names). Reads that accept overlays take
+  `overlays:[{code,parameters}]` (at most 4) and return
+  `overlays:[{code,parameters,policy,series:{name:[{at,value|null,reason}]}}]`.
+
+### Side panel and tiles
+
+Curves & prices reuses `side-panel.ts` (docked on wide screens, overlay drawer
+otherwise or while the assistant is open, one question at a time, focus
+restored) and the desk tile styles. The tile helpers become shared exports
+instead of Blotter-private ones. Curve builder's views were first the same
+side panel's modes; they are now tabs in its dock (Curve builder, above).
+
+## Curves & prices
+
+```
+┌ library ┐┌ Gas futures · USD/MMBtu ─────────────────── [Price sources] [How it's priced] ┐
+│ Gas     ││ ┌ Contracts ┐┌ Front contract ┐┌ Front price ┐┌ Settlement ┐                     │
+│ ● Gas f…││ ┌ forward curve (ECharts) ─────────────────────────────┐┌ side panel: Jan 2021 ┐│
+│ ● Gas fw││ │                                                      ││ History (KLineChart)  ││
+│ Power   ││ └──────────────────────────────────────────────────────┘│ + overlays, drawing   ││
+│ ● Hub p…││ contracts table (rows open the panel)                   │ How it's priced       ││
+└─────────┘└─────────────────────────────────────────────────────────└───────────────────────┘
+```
+
+**Market board.** With no curve selected, the board replaces the welcome card:
+one card per visible curve, grouped as the library groups them. Each card shows
+the curve name, market type, price unit, front contract and price, contract
+count and a sparkline, from one batched read at the selected close. Cards for
+curves the close cannot price say why ("No remaining contracts"). Choosing a
+card selects the curve, as the library does.
+
+**Curve kinds.** Each card, library row and the selected curve's header show
+the curve's kind (D259) as a coloured icon badge named by its label: Market
+settlement, Trader mark, Interest rate, Basis / spread or Scaled. The kind
+comes with the navigation read; the browser never infers it.
+
+Commodity identity uses the icon the commodity names in reference data (D425):
+`flame`, `bolt`, `drop`, `tanker`, `cylinder`, `anchor`, `leaf` or `cube`. The navigation read sends
+the name with the curve's commodity; the browser draws it, named by the
+catalog's commodity label in a tooltip and accessible text, and rejects a name
+outside that list. These icons replace dots on library rows and market-board
+cards. Curves without a commodity have no commodity marker; rates retain their
+existing interest-rate kind badge. No icon is inferred from a commodity's code
+or name, and no commodity is inferred from a curve name.
+
+**Library.** Unchanged in behavior, with the commodity icon, the kind badge and
+the curve's sparkline beside each name. `.curve-button` keeps its markup; its
+spans stay its text.
+
+**Selected curve.**
+
+- Tiles: Contracts, Front contract, Front price, Settlement (rates: Maturities,
+  First maturity, First zero rate, Day count), from the evaluate response's new
+  `summary`. The browser no longer counts points or reads `points[0]`.
+- The forward curve chart and contracts table stay. Choosing a row, or pressing
+  Enter on it, opens the contract in the side panel.
+- **Price sources** and **How it's priced** stay as tabs, as today.
+- Choosing another curve keeps the curve in view until the chosen curve's
+  prices arrive, then changes its title, closes, tiles, chart and tables in one
+  step. The chosen library row is pressed at once, the page is pending
+  meanwhile and dims only when the read is slow, and nothing can be opened from
+  the curve that is leaving. A read that fails empties the page and says why.
+
+**Contract panel.** Header: contract, delivery period, price and unit. Tabs:
+
+1. **History**: the contract's closes over time in the time chart, with
+   overlays and drawing tools, and the values table under it. It replaces the
+   history card.
+2. **How it's priced**: the per-contract pricing graph for that contract.
+
+A live correction refreshes the open panel with the page. Changing the close,
+context or curve closes the panel.
+
+## Curve builder
+
+The page is named **Curve builder** wherever a person or the assistant sees it;
+its identifiers (`custom-curves`, `custom_curves`, the `custom_curves.*_v1`
+operations) are unchanged. It is an entry of Reference Data → Curves (D365, D399).
+
+```
+┌ Reference Data                                                                         ┐
+│ NG prompt ▾  ● Draft v3                                      As of · close · knowledge │
+├ Build │ Details │ Versions │ Lineage │ History ──── [Preview] [Save draft] [Publish] ⋯ ┤
+│ graph board and selected operation                                                     │
+├ Preview ───────────────────────────────────────────────────────────────────────────────┤
+│ tiles, chart and table                                                                 │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Title and actions.** The curve's name, in the app header, with its state chip
+  (Draft, Published, Unsaved changes) and version. The actions sit at the end of the
+  tab row, with **Reset layout** in its overflow menu. A
+  **Saved by assistant** chip shows while the open version's generation was saved
+  by the page assistant (`saver.savedBy`, D260); a person's Save clears it, and a
+  generation with no recorded saver shows none.
+- **Saved curves.** A popover on the title holds the library. **Ask the assistant to set up a curve** opens the page assistant
+  with a question to start from, which asks it to prepare the curve, show its key
+  values and then save it as a draft. The assistant's saved draft opens from its
+  **Open saved draft** notice, never by itself, behind the leave question below.
+  Each ask reports the saved curve open, if any, and whether it has unsaved edits;
+  the assistant refuses to save that curve while it does. Saved curves are listed with state chips,
+  grouped under their kind (D259) with its badge on each entry. **New curve**
+  starts from a blank graph. The catalog read returns the state, version and
+  kind shown. The header shows the open saved version's kind badge; an unsaved
+  edit has none until it is saved. A source card shows the kind of the curve or
+  published curve it reads.
+- **Nothing open.** With no curve open, the main area offers **Ask the
+  assistant to set up a curve**, **New curve** and the templates.
+- **Views as tabs in a dock** (`dock.ts`, `dock-model.ts`). The views open in two
+  groups, Build and its siblings above **Preview**:
+  - **Preview:** the preview's tiles, chart, table and receipt, or a Preview
+    button while there is none. Preview runs only when asked. After an edit the
+    last chart and tiles stay, subdued and labeled out of date; they are display
+    only, and the values, lineage and history are cleared.
+  - **Build:** the Visual or Formula board, with **Add an operation** and the
+    selected operation's inspector beside it (below it where the group is
+    narrow). **Hide operations** folds them away to give the board their
+    width; selecting a card shows Graph and its inspector again.
+  - **Details:** code, name, the saved version's kind, template and the
+    ingredients the graph reads with their kind badges. New curve opens Details.
+    Combine curves is a disclosure beneath Add an operation in Build.
+  - **Versions:** the effective versions timeline.
+  - **Lineage:** the preview's dependencies, source observations and trace.
+
+  Dragging a tab shows drop zones on every group: its centre joins that group
+  and an edge splits the group with the tab on that side. A tab's menu
+  (right-click, the context-menu key or Shift+F10) offers Move to new group
+  right, Move to new group below and Move to group…; the arrow keys move
+  between a group's tabs. Dividers resize a split by pointer or arrow key.
+  Splits nest two levels deep and an emptied group closes. The arrangement is
+  this viewer's presentation state in `localStorage`
+  (`openetrm.custom-curves.layout.v2`); an unreadable or outdated arrangement
+  opens the default, and **Reset layout** returns to it. Below a 960 px main
+  area every tab is shown in one group and the saved arrangement returns when
+  the page is wide again.
+- **Graph.** The workbench keeps its board, formula mode and behavior, styled
+  with tokens instead of literal colors.
+- **Graph objects.** Each card shows its input ports and an output dot. A
+  weighted contract mapping lists each explicit contract connection as its own
+  row, labelled "Fixed contract · <catalog label>" with its weight exactly as
+  typed, and an arrow runs from the source to that row. Arrows are focusable
+  objects: right-click, the context-menu key or Shift+F10 opens Change
+  source…, Change target port…, Edit weight (contract connections) and Remove
+  arrow. A card's menu offers Add arrow from here…, Add contract connection…
+  (mappings) and Remove operation. Add arrow, Change target port and dragging
+  from an output dot enter connect mode: only the inputs whose catalog type
+  accepts the output are offered, a click or Enter connects and Escape
+  cancels. Every edit is an ordinary definition edit: it marks the curve
+  unsaved and clears the preview; Formula then shows the edited graph (or none
+  while the backend cannot format it). The backend validates every edit on
+  preview or save. Read-only accounts get only View. A row whose source
+  input was removed shows "Source disconnected" and opens the same menu from
+  the row; changing a row's source clears its contract for an explicit new
+  choice. Auto-layout and Fit use the cards' rendered heights, so cards never
+  overlap and expanded sources stay inside the board.
+- **Expandable sources.** A source card whose catalog entry lists contracts
+  expands to show them as the catalog names them; picking one into a mapping
+  (Connect to…, or dragging it onto the mapping) adds a fixed contract
+  connection with no weight or output position chosen, focuses its weight, and
+  Preview and Save wait until every weight is entered. Published custom-curve
+  sources list no contracts in the catalog, so they do not expand. Expanded
+  state is page state and is not saved.
+- **Rolling selections.** A Select contracts card states its relative
+  positions as its definition does. The preview does not yet state which
+  contracts each selection resolved, so the card shows no resolved contracts.
+- **Preview.** Tiles from a new backend `summary` on the preview (point count,
+  first and last delivery period, output unit, unavailable points), then the
+  chart and table. Dependencies, observations and trace are in Lineage.
+- **Leaving with unsaved edits asks first**, above the views, through the
+  same `leaving()` path and `beforeunload` guard as the Blotter, and only on
+  moves that discard the edits: another page, a changed historical context or
+  return to working data, an account switch or sign-out, another example, and,
+  in the page, opening another library entry, New curve, a template, or Reload
+  library on a selected curve. A change of close keeps the graph (D162), so it
+  asks only when an effective-version timeline is unpublished, and Discard drops
+  that draft alone.
+  Saving preferences and following live keep the edits and never ask. Keeping
+  returns focus to the control that asked. A request whose outcome is
+  unconfirmed is not an unsaved edit: it is retained across a move, so it
+  neither asks nor registers the unload guard. A move that fails after the
+  edits were discarded reads the library again.
+  Preview and Save also wait, naming what is missing, while a contract
+  connection lacks its contract, output position or weight.
+- The retained-request banner, optimistic versions, read-only explanations and
+  assistant proposals are unchanged.
+
+## Delivery prices
+
+```
+┌ Delivery prices ─────────────────────────────────────────────────────────────┐
+│ Power ▾ PJM ▾ Day-ahead ▾ Hub A ▾ Source ▾  Nov 2 → Nov 2  Known at …  [Show] │
+│ Newest delivery day · Synthetic PJM DA hourly                                 │
+│ ┌ Intervals ┐┌ Low · High ┐┌ Average ┐┌ Collection ┐                           │
+│ [Prices] [Collection history]                                                │
+│ ┌ interval prices (KLineChart) + overlays, drawing tools ────────────────────┐ │
+│ └──────────────────────────────────────────────────────────────────────────┘ │
+│ interval table                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Filter bar.** The commodity, operator, market, location and source selects,
+  the delivery date range and the knowledge cutoff move out of the Context
+  popover into a bar at the top of the page. The cascade and its refusal of
+  conflicting labels stay. A changed filter clears the choices below it and
+  chooses none of them; the person's range is read when they choose Show
+  prices.
+- **Opening selection from the backend.** The catalog returns
+  `opening:{sourceId,fromDate,throughDate,policy:'newest_available_delivery_day_v1'}`
+  (the source with the newest available day, ties broken by source name then
+  identity). The page opens on it and shows a **Newest delivery day** badge,
+  which becomes **Selected range** once the user changes a filter, a date or
+  the cutoff. The browser's `latestDeliverySource` is removed. A catalog
+  without an opening shows that there are no delivery prices yet.
+- **Tiles** from a new `summary` on the period read under the same rational
+  policy as overlays: interval count with missing intervals, low and high with
+  their instants, time-weighted average over the published intervals, and the
+  latest knowledge instant used. A collection tile shows the jobs and the
+  newest attempt's outcome from a new catalog `collection` summary.
+- **Prices tab:** the time chart of interval prices with overlays, then the
+  interval table. The period read states the series it is charted from as
+  `chart:{points:[{at,value|null,unavailableReason}]}`, one point per expected
+  interval of its operating days (the same points the overlays run over); an
+  interval not published by the cutoff has no price and the reason
+  `not_published_at_cutoff`. The browser draws only that series and refuses a
+  read without it. **Collection history tab:** today's attempts table.
+- The page keeps its own cutoff and generation guard, outside the As of dock.
+
+## Backend changes
+
+1. `market/curve-shapes`: each curve adds `contractCount` and
+   `front:{contractId,deliveryFrom,deliveryTo,price}|null`. The board reads
+   it in batches of 64.
+2. `evaluate`: adds `summary`, the same fields, plus the rate-curve fields
+   (maturity count, first maturity, first zero rate, day count).
+3. The overlay module and catalog; `history` and `power-imports/period` accept
+   overlays.
+4. `power-imports`: adds `opening` and `collection`; `power-imports/period`
+   adds `summary`.
+5. `custom-curves/preview`: adds `summary`.
+6. The preview launcher seeds synthetic delivery prices (two sources, a week of
+   hourly and quarter-hourly prices) so the page can be seen and checked
+   locally.
+
+**Front contract** is defined once, in the backend: the first contract in
+delivery order that the selected close prices. A curve with no such contract
+has `front: null` and an availability reason.
+
+## Decisions
+
+D231 (KLineChart for time charts), D232 (server-computed overlays), D233
+(backend curve summaries and the front contract), D234 (the delivery opening
+selection and period statistics) and D235 (the unsaved-edit question) are
+recorded in [decisions.md](decisions.md). D238 (idempotent writes) and D237
+(history revision policy) govern the history reads the charts draw.
+
+## Remaining work
+
+Listed in [plan.md](plan.md): Positions on this curve, Bollinger bands,
+per-selection resolved contracts in custom-curve previews, structured refusals
+for an empty contract or null output position, a reported refusal of a saved
+weighted draft previewed by id and version and rates curves on the market board.
+The contract history chart also lost the image export the old history card had.
+
+## Verification
+
+`tools/run_preview.py --markets-desk-check` runs the market and delivery browser
+suites in a newly owned standard fixture, with the ordinary HTTP checks. Supply
+the installed `--pg-bin`, `--dotnet` and `--browser` paths. This option runs alone;
+it does not qualify trading screens.
+
+- Backend numerical checks for each overlay definition, written failing first
+  and independent of the implementation: hand-computed series, missing points,
+  incomplete windows, parameter refusals, policy rounding.
+- Backend checks for curve summaries (futures, forwards, rates, no remaining
+  contracts), the delivery opening policy (ties) and the period summary
+  (missing intervals, time weighting across a DST change).
+- A disposable real-browser chart check exercises multiple supplied overlay
+  series, a two-point segment, removal state and preservation of zoom on resize.
+  It uses only synthetic answers and a static server; no application data.
+- Web unit tests for the time-chart data mapping (gaps, overlay lookup by
+  instant, no computation) and the new page models.
+- Browser checks in the owned preview: the board, selecting a curve, the
+  contract panel with an overlay, a custom curve with the leave question, and
+  Delivery prices with seeded data, at 1440 and 390 pixels.
+- The page benchmark keeps each page under one second.
+- Adversarial review for the overlay module, the summaries and the delivery
+  opening policy before publication.
+
+## Replaced, not kept
+
+The welcome card, the history card, the browser's count and front-contract
+derivation, the custom-curve definition card and accordions, the delivery
+Context popover and the browser's opening source choice are removed once their
+replacements cover them. Tests are updated to the new structure, keeping the
+ids that the behavior still needs.
+
+## Left to the builder
+
+- Breakpoints, spacing, motion and the exact overlay menu layout.
+- Module structure for the page models and the panel modes.
+- Batch scheduling for the market board within the page budget.

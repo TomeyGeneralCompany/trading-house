@@ -1,0 +1,464 @@
+# Blotter workbench
+
+Status: implemented locally; not qualified for production. It builds on
+[blotter-desk.md](blotter-desk.md) and replaces that document's desk layout
+and position expansion. Its decisions are D272–D277 in
+[decisions.md](decisions.md) (the page report's layout is D271).
+Local page performance: the Blotter p50/p95 was 555/618 ms against the 1000 ms
+budget on a synthetic fixture (24 trades, 16 swaps, 92 contracts, 12 curves,
+40 ms latency, 5 samples); that is a local figure, not a qualification.
+
+Remaining:
+
+- **Hedge…** is left out of the row menu at the owner's request.
+- A page-performance qualification beyond the local figure above.
+
+## Why
+
+A trader opens the Blotter to scan current positions against their view of
+market direction and to find what needs a hedge or a close-out. That is a
+top-to-bottom working pass over a long list, so the one thing the page must
+never do is lose the trader's place. Before this implementation it did, in four ways:
+
+1. **First load shows two tables.** `load()` in `web/src/futures-view.ts`
+   draws a provisional table of unvalued position facts (`renderFacts`: Value
+   "Pending", "—" for missing market and delivery), then destroys it and draws
+   the valued table when `trading/workspace` returns. Half-filled rows appear
+   and then jump.
+2. **Every control change rebuilds the grid.** `render()` calls
+   `workspace.render`, which destroys the Tabulator grid and builds a new one
+   (`web/src/table-workspace.ts`). Regrouping rows already read, choosing
+   columns, or applying a view resets scroll, selection and focus.
+3. **Opening a row shifts the view.** The position detail is inserted inside a
+   virtual-rendered row (`detailRow` in `web/src/data-grid.ts`). Its height
+   changes the renderer's estimates and the grid redraws around it; much of
+   `data-grid.ts` exists to work around this.
+4. **The page is a document, not a workspace.** Large tiles and charts sit
+   above the table, the page scrolls as a whole, and the table has a fixed
+   maximum height (560 px) however large the window is. A full-width
+   "Close position view" button closes the detail.
+
+The Blotter becomes a desktop-style workbench: panes that fill the window,
+a grid that is built once and keeps its state, details that open beside the
+list without moving it, and actions on a position from the position itself.
+
+## Goals
+
+1. The Blotter fills the window beside the navigation. The page never
+   scrolls; only panes scroll. Resizing the window resizes the panes.
+2. The positions grid is built once per Blotter visit and updated in place.
+   Regrouping, sorting, filtering, column choice, a new valuation and a
+   changed selection never lose the scroll position, the selected row or
+   keyboard focus, unless the selected row no longer exists.
+3. Position details open in a docked pane, not inside the grid. The grid's
+   row heights never change because a detail opened or closed.
+4. Charts are secondary: a collapsible pane, by default at the bottom.
+5. Panes can be rearranged by dragging, resized and collapsed. The
+   arrangement is part of a saved Blotter view.
+6. The Blotter can pop out into its own window that stays tied to the main
+   window.
+7. First load shows progress instead of provisional rows.
+8. A context menu on the selected row offers the actions a trader takes on a
+   position, including a pre-filled close-out reviewed before booking.
+9. Every Blotter action is one operation that the UI and the assistant both
+   call (AGENTS.md: UI and agent entry points use the same operations).
+
+## Non-goals
+
+- Incremental display of valued positions. Streamed completion counts inform
+  progress; the grid waits for the complete valuation (see [First load](#first-load)).
+- The assistant driving the Blotter, suggesting hedges, drawing charts in the
+  chat and running reports. A later project, built on goal 9.
+- News and article retrieval for the assistant.
+- The market dashboard (prices, latest levels, weather). A separate page.
+- New pricing, valuation, risk mathematics or permissions.
+- Other pages. Curve builder keeps its dock; this design generalizes the dock
+  module it uses but does not change Curve builder's behavior.
+
+## Anti-goals
+
+The redesign fails, even if it renders, if any of these happen:
+
+- A control change, a valuation arriving or a detail opening moves the rows
+  the trader is looking at, or takes focus away from where they were.
+- A row shows a partial value set, or a summary shows a total over a scope
+  that is not completely valued, without a visible flag and reason.
+- The browser computes a close-out or hedge quantity, side, price or any other
+  trade term. Proposed trade terms come from the backend.
+- Anything is booked without the trader reviewing and submitting the form.
+- The pop-out and the main window show different contexts or views of the
+  same Blotter without saying so.
+- Existing safety behavior is lost: retained trade requests with retry and
+  reconcile, unsaved-edit guards, optimistic view versions, live-context
+  pinning, stale-response rejection and the assistant's page report
+  (blotter-desk.md, Anti-goals).
+
+## Constraints
+
+- AGENTS.md applies in full: TypeScript is presentation only, no silent
+  defaults, exact decimal strings are the values, synthetic data, TDD.
+- The constraints of blotter-desk.md stay, including D162 close selection,
+  D190/D191 page reporting and the page-performance target (architecture §8).
+- Saved views: `BlotterView` in `web/src/blotter-layout.ts` (version 6) is
+  saved to the account through `table-views/blotter`. Earlier versions are
+  never migrated; they are listed by name and saved again (existing rule).
+- Reuse before writing new code: the dock model and dock drawing
+  (`curve-dock-model.ts`, `curve-dock.ts`), the context-menu module
+  (`context-menu.ts`), the position panel (`position-panel.ts`) and the
+  position pop-out (`position-window.ts`, `position.html`). Generalize them
+  rather than copying; move shared code where both pages use it.
+- No new dependency without a named consumer (AGENTS.md). Tabulator 6.6.1
+  stays the grid unless the builder shows it cannot meet goal 2.
+- Adversarial review is required for: the pop-out's tie to the main window
+  (authorization and context pinning across windows), the close-out draft
+  operation (numerical, trade terms), and the page-report change.
+
+## Layout
+
+The default arrangement, top to bottom:
+
+| Pane | Contents | Default |
+| --- | --- | --- |
+| Toolbar | View, books and portfolios, row grouping, filter, columns, New trade (opens New trade's page, D421), pop-out, As-of | Fixed, not a pane |
+| Summary strip | One line: swap PV, futures execution P&L, positions, not valued, risk status, by currency | Open |
+| Positions grid | The trade rows or pivot | Takes the remaining height |
+| Details | The selected position | Collapsed until a row is opened |
+| Charts | The desk charts (PV by market, position by delivery month) | Open, bottom |
+
+- On desktop, the workbench fills the width beside navigation and a docked
+  Assistant, without the ordinary page-width cap. Its panes use the height above
+  a compact footer. Visible Assistant launch/minimize controls share that footer
+  space; with them hidden, the panes extend farther down. Maximizing Positions
+  or Details fills that available dock area and retains scrolling within the
+  grid or pane. Phone pages retain their normal page scrolling (D348).
+
+- The summary strip replaces the large tiles. It shows the same backend
+  figures with the same rules (separate currencies, swap PV and futures P&L
+  never added, pending/unavailable flagged with reason). The tiles' per-book
+  bars and the position mix by commodity and instrument type move into the
+  Charts pane as charts of their own; the risk tile's largest move and shock
+  count stay in the strip as the risk status, and **Run risk** moves to the
+  toolbar. No backend read is dropped. (Design call.)
+- The risk report (D221/D222) opens in the Details pane, as it opens in the
+  side panel today; its results show in the grid under the Risk lens.
+  (Design call.)
+- The charts show the scope the grid shows (selected books, portfolios and
+  filters), as the desk charts do today.
+- At narrow widths (the existing `narrow` rule in `curve-dock.ts`) panes
+  stack in one column and the saved arrangement is kept for when the window
+  is wide again.
+
+## Panes: arrange, resize, collapse
+
+- Panes are the Summary strip, Positions grid, Details and Charts. Each has a
+  header with its title, a drag grip and a collapse control (⌄ / ⌃).
+- Dragging a pane header onto another pane's edge docks it on that side;
+  onto its centre makes them tabs in one group. This is the Curve builder
+  dock interaction, generalized: `curve-dock-model.ts` becomes a shared dock
+  model used by both pages. The same moves are available from the pane
+  header's menu (keyboard: context-menu key or Shift+F10).
+- Dividers resize. A collapsed pane shows a one-line bar with its title and
+  ⌃; its space goes to its neighbours.
+- The Positions grid cannot be collapsed or closed.
+- Each pane can temporarily maximize to fill the dock and restore its previous
+  arrangement. The saved split ratios, grid and editor state stay in place.
+  Moving and resizing wait until the panes are restored. Maximization is not
+  saved in the named view (D294).
+- The arrangement (dock layout, split ratios, collapsed panes, active tabs)
+  is saved in the named Blotter view. This bumps `BlotterView` to version 6;
+  version 5 views follow the existing earlier-version rule. An unsaved
+  arrangement persists for the browser session like other unsaved view
+  edits. **Reset layout** restores the default arrangement; with the details
+  open it first asks about their edits, as collapsing them does, and is
+  refused while the page is busy.
+
+## Positions grid
+
+- One grid instance per Blotter visit. Data, grouping, sorting, filters,
+  column visibility and order change through the grid's in-place API
+  (for Tabulator: `replaceData`/`updateData`, `setGroupBy`, `setSort`,
+  `setFilter`, column show/hide/move). Destroying the grid is reserved for
+  leaving the Blotter, switching between trade rows and pivot, and an
+  account or workspace change.
+- Rows are identified by a stable key (trade and binding), not by source
+  index, so the selection and scroll anchor survive new data. Revision is row
+  data: an amendment or correction updates the row in place and the
+  selection follows the trade, as D221 has the panel follow it. (Design
+  call.)
+- Place retention: on any update the grid keeps the selected row selected and
+  keeps the first visible row at the same position in the viewport (scroll
+  anchoring by row key). If the selected row is gone, the selection clears
+  and a one-line notice says why.
+- Group rows show the backend's subtotals and collapse and expand in place.
+- Keyboard: ↑/↓ moves the selection; Enter opens details; the context-menu key
+  or Shift+F10 opens the row menu; Escape collapses details and returns
+  focus to the row.
+- Selecting a row while details are open shows that position in details.
+  Selection does not scroll the grid.
+- Double-click keeps its current meaning (open the position in its own
+  window).
+- Lenses: switching Values and Risk changes columns and cell content in place
+  and keeps place. The Ladder lens (D230) draws per-factor totals, not trade
+  rows; like the trades/pivot switch it replaces the grid's rows, and
+  returning to trade rows restores the scroll anchor and selection.
+  (Design call.)
+
+## Scope and personal sidebar views
+
+Blotter and Risk share searchable checkbox pickers for portfolios and books.
+Choosing portfolios shows their included books, using exact memberships from
+the authorized directory. Empty book selection means all readable books within
+that portfolio scope. Selecting both retains the backend's intersection.
+A selected book outside the chosen portfolios stays visible with an explanation
+and a remove action; no scope is silently broadened. Unavailable saved IDs have
+generic labels rather than names from an earlier directory. Blotter stages these
+choices until **Apply filters**; Risk applies them after its unsaved-setup guard.
+
+To keep a product or other filtered view, choose its filters and columns, open
+**Save view**, name it, select **Pin to sidebar**, and save. Pins use the existing
+account-owned saved view and can be removed by saving it with the pin cleared.
+The fixed Physical gas and Physical crude sidebar entries are removed; their
+positions and native booking operations remain in the common Blotter.
+
+## Details pane
+
+- Opens the selected position using the existing position panel
+  (`position-panel.ts`) and its tabs: Curve, Terms, Risk, History. The Terms
+  tab holds the sides table (pay/receive, fixed or floating basis, price,
+  current price, quantity, value), which is what a trader reads first, so the
+  pane opens on Terms. The last chosen tab is kept while moving between
+  positions.
+- This supersedes D253's amendment that a position's detail opens under its
+  Blotter row (decided by the owner, 2026-10-30). Each side's evaluated
+  schedule, which D253 placed under the row, shows in the Details pane with
+  the sides table.
+- Header: ◂ ▸ (previous and next position in grid order), the position's
+  title, and ⌄ to collapse. The common pane header offers maximize/restore,
+  as it does for Summary, Positions and Charts. Maximizing temporarily fills
+  the dock with Details without changing its saved arrangement or remounting
+  the editor. Collapse or reset restores the arrangement.
+- Amendment and close-out forms open in the details pane; the unsaved-edit
+  guard applies before it shows another position or collapses. A new trade is
+  entered on New trade's page (D421), which shows this same pane alone, filling
+  the dock, with the Blotter's read kept behind it; a booked trade is followed
+  here, where its position opens. The pop-out Blotter, which has no sidebar,
+  keeps new futures and swaps in its details pane.
+- Futures and swap amendment editors keep **Preview changes** and **Save
+  amendment** together in a sticky action bar. Saving is enabled only after
+  the current terms have been previewed and explicitly confirmed. Editing
+  a term invalidates that review. The amendment reason appears before the
+  terms. Swap **Price** shows an estimate and local validation errors; its
+  result explains the separate preview, confirmation and save steps.
+- The inline row expansion (`position-expansion.ts`) and the grid's detail
+  row support in `data-grid.ts` (`detailRow`, `resizeDetail`, the virtual
+  buffer workarounds) are removed.
+
+## First load
+
+- The grid shows no rows until the entire valuation completes. A thin progress bar
+  under the toolbar and a status line show what is happening: "Valuing
+  positions" while the read runs, and "Valuing positions · 74 of 120 complete" as
+  the backend completes positions.
+- The provisional facts table (`renderFacts`, `trading/positions` paging for
+  display) is removed from the first-load path. Opening a position before the
+  valuation finishes is not offered. The facts read supplies the count and
+  cross-checks the final valuation scope; it never draws rows.
+- The first load of a trade view consumes `trading/workspace/stream`. Its
+  completed-position count updates progress while valued rows remain private
+  until the terminal complete frame and its context are validated. The grid,
+  group subtotals and summary strip appear together from the complete result.
+  A refused, truncated or inconsistent stream displays no partial result.
+  Refreshes and pivot views retain the whole-workspace read.
+- A failed valuation keeps the toolbar usable and shows the reason and a
+  Retry in the grid area. A failed count of the positions, read beside the
+  valuation, is said as the count's own failure, with its reason and Retry. A refresh of an already loaded Blotter keeps the
+  current rows on screen, marked stale, until the new values replace them in
+  place.
+
+## Row context menu
+
+Right-click, the context-menu key or Shift+F10 on a row opens a menu for that
+position (`context-menu.ts`). Items are shown only when the account may
+perform them; otherwise they are shown disabled with the reason.
+
+| Item | Effect |
+| --- | --- |
+| Close out… | Opens a new-trade form in details, pre-filled with the offsetting trade |
+| Amend… | Opens the amendment form in details (existing) |
+| Buy more… / Sell… | Shows the position and asks the adjustment's quantity in its details (D424) |
+| Risk… | Opens the risk report scoped to this trade (D424) |
+| Open in its own window | The existing position pop-out |
+| Copy trade ID | Copies the trade reference |
+| Ask the assistant about this position | Opens the assistant panel with this position as context |
+
+The head of a position's details offers the same actions as buttons, from one
+definition (`position-actions.ts`, D424): Close out…, Amend, the two adjustments,
+Risk… and Open curve, then Terminate and Novate drawn Coming soon. The adjustments
+are named from the direction the position states (Buy more and Sell for a long
+future, Sell more and Buy back for a short one, Increase and Reduce otherwise).
+Pressing one asks its quantity in one row under the buttons; Draft trade sends it
+as typed.
+
+Adjustment (D424):
+
+- `POST /api/trading/position-adjustment-draft` returns the draft of a new trade of
+  the position's own instrument, book and parties for the stated quantity: on the
+  position's side to increase it, on the other side to reduce it, at the curve
+  price of the pinned close. It is read, refused and opened as the close-out
+  draft is, for the revision the person saw when they asked.
+- Refused with a reason shown beside the quantity, which stays for the person to
+  correct: a quantity that is not a plain
+  positive decimal; a reduction beyond what is held; a scheduled swap; an
+  instrument neither draft supports; and everything the close-out draft refuses.
+
+Close-out:
+
+- A new backend read operation returns draft trade terms for a full
+  close-out of one position revision in the pinned context: same instrument
+  and contract or delivery, opposite side, the position's open quantity, and
+  as the price the position's current curve price (mark) in the pinned
+  context (owner, 2026-10-30). The form labels the price with its source and
+  close, for example "Curve price at 29 Oct 17:30 close", until the trader
+  edits it. A position with no mark in that context gets a structured error,
+  never another price.
+- A partly settled swap closes its remaining periods only (owner,
+  2026-10-30): the draft covers each unsettled period, opposite side, the
+  period's open quantity and its current curve price; settled periods are
+  left untouched. Which periods count as settled is the backend's settlement
+  state in the pinned context and knowledge cutoff; a period whose state is
+  ambiguous (for example fixed but not yet settled) is refused with the
+  reason rather than included or dropped. A by-period or scheduled swap
+  (D214) keeps its per-period quantities. The browser never derives these. Missing or ambiguous terms (for example a
+  partly settled swap) return a structured error shown in the form, never a
+  guessed draft.
+- The draft opens in the existing booking or swap form for review. The trader
+  may edit it; booking uses the existing booking operations, retained
+  requests and idempotency. Nothing books from the menu.
+
+## Pop-out Blotter
+
+- A toolbar button opens the Blotter in its own browser window (a second
+  page like `position.html`). The main window's Blotter shows "Blotter is in
+  its own window" with **Bring back**, and resumes there when the pop-out
+  closes.
+- The pop-out follows the main window: account, workspace, market date or
+  close, historical context and knowledge cutoff. A change in the main
+  window is applied in the pop-out at once, whichever page the main window
+  shows (the header's As-of selection, not a page's own read, is what it
+  follows).
+- While popped out, the Blotter and its view (books, portfolios, grouping,
+  filters, columns, layout, saved view) live only in the pop-out; the main
+  window shows the placeholder and no Blotter controls, so there is one
+  editor of the view and no concurrent edits. Bring back hands the current
+  view, including unsaved edits, to the main window. Narrow stacking is per
+  window. (Design call.)
+- The pop-out reads through the same API and authorization as the main
+  window. It never receives data from the main window that it has not read
+  itself under its own session; the main window only sends selections.
+- When the main window closes, signs out or changes account, the pop-out
+  shows why and stops showing values rather than leaving stale numbers.
+- The assistant panel stays in the main window. Its page report (D190/D191)
+  reports the pop-out's Blotter state, relayed, and "Ask the assistant about
+  this position" in the pop-out focuses the main window's panel. A Navigate
+  target to the Blotter brings the pop-out to the front. (Design call;
+  part of the required page-report review.)
+- Booking, amending and close-out work in the pop-out with the same
+  operations and guards. A retained trade request is owned by one window at
+  a time. (Builder's call: the cross-window channel, for example
+  `BroadcastChannel` with an origin and session check.) A request the pop-out
+  hands over waits in the main window's storage until the main window takes
+  it; a booking or command made there first takes it over and is refused
+  while it is outstanding, and the pop-out never writes over a request
+  already waiting there.
+
+## Shared operations
+
+Each Blotter action is a named operation with typed input, used by the UI
+and later exposed to the assistant: select view, choose books/portfolios,
+group rows, sort, filter, choose columns, select position, open/collapse
+details, arrange/resize/collapse panes, reset layout, pop out/bring back,
+draft close-out, open amendment. The assistant page report (D190/D191)
+reports the selected position, open pane and view as today, plus whether the
+Blotter is popped out. Exposing these operations as assistant tools is out of
+scope here. An operation refused while the page is busy says why; one whose
+work fails is said in the banner and rejects with that failure, so whoever
+dispatched it hears it.
+
+## Backend changes
+
+1. Close-out draft read (above), with tests per instrument type: future,
+   financial swap, heat rate, PPA (PPA may be refused as unsupported with a
+   structured reason).
+2. `BlotterView` version 6 validation on the server side, if the server
+   validates saved layouts.
+3. Nothing else; streaming valuation is its own design.
+
+## Decisions recorded
+
+D272 (grid and details pane), D273 (saved layout), D274 (pop-out), D275
+(close-out drafts), D276 (first load), D277 (busy refusal). The original list:
+
+- The Blotter grid is built once and updated in place; destroying it is
+  limited to the cases above.
+- Position details are a docked pane; the inline row expansion is removed. Supersedes D253's
+  "detail opens under its Blotter row" (owner, 2026-10-30).
+- Pane arrangement is part of the saved Blotter view (version 6).
+- The pop-out Blotter follows the main window's context and shares the view
+  both ways; it reads under its own session.
+- Close-out drafts are produced by the backend; the browser never derives
+  trade terms.
+- First load shows completion progress and no rows until the full result is ready.
+
+## Verification
+
+- Browser checks (the existing harness under `web/tests` plus a browser
+  run): scroll position and selected row are unchanged after regrouping,
+  sorting, filtering, column changes, a refreshed valuation, opening and
+  collapsing details, and resizing the window.
+- First load advances completion progress but renders no row before the full
+  valuation completes. Refused, truncated and inconsistent streams expose no
+  partial result; cancellation and late frames cannot restore a departed view.
+- Panes: drag to each edge and centre, resize, collapse, save view, reload,
+  reset layout; narrow-width stacking.
+- Pop-out: context change in the main window reaches the pop-out; view change
+  in either reaches both; main window closed or signed out stops the pop-out.
+- Close-out draft: backend tests per instrument type and refusal reasons;
+  UI test that the form opens pre-filled and nothing books without submit.
+- Page performance stays within the architecture §8 target.
+
+## Left to the builder
+
+- Tabulator API choices and how scroll anchoring is implemented.
+- Pane header visuals, icons and animation, within the shared visual system.
+- The cross-window channel and its message format.
+- Default split ratios.
+
+## Deferred
+
+- **Hedge…** is not in the menu (owner, 2026-10-30). Close-out covers the full
+  offset; hedging with a different instrument or quantity belongs with the
+  assistant work that suggests hedges.
+
+
+## Side pricing details
+
+The existing gas Side tabs use one [shared pricing/lifecycle grid](side-schedules.md#pricing-and-lifecycle-inspection-d352).
+It replaces the old summary Side grid, with no additional disclosure or selector.
+Crude and LNG use the same inspector in their schedule views. Select
+**Calculation** for averaging,
+source contract/fixing, amount and discount inputs. Schedule values include the
+signed booked scale; calculation cells declare their unit-Side basis. Lifecycle
+facts remain independent of the selected contractual MTM measure.
+
+
+## Desktop continuity (D370)
+
+Maximizing Positions hides the other dock panes and fills the dock without outer
+padding. Resizing preserves the grid’s row anchor, selected row and horizontal
+scroll, including while another page hides it. Returning keeps the read-only
+position and detail tab after server freshness validation. An authority or context
+change still invalidates retained data; edits keep their existing leave guards.
+Side schedules keep their widget while the position/context is unchanged. Rows
+read on beneath the rows already shown, which keep their place. Paging
+calculation inputs leaves the previous page visible and inert until its
+validated replacement arrives, retaining the table’s scroll position.

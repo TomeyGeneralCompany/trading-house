@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  impact:
+    name: Select impacted checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      groups: ${{ steps.plan.outputs.groups }}
+      full: ${{ steps.plan.outputs.full }}
+    steps:
+      - name: Check out complete comparison history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check impact selection behavior
+        run: python3 -m unittest discover -s tests -p test_ci_impact.py
+      - name: Select conservative verification groups
+        id: plan
+        run: python3 tools/ci_impact.py
+
+  verification:
+    name: Synthetic verification (${{ matrix.group }})
+    needs: impact
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.impact.outputs.groups) }}
+    runs-on: ubuntu-24.04
+    # Include preparation and numerical/browser workload variation on shared runners.
+    timeout-minutes: 90
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: |
+            global.json
+            src/**/packages.lock.json
+            tests/**/packages.lock.json
+      - name: Set up the pinned Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Restore PostgreSQL dependency packages
+        if: matrix.group != 'repository' && matrix.group != 'frontend' && matrix.group != 'managed'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/postgresql-dependencies
+          key: ${{ runner.os }}-${{ runner.arch }}-postgresql-v1-${{ hashFiles('tools/ci/postgresql.lock.json') }}
+      - name: Verify and install PostgreSQL 18
+        if: matrix.group != 'repository' && matrix.group != 'frontend' && matrix.group != 'managed'
+        shell: bash
+        env:
+          POSTGRESQL_BUNDLE_URL: ${{ vars.POSTGRESQL_BUNDLE_URL }}
+        run: |
+          bundle_args=()
+          if [ -n "$POSTGRESQL_BUNDLE_URL" ]; then
+            bundle_args=(--bundle-url "$POSTGRESQL_BUNDLE_URL")
+          fi
+          python3 tools/ci_dependencies.py --cache "$RUNNER_TEMP/postgresql-dependencies" "${bundle_args[@]}"
+      - name: Record the verification environment
+        shell: bash
+        run: |
+          printf 'Runner image: %s (%s)\n' "$ImageOS" "$ImageVersion"
+          dotnet --info
+          node --version
+          npm --version
+          python3 --version
+          if [ -x /usr/lib/postgresql/18/bin/postgres ]; then
+            /usr/lib/postgresql/18/bin/postgres --version
+          fi
+          google-chrome --version
+          dpkg-query -W tzdata libicu74
+      - name: Validate deployment configuration
+        if: matrix.group == 'repository'
+        run: python3 tools/check_deployment.py
+      - name: Run synthetic verification
+        shell: bash
+        run: |
+          python3 tools/check_all.py --group "${{ matrix.group }}" \
+            --pg-bin /usr/lib/postgresql/18/bin \
+            --dotnet "$(command -v dotnet)" \
+            --browser "$(command -v google-chrome)"
+
+  checks:
+    name: Stock database and browser checks
+    needs: [impact, verification]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Require every verification group to complete successfully
+        env:
+          IMPACT_RESULT: ${{ needs.impact.result }}
+          VERIFICATION_RESULT: ${{ needs.verification.result }}
+        run: test "$IMPACT_RESULT" = success && test "$VERIFICATION_RESULT" = success
+
+  publish:
+    name: Publish hosted release
+    needs: [impact, checks]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.impact.outputs.full == 'true' && vars.RELEASE_PUBLICATION_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: hosted-release
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out the verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up the pinned SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: |
+            global.json
+            src/**/packages.lock.json
+            tests/**/packages.lock.json
+      - name: Set up the pinned Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build release outputs
+        run: |
+          dotnet restore src/OpenEtrm.Api/OpenEtrm.Api.csproj --locked-mode
+          dotnet publish src/OpenEtrm.Api/OpenEtrm.Api.csproj --no-restore --no-self-contained --configuration Release --output "$RUNNER_TEMP/api"
+          dotnet restore src/OpenEtrm.Worker/OpenEtrm.Worker.csproj --locked-mode
+          dotnet publish src/OpenEtrm.Worker/OpenEtrm.Worker.csproj --no-restore --no-self-contained --configuration Release --output "$RUNNER_TEMP/worker"
+          npm ci --prefix web --ignore-scripts
+          npm run build --prefix web
+          mkdir "$RUNNER_TEMP/release"
+          python3 tools/package_release.py --api "$RUNNER_TEMP/api" --worker "$RUNNER_TEMP/worker" --web web/dist \
+            --output "$RUNNER_TEMP/release/openetrm-release.tar.gz" \
+            --repository "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Attest the complete release envelope
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/release/openetrm-release.tar.gz
+      - name: Publish the attested release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_FILE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          python3 tools/publish_release.py --directory "$RUNNER_TEMP/release" --attestation "$ATTESTATION_FILE"

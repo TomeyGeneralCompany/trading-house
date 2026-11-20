@@ -1,0 +1,254 @@
+using System.Collections.Immutable;
+using System.Text.Json;
+using OpenEtrm.MarketData;
+
+namespace OpenEtrm.Api;
+
+// A page report's page, the read its selection names, once it parses, and the Blotter's layout where it states one.
+sealed record PageRead(string Page,ToolCall? Call,BlotterLayout? Layout,bool SupportsRead=true);
+
+// What the Blotter showed of its panes and window when the question was asked (D271): whether its details and charts were
+// open, each the shown tab of its group in the panes as drawn and not put away, and whether it was in a window of its own.
+sealed record BlotterLayout(bool Details,bool Charts,bool PoppedOut);
+
+// The page a question was asked from (docs/ai-assistant.md §7.3, §8): exactly {"page","selection"}, the page one of a
+// closed set with one id per navigable view, and on a page the Blotter reports optionally its "layout". A supported page's
+// selection is an input of its read tool for one of the views the page shows; an unsupported page's selection is empty.
+// Ask refuses any other report before admission, and Read current page dispatches the stored report with the same parser.
+static class PageReports
+{
+    // A page: the tool that reads it, the operations behind the views it shows and, for a page the assistant reads, the
+    // name navigation targets label it with and whether Navigate opens it (D250).
+    sealed record Page(string? Tool,ImmutableHashSet<string> Operations,string? Name,bool Navigable=true);
+
+    static readonly ImmutableDictionary<string,Page> Pages=new Dictionary<string,Page>
+    {
+        ["curves"]=new("read_market_data",["market_data.curves_v1","market_data.curve_v1","market_data.observations_v1"],"Curves & prices"),
+        ["contract_definitions"]=new("read_market_data",["market_data.contract_definitions_v1"],"Contract definitions"),
+        ["schedules"]=new("read_schedules",["schedules.library_v1"],"Schedules"),
+        ["power_tous"]=new("read_schedules",["schedules.tou_products_v1","schedules.power_hours_v1"],"Power TOUs"),
+        ["reference_data"]=new("read_reference_data",["reference_data.table_v1"],"Reference data"),
+        ["parties"]=new("read_trade_parties",["trade_parties.versions_v1"],"Entities & counterparties"),
+        ["blotter"]=new("read_trades",["trades.blotter_v1","trades.trade_v1","trades.futures_option_catalog_v2"],"Blotter"),
+        ["custom_curves"]=new("read_custom_curves",["custom_curves.catalog_v1","custom_curves.prepare_v1","custom_curves.save_draft_v1"],"Curve builder"),
+        ["jobs"]=new("read_jobs",["jobs.list_v1","jobs.history_v1"],"Jobs"),
+        // The inspected PPA is the Blotter's trade view of it; its target opens it in the Blotter.
+        ["ppa"]=new("read_trades",["trades.trade_v1","trades.ppa_book_v1"],"PPA bookings",false),
+        ["blotter_risk"]=Workspace("Blotter risk"),["blotter_risk_lens"]=Workspace("Blotter risk lens"),["blotter_new_trade"]=Workspace("New trade"),["blotter_new_future"]=Workspace("New futures trade"),["blotter_new_swap"]=Workspace("New swap"),["blotter_new_ppa"]=Unsupported("New PPA"),["blotter_new_gas"]=Unsupported("New physical gas trade"),["blotter_new_park_loan"]=Unsupported("New Park and Loan agreement"),["blotter_new_crude"]=Unsupported("New physical crude trade"),["blotter_new_lng"]=Unsupported("New physical LNG cargo"),["blotter_new_heat_rate_call"]=Unsupported("New heat-rate call option"),["blotter_new_gas_storage"]=Unsupported("New gas storage contract"),["blotter_new_option"]=Unsupported("New futures option trade"),
+        ["physical_power"]=Unsupported("Operating facilities"),["rec_inventory"]=Unsupported("REC inventory"),["blotter_new_rec"]=Unsupported("New REC forward"),["blotter_operating_right"]=Unsupported("Saved operating right"),["blotter_rec_forward"]=Unsupported("Saved REC forward"),["dashboard"]=Unsupported("Dashboard"),["vol_surfaces"]=Unsupported("Vol surfaces"),["options"]=Unsupported("Options"),
+        ["blotter_new_transport"]=Unsupported("New Transport agreement"),
+        ["facility_definitions"]=Unsupported("Facility definitions"),["facility_activity"]=Unsupported("Physical facility activity"),["transport_capacity"]=Unsupported("Transport capacity"),["transport_route_plans"]=Unsupported("Transport route plans"),
+        ["delivery_workbench_gas"]=Unsupported("Gas delivery workbench"),["delivery_workbench_crude"]=Unsupported("Crude delivery workbench"),
+        ["lifecycle"]=Workspace("Lifecycle"),["physical_operations"]=Workspace("Physical operations"),["facility_quantities"]=new("read_workspace_page",["workspace.page_v1"],"Facilities",false),["gas_setup"]=Workspace("Gas delivery setup"),["crude_setup"]=Workspace("Crude delivery setup"),["physical_gas"]=Unsupported("Physical gas bookings"),["physical_crude"]=Unsupported("Physical crude bookings"),["risk_jobs"]=Workspace("Risk"),["delivery_prices"]=Workspace("Delivery prices"),["interval_series"]=Workspace("Interval data"),
+        ["interval_curves"]=Workspace("Hourly / sub-hourly curves"),["users_access"]=Workspace("Users & access"),["settings_ai"]=Workspace("AI settings")
+    }.ToImmutableDictionary(StringComparer.Ordinal);
+
+    static Page Unsupported(string name)=>new(null,[],name);
+    static Page Workspace(string name)=>new("read_workspace_page",["workspace.page_v1"],name);
+    internal static IEnumerable<string> All=>Pages.Keys.Order(StringComparer.Ordinal);
+    internal static bool Operational(string page)=>page is "users_access" or "settings_ai" or "jobs" or "risk_jobs" or "delivery_prices" or "interval_series";
+
+    // The pages the Blotter reports, which alone may state its layout.
+    static readonly ImmutableHashSet<string> BlotterPages=["blotter_new_transport","blotter_new_rec","blotter_operating_right","blotter_rec_forward","blotter","blotter_risk","blotter_risk_lens","blotter_new_trade","blotter_new_future","blotter_new_swap","blotter_new_ppa","blotter_new_gas","blotter_new_park_loan","blotter_new_option","blotter_new_crude","blotter_new_lng","blotter_new_heat_rate_call","blotter_new_gas_storage"];
+
+    // The pages the assistant reads, those Navigate opens, and those it does not read.
+    internal static IEnumerable<string> Supported=>Pages.Where(p=>p.Value.Tool is not null).Select(p=>p.Key);
+    internal static IEnumerable<string> Navigable=>Pages.Where(p=>p.Value is {Tool:not null,Navigable:true}).Select(p=>p.Key);
+    internal static IEnumerable<string> NotSupported=>Pages.Where(p=>p.Value.Tool is null).Select(p=>p.Key);
+    internal static bool Opens(string page)=>Pages[page] is {Tool:not null,Navigable:true};
+
+    // A page the assistant reads: its read tool, the operations behind the views it shows and its name; and the page an
+    // operation reads.
+    internal static string Tool(string page)=>Pages[page].Tool??throw new InvalidOperationException("The assistant does not read this page.");
+    internal static ImmutableHashSet<string> Operations(string page)=>Pages[page].Operations;
+    internal static string Name(string page)=>Pages[page].Name??throw new InvalidOperationException("The assistant does not read this page.");
+    // An operation two pages show belongs to the one Navigate opens.
+    internal static string PageOf(string operation)
+    {
+        var pages=Pages.Where(p=>p.Value.Operations.Contains(operation)).ToArray();
+        return (pages.Length==1?pages[0]:pages.Single(p=>p.Value.Navigable)).Key;
+    }
+
+    // A report ask accepts, or page_report_invalid.
+    public static void Require(JsonElement report)
+    {
+        if(Read(report) is not {} read||read.SupportsRead&&read.Call is null&&Pages[read.Page].Tool is not null)
+            throw new MarketDataException("page_report_invalid","Name the page you asked from, from the supported set, with its selection in the documented form.");
+    }
+
+    // The stored report's page and read: none for a page the assistant does not read, and no read for a selection that
+    // does not parse, which ask never stores.
+    public static PageRead? Dispatch(JsonElement report)=>Read(report) is {SupportsRead:true} read&&Pages[read.Page].Tool is not null?read:null;
+
+    internal static BlotterDigestView? DigestView(JsonElement report)
+    {
+        if(report.TryGetProperty("view",out var view))return BlotterDigestView.Parse(view);
+        if(Dispatch(report)?.Call?.Arguments is BlotterArguments blotter)
+            return new(blotter.View.Mode!,blotter.View.BookIds,blotter.View.PortfolioIds,blotter.View.GroupBy,blotter.View.Measures,null);
+        return null;
+    }
+
+    // Only the facility page has a business date independent of a pricing frame. This immutable
+    // report member participates in ask retry equality before the knowledge context is captured.
+    internal static DateOnly? BusinessDate(JsonElement report)
+    {
+        if(!report.TryGetProperty("businessDate",out var date))return null;
+        if(report.GetProperty("page").GetString()!="facility_quantities"||date.ValueKind!=JsonValueKind.String||
+            !DateOnly.TryParseExact(date.GetString(),"yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None,out var day))throw ToolInput.Invalid();
+        return day;
+    }
+
+    static PageRead? Read(JsonElement report)
+    {
+        if(report.ValueKind!=JsonValueKind.Object)return null;
+        var fields=report.EnumerateObject().Select(m=>m.Name).ToArray();
+        if(fields.Distinct().Count()!=fields.Length)return null;
+        var hasView=report.TryGetProperty("view",out var digestView);
+        var hasFocus=report.TryGetProperty("focus",out var focus);
+        var members=fields.Where(f=>f is not("view" or "focus" or "businessDate")).Order(StringComparer.Ordinal).ToArray();
+        var laid=members.SequenceEqual(["layout","page","selection"]);
+        if(!laid&&!members.SequenceEqual(["page","selection"])||report.GetProperty("page") is not {ValueKind:JsonValueKind.String} named||!Pages.TryGetValue(named.GetString()!,out var page))
+            return null;
+        var id=named.GetString()!;
+        try{_=BusinessDate(report);}catch(ToolRefusal){return null;}
+        if(hasFocus)
+        {
+            if(!BlotterPages.Contains(id))return null;
+            try{_=PageFocus.Parse(focus);}catch(ToolRefusal){return null;}
+        }
+        if(hasView)
+        {
+            if(!BlotterPages.Contains(id))return null;
+            try{_=BlotterDigestView.Parse(digestView);}catch(Exception e) when(e is ToolRefusal or MarketDataException){return null;}
+        }
+        BlotterLayout? layout=null;
+        if(laid&&(!BlotterPages.Contains(id)||(layout=Layout(report.GetProperty("layout"))) is null))return null;
+        var selection=report.GetProperty("selection");
+        if(page.Tool is null)return selection.ValueKind==JsonValueKind.Object&&!selection.EnumerateObject().Any()?new(id,null,layout):null;
+        try
+        {
+            // A retained gas-service trade can host a question before its trade reader is qualified.
+            // Validate its identity without offering or dispatching another product's reader.
+            if(id=="blotter"&&selection.ValueKind==JsonValueKind.Object&&selection.TryGetProperty("instrumentType",out var instrument)
+                &&instrument.ValueKind==JsonValueKind.String&&instrument.GetString() is ("physical_gas_park_loan" or "physical_gas_park_custody" or "physical_gas_transport"))
+            {
+                var trade=new ToolInput(selection);
+                trade.Exactly("view","mode","bookIds","portfolioIds","groupBy","measures","tradeId","instrumentType","revision");
+                _=trade.Choice("view","trade");
+                trade.Null("mode","bookIds","portfolioIds","groupBy","measures");
+                _=trade.Id("tradeId");_=trade.Revision("revision");
+                return new(id,null,layout,SupportsRead:false);
+            }
+            if(page.Tool=="read_workspace_page")
+            {
+                _=new ToolInput(selection);
+                if(id=="risk_jobs")RiskSelection(selection);
+                else if(id=="physical_operations"&&selection.EnumerateObject().Any())PhysicalSelection(selection);
+                else if(id=="facility_quantities"&&selection.EnumerateObject().Any())
+                {
+                    var facility=new ToolInput(selection);facility.Exactly("ledgerId");
+                    if(facility.Has("ledgerId"))_=facility.Id("ledgerId");
+                }
+                else if(selection.EnumerateObject().Any())Selected(id,selection);
+                return new(id,AgentTools.Parse(page.Tool,JsonSerializer.SerializeToElement(new{page=id})),layout);
+            }
+            // Curve builder reports the curve it has open, if any, and whether it holds unsaved edits, and reads its catalog (D260).
+            if(id=="custom_curves"){_=OpenCurve(selection);return new(id,AgentTools.Parse(page.Tool,NoInput),layout);}
+            var call=AgentTools.Parse(page.Tool,selection);
+            if(hasView&&call.Arguments is BlotterArguments blotter)
+            {
+                var view=BlotterDigestView.Parse(digestView);var selected=blotter.View;
+                if(view.Mode!=selected.Mode||!view.BookIds.ToHashSet().SetEquals(selected.BookIds)||
+                    !view.PortfolioIds.ToHashSet().SetEquals(selected.PortfolioIds)||
+                    view.Mode=="pivot"&&(!view.GroupBy.SequenceEqual(selected.GroupBy)||!view.Measures.SequenceEqual(selected.Measures)))
+                    throw ToolInput.Invalid();
+            }
+            return new(id,page.Operations.Contains(call.Operation.Id)&&Shows(id,call)?call:null,layout);
+        }
+        catch(ToolRefusal){return new(id,null,layout);}
+    }
+
+    // A workspace page's selected read: one of the page's own reads, never a command (the Blotter's lens reads as its risk report).
+    static void Selected(string id,JsonElement selection)
+    {
+        var operation=SelectedRead(id,selection)?.Operation is {} code?AssistantOperations.Find(code):null;
+        if(operation is null||operation.RequiresApproval||operation.Page!=(id=="blotter_risk_lens"?"blotter_risk":id))throw ToolInput.Invalid();
+    }
+
+    // The read a workspace page's selection names, if any: Risk's selection without its view, any other page's as it is.
+    internal static WorkspaceArguments? SelectedRead(string page,JsonElement selection)
+    {
+        if(!selection.TryGetProperty("operation",out _))return null;
+        var read=page=="risk_jobs"?JsonSerializer.SerializeToElement(selection.EnumerateObject().Where(m=>m.Name!="view").ToDictionary(m=>m.Name,m=>m.Value)):selection;
+        return (WorkspaceArguments)AgentTools.Parse("read_page_operation",read).Arguments;
+    }
+
+    // Risk's views, by the name its report gives each and the name Looking at and the page digest show (D392).
+    static readonly ImmutableDictionary<string,string> RiskViews=new Dictionary<string,string>
+    {
+        ["reports"]="Reports",["pnl_explain"]="P&L explain",["scenarios_greeks"]="Scenarios & Greeks",["var_es"]="VaR / ES",["run_history"]="Run history"
+    }.ToImmutableDictionary(StringComparer.Ordinal);
+
+    // Risk's selection: exactly the view it shows and, in Reports only, the retained report open there, read by its id.
+    static void RiskSelection(JsonElement selection)
+    {
+        var input=new ToolInput(selection);
+        var view=input.Choice("view",[..RiskViews.Keys]);
+        if(!input.Has("operation")){input.Exactly("view");return;}
+        input.Exactly("view","operation","inputJson");
+        if(view!="reports"||SelectedRead("risk_jobs",selection) is not {Operation:"portfolio.risk.jobs.id_v1",Input:{} read})throw ToolInput.Invalid();
+        var request=new ToolInput(read);request.Exactly("body","parameters");request.Null("body");
+        var parameters=request.Members("parameters");parameters.Exactly("id");_=parameters.Id("id");
+    }
+
+    internal static string RiskViewName(JsonElement selection)=>RiskViews[selection.GetProperty("view").GetString()!];
+
+    // Physical operations' instrument and tab and, on a selected gas delivery row, its day, delivery side and stage: all of them or
+    // none of them. They identify what the page shows; the assistant reads them with its own authorized operations.
+    static void PhysicalSelection(JsonElement selection)
+    {
+        var input=new ToolInput(selection);input.Exactly("tradeId","bindingId","revision","instrumentType","tab","day","obligationId","stage");
+        _=input.Id("tradeId");_=input.Id("bindingId");_=input.Whole("revision",1,int.MaxValue);
+        var kind=input.Choice("instrumentType","physical_gas","physical_crude","physical_lng");
+        var tab=input.Choice("tab",kind=="physical_gas"?["overview","delivery","cash"]:["overview","delivery"]);
+        if(kind=="physical_gas"&&tab=="delivery"&&input.Has("day"))
+        {
+            if(!DateOnly.TryParseExact(input.Text("day",10,10),"yyyy-MM-dd",System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None,out _))throw ToolInput.Invalid();
+            _=input.Id("obligationId");_=input.Whole("stage",0,3);
+        }
+        else input.Null("day","obligationId","stage");
+    }
+
+    // The Blotter's layout: exactly {"pane":{"details","charts"},"poppedOut"}, each a flag; anything else is none.
+    static BlotterLayout? Layout(JsonElement layout)
+    {
+        try
+        {
+            var members=new ToolInput(layout);
+            members.Exactly("pane","poppedOut");
+            var pane=members.Members("pane");
+            pane.Exactly("details","charts");
+            return new(pane.Flag("details"),pane.Flag("charts"),members.Flag("poppedOut"));
+        }
+        catch(ToolRefusal){return null;}
+    }
+
+    static readonly JsonElement NoInput=JsonDocument.Parse("{}").RootElement.Clone();
+
+    // Curve builder's selection: exactly the curve it has open, or null, and whether it holds unsaved edits.
+    static (Guid? Curve,bool Unsaved) OpenCurve(JsonElement selection)
+    {
+        var members=new ToolInput(selection);
+        members.Exactly("curve","unsaved");
+        return(members.Has("curve")?members.Id("curve"):null,members.Flag("unsaved"));
+    }
+
+    // Whether a stored report shows this curve open in Curve builder with unsaved edits (D260).
+    internal static bool HoldsUnsaved(JsonElement report,Guid curve)=>
+        Read(report) is {Page:"custom_curves",Call:not null}&&OpenCurve(report.GetProperty("selection")) is {Unsaved:true} open&&open.Curve==curve;
+
+    // PPA bookings shows only PPAs, each at the revision it inspected.
+    static bool Shows(string page,ToolCall call)=>page!="ppa"||call.Arguments is not TradeArguments{InstrumentType:not "ppa"} and not TradeArguments{Revision:null};
+}

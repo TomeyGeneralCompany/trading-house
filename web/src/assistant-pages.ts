@@ -1,0 +1,347 @@
+import {cloneRead} from './read-references.js';
+import {tradingInstrumentTypes,type TradingInstrumentType} from './trading-instrument-types.js';
+// The pages as the assistant panel sees them (docs/ai-assistant.md §7.3, §8, §10.1, D191): the report an ask sends for
+// what a page shows, Looking at, which says exactly that, the context an ask pins, when a navigation target moves the
+// page, the places a move left for Back, and the plain lines the conversation shows. None of them names an identifier.
+import {grantPhrase,type Vendor} from './agent-grants.js';
+import {readPages,type Step,type Ending,type Usage,type TargetContext} from './assistant-events.js';
+import {physicalTabs,gasStages} from './physical-operations-grid.js';
+import {riskReportViews,riskViewNames,riskViews,type RiskView} from './risk-views.js';
+import type {NewProduct} from './new-trade.js';
+
+/**
+ * What the Blotter shows of its panes and window, which its report states beside the selection (D271). A pane is open when it is the shown
+ * tab of its group in the panes as drawn and is not put away: one behind another tab of its group is not open. A narrow page draws every
+ * pane in one group, so there only the pane that group shows is open (dock-model openTabs). `poppedOut`: the Blotter is in a window of its own.
+ */
+export type BlotterLayoutShown={pane:{details:boolean;charts:boolean};poppedOut:boolean};
+export type PivotCellFocus={keys:Record<string,unknown>;measure:string};
+export type PageFocus={tradeIds:string[];pivotCell:PivotCellFocus|null};
+export type PageReport={page:string;selection:Record<string,unknown>;layout?:BlotterLayoutShown;view?:BlotterDigestView;focus?:PageFocus;businessDate?:string};
+export type BlotterDigestView=BlotterSelection&{primaryMeasure:string|null};
+export type BlotterSelection={mode:'trades'|'pivot';bookIds:string[];portfolioIds:string[];groupBy:string[];measures:string[]};
+export type TradeShown={tradeId:string;instrumentType:TradingInstrumentType;revision:number;reference:string};
+/** A new trade being entered in the Blotter's panel: of its product, or of none until the person chooses one. */
+export type EntryShown={product:NewProduct|null};
+/** What PPA bookings shows: the inspected trade's revision, else the book whose PPA trades it lists, else neither. */
+export type PpaShown={trade:{tradeId:string;revision:number}|null;book:string|null};
+// What a web page shows, as the page's own state names it.
+export type WorkspaceSelection={operation:string;inputJson:string};
+// The physical instrument and tab Physical operations shows and, on a selected gas delivery row, its day, delivery side and stage.
+export type PhysicalShown={tradeId:string;bindingId:string;revision:number;instrumentType:'physical_gas'|'physical_crude'|'physical_lng';tab:string;
+  day:string|null;obligationId:string|null;stage:number|null};
+export type PageState=(
+  {page:'market';curve:string|null;tab:'prices'|'dependencies'|'inputs'}|{page:'power';frame:boolean}|{page:'configuration'}|{page:'schedules'}
+  |{page:'reference';table:string;search:string}|{page:'parties';kind:string}
+  |({page:'futures';risk:boolean;trade:TradeShown|null;entry:EntryShown|null;lens:'values'|'risk';view:BlotterSelection}&BlotterLayoutShown)
+  |{page:'jobs';job:string|null}|({page:'ppa'}&PpaShown)|{page:'custom-curves';curve:string|null;unsaved:boolean}
+  |{page:'physical-operations';physical?:PhysicalShown}|{page:'lifecycle'}|{page:'risk';view:RiskView}
+  |{page:'rec-inventory'|'physical-power'|'facilities'|'dashboard'|'crude-setup'|'gas-setup'|'gas'|'crude'|'delivery'|'interval-series'|'interval-curves'|'vol-surfaces'|'options'|'admin'|'ai'})&{assistant?:WorkspaceSelection;digestView?:BlotterDigestView;focus?:PageFocus;businessDate?:string;facilityLedger?:string|null;facilitySection?:'quantities'|'definitions'|'activity'|'transport'|'route'|'gas-delivery'|'crude-delivery'};
+// The knowledge a page shows: working data, with its As of frame once one is chosen; the selected historical view; or a
+// historical selection not yet applied, which pins nothing.
+export type PageContext={mode:'current';frameId:string|null;frameLabel:string|null;businessDate?:string}
+  |{mode:'retained';contextId:string;effectiveOn:string;knownAtLabel:string;frameId:string|null;frameLabel:string|null}|{mode:'unapplied'};
+
+export const inconsistent=()=>Error('The assistant’s page is inconsistent. Reload it.');
+const unsupported:Record<string,string>={'rec-inventory':'rec_inventory','physical-power':'physical_power',facilities:'facility_quantities',dashboard:'dashboard','crude-setup':'crude_setup','gas-setup':'gas_setup',gas:'physical_gas',crude:'physical_crude',delivery:'delivery_prices','interval-series':'interval_series',
+  'interval-curves':'interval_curves','vol-surfaces':'vol_surfaces',options:'options',admin:'users_access',ai:'settings_ai'};
+// Pages the assistant reads but Navigate does not open (D250).
+const unopened:readonly string[]=['ppa'];
+const noBlotter={mode:null,portfolioIds:null,groupBy:null,measures:null};
+
+// The page a trade being entered is reported as: one id per product, and one while none is chosen. The assistant reads none of them.
+const entryPages={rec:'blotter_new_rec',none:'blotter_new_trade',futures:'blotter_new_future',swaps:'blotter_new_swap',ppa:'blotter_new_ppa',gas:'blotter_new_gas',transport:'blotter_new_transport','park-loan':'blotter_new_park_loan',crude:'blotter_new_crude',lng:'blotter_new_lng',options:'blotter_new_option',toll:'blotter_new_heat_rate_call',storage:'blotter_new_gas_storage'} as const;
+// The report an ask sends: a read page's selection is its read tool's input for the view the page shows; any other
+// page's is empty. Blotter trade rows name no grouping, which the Blotter keeps for when its totals are shown again. What the
+// Blotter's panel holds comes first, its risk report, a new trade or a position; then its trade rows under the Risk lens, whose
+// risk results the assistant does not read (D222), or the rows and totals it reads.
+export function pageReport(state:PageState):PageReport{
+  switch(state.page){
+    case 'lifecycle':return {page:'lifecycle',selection:{}};
+    case 'physical-operations':return {page:'physical_operations',selection:state.physical?{...state.physical}:{}};
+    case 'facilities':return state.facilitySection&&state.facilitySection!=='quantities'?{page:state.facilitySection==='gas-delivery'?'delivery_workbench_gas':state.facilitySection==='crude-delivery'?'delivery_workbench_crude':state.facilitySection==='route'?'transport_route_plans':state.facilitySection==='transport'?'transport_capacity':state.facilitySection==='definitions'?'facility_definitions':'facility_activity',selection:{}}:
+      {page:'facility_quantities',selection:state.businessDate?{ledgerId:state.facilityLedger??null}:{},...(state.businessDate?{businessDate:state.businessDate}:{})};
+    // Risk names the view it shows, and only Reports the retained report open there (D392).
+    case 'risk':return {page:'risk_jobs',selection:{view:riskReportViews[state.view],...(state.view==='risk'&&state.assistant?state.assistant:{})}};
+    case 'market':return {page:'curves',selection:state.curve===null?{view:'curves',curve:null}:{view:state.tab==='inputs'?'observations':'curve',curve:state.curve}};
+    case 'power':return {page:'power_tous',selection:{view:state.frame?'power_hours':'tou_products'}};
+    // Contract pricing and Publications have no assistant read contract; the panel stays unavailable on those views.
+    case 'configuration':throw inconsistent();
+    // Curve builder names the saved curve it has open, if any, and whether it holds unsaved edits, which the assistant does not save over (D260).
+    case 'custom-curves':return {page:'custom_curves',selection:{curve:state.curve,unsaved:state.unsaved}};
+    case 'schedules':return {page:'schedules',selection:{view:'library'}};
+    case 'reference':return {page:'reference_data',selection:{table:state.table,search:state.search}};
+    case 'parties':return {page:'parties',selection:{kind:state.kind}};
+    // An inspected PPA is the Blotter's trade view of it; a listed book is its PPA trades. Before either there is no
+    // book to report, which Looking at says, and nothing is asked from.
+    case 'ppa':return {page:'ppa',selection:state.trade?{view:'trade',...noBlotter,bookIds:null,tradeId:state.trade.tradeId,instrumentType:'ppa',revision:state.trade.revision}
+      :{view:'ppa_book',...noBlotter,bookIds:state.book?[state.book]:[],tradeId:null,instrumentType:null,revision:null}};
+    // The page's own directory also lists jobs others own for a job manager, which the assistant does not read, so the list it
+    // reports is always the first page of the person's own jobs.
+    case 'jobs':return {page:'jobs',selection:state.job?{view:'history',job:state.job,page:null,before:null}:{view:'jobs',job:null,page:0,before:null}};
+    case 'futures':{
+      const layout:BlotterLayoutShown={pane:{...state.pane},poppedOut:state.poppedOut};
+      const pointers={...(state.digestView?{view:cloneRead(state.digestView)}:{}),...(state.focus?{focus:cloneRead(state.focus)}:{})};
+      if(state.risk)return {page:'blotter_risk',selection:state.assistant??{},layout,...pointers};
+      if(state.entry)return {page:entryPages[state.entry.product??'none'],selection:state.entry.product==='rec'?{}:state.assistant??{},layout,...pointers};
+      if(!state.trade&&state.lens==='risk')return {page:'blotter_risk_lens',selection:state.assistant??{},layout,...pointers};
+      const t=state.trade,v=state.view,pivot=v.mode==='pivot';
+      if(t?.instrumentType==='operating_right'||t?.instrumentType==='rec_forward')return {page:t.instrumentType==='operating_right'?'blotter_operating_right':'blotter_rec_forward',selection:{},layout,...pointers};
+      return {page:'blotter',layout,...pointers,selection:t?{view:'trade',mode:null,bookIds:null,portfolioIds:null,groupBy:null,measures:null,tradeId:t.tradeId,instrumentType:t.instrumentType,revision:t.revision}
+        :{view:'blotter',mode:v.mode,bookIds:[...v.bookIds],portfolioIds:[...v.portfolioIds],groupBy:pivot?[...v.groupBy]:[],measures:pivot?[...v.measures]:[],
+          tradeId:null,instrumentType:null,revision:null}};
+    }
+    default:return {page:unsupported[state.page],selection:state.assistant??{}};
+  }
+}
+
+// What Looking at showed, kept to compare with the page at send: the report it shows whole, the Blotter's layout too, and its context.
+export const lookingKey=({report,context}:{report:PageReport;context:PageContext})=>JSON.stringify([report.page,report.selection,report.layout??null,report.view??null,report.focus??null,context]);
+
+// The selection an ask retains. A financial tool validates any frame it requires when requested.
+export function askKnowledge(context:PageContext){
+  if(context.mode==='unapplied')return undefined;
+  return context.mode==='current'?{mode:'current',contextId:null,frameId:context.frameId}:{mode:'retained',contextId:context.contextId,frameId:context.frameId};
+}
+
+const pageNames:Record<string,string>={lifecycle:'Lifecycle',physical_operations:'Physical operations',gas_setup:'Gas delivery setup',crude_setup:'Crude delivery setup',facility_quantities:'Facilities',facility_definitions:'Facility definitions',facility_activity:'Physical facility activity',transport_capacity:'Transport capacity',transport_route_plans:'Transport route plans',delivery_workbench_gas:'Gas delivery workbench',delivery_workbench_crude:'Crude delivery workbench',curves:'Curves & prices',contract_definitions:'Contract definitions',schedules:'Schedules',power_tous:'Power TOUs',
+  reference_data:'Reference data',parties:'Entities & counterparties',blotter:'Blotter',blotter_operating_right:'Blotter',blotter_rec_forward:'Blotter',blotter_risk:'Blotter',blotter_risk_lens:'Blotter',blotter_new_rec:'New trade',blotter_new_trade:'New trade',blotter_new_future:'New trade',blotter_new_swap:'New trade',blotter_new_ppa:'New trade',blotter_new_gas:'New trade',blotter_new_transport:'New trade',blotter_new_park_loan:'New trade',blotter_new_option:'New trade',blotter_new_crude:'New trade',blotter_new_lng:'New trade',blotter_new_heat_rate_call:'New trade',blotter_new_gas_storage:'New trade',delivery_prices:'Delivery prices',
+  custom_curves:'Curve builder',interval_series:'Interval data',interval_curves:'Curves & prices · Hourly / sub-hourly',jobs:'Jobs',users_access:'Users & access',
+  rec_inventory:'REC inventory',physical_power:'Operating facilities',risk_jobs:'Risk',settings_ai:'AI',dashboard:'Dashboard',physical_gas:'Physical gas bookings',physical_crude:'Physical crude bookings',ppa:'PPA bookings',vol_surfaces:'Vol surfaces',options:'Options'};
+// The label catalog is checked against server admission by the owned browser fixture.
+export const reportedPages:readonly string[]=Object.freeze(Object.keys(pageNames));
+const dimensions:Record<string,string>={portfolio:'portfolio',book:'book',market:'market',contract:'contract',instrumentType:'instrument type',commodity:'commodity'};
+const counted=(n:number,noun:string)=>`${n} ${noun}${n===1?'':'s'}`;
+const unreadTrade=(report:PageReport)=>report.page==='blotter'&&report.selection.view==='trade'&&(report.selection.instrumentType==='physical_gas_park_loan'||report.selection.instrumentType==='physical_gas_park_custody'||report.selection.instrumentType==='physical_gas_transport');
+const joined=(names:string[])=>names.length>1?`${names.slice(0,-1).join(', ')} and ${names.at(-1)}`:names[0];
+export type Names={curve:(code:string)=>string;table:(code:string)=>string};
+
+const unsent='The assistant can inspect available terms, preview explicit drafts and prepare changes for your authorization.';
+function shows(report:PageReport,names:Names,trade?:string){
+  const s=report.selection;
+  switch(report.page){
+    case 'curves':return s.view==='curves'?'Curve directory':`${s.view==='observations'?'Inputs':'Prices'} of ${names.curve(String(s.curve))}`;
+    case 'contract_definitions':return 'Contract date definitions';
+    case 'custom_curves':return 'Published curve ingredients and saved curve library. Unsaved edits are not sent.';
+    case 'schedules':return 'Schedule library';
+    case 'power_tous':return s.view==='power_hours'?'TOU products and power hours':'TOU products';
+    case 'reference_data':return s.table===''?'No table is shown yet':names.table(String(s.table))+(s.search?` · rows matching “${s.search}”`:'');
+    case 'parties':return s.kind==='legal_entity'?'Legal entities':'Counterparties';
+    case 'blotter':{
+      if(s.view==='trade'){if(!trade)throw inconsistent();return `Trade ${trade}, revision ${s.revision}`+(unreadTrade(report)?'. The assistant does not read this trade.':'');}
+      const books=(s.bookIds as string[]).length,portfolios=(s.portfolioIds as string[]).length;
+      const scope=books||portfolios?[books?counted(books,'book'):'',portfolios?counted(portfolios,'portfolio'):''].filter(Boolean).join(', '):'every book you can read';
+      return `${s.mode==='pivot'?`Totals by ${joined((s.groupBy as string[]).map(d=>dimensions[d]))}`:'Trade rows'} · ${scope}`;
+    }
+    case 'jobs':return s.view==='history'?'The history of the job whose details are open':'Your jobs. Other people’s jobs are not sent.';
+    case 'ppa':return `${s.view==='trade'?`Inspected PPA trade, revision ${s.revision}`:(s.bookIds as string[]).length?'PPA trades of the selected book'
+      :'No PPA trades are listed yet: load a book’s PPA trades to ask about them'}. Read at the As of date and knowledge cutoff of the context below, not this page’s own.`;
+    case 'blotter_risk':return 'Risk operations and calculations under the pinned context.';
+    case 'blotter_risk_lens':return 'Risk operations for the trade rows under the pinned context.';
+    case 'blotter_new_trade':return `A new trade is being started: no product is chosen yet. ${unsent}`;
+    case 'blotter_new_future':return `A new future is being entered. ${unsent}`;
+    case 'blotter_new_swap':return `A new swap is being entered. ${unsent}`;
+    case 'blotter_new_ppa':return 'A new PPA is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_operating_right':return 'A saved operating right is open. The assistant does not read this trade.';
+    case 'blotter_rec_forward':return 'A saved REC forward is open. The assistant does not read this trade.';
+    case 'rec_inventory':return 'Certificate inventory and standalone forwards. The assistant does not read this page.';
+    case 'physical_power':return 'Operating facilities and supplied plans. The assistant does not read this page.';
+    case 'blotter_new_rec':return 'A qualified REC forward is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_new_lng':return 'A new physical LNG cargo is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_new_heat_rate_call':return 'A new heat-rate call option is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_new_gas_storage':return 'A new gas storage contract is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_new_crude':return 'A new physical crude trade is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_new_option':return 'A new futures option is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_new_gas':return 'A new physical gas trade is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_new_transport':return 'A new Transport agreement is being entered. The assistant does not read a trade being entered.';
+    case 'blotter_new_park_loan':return 'A new Park and loan trade is being entered. The assistant does not read a trade being entered.';
+    case 'lifecycle':return 'Lifecycle actions and saved policies at the header context. Unsaved inputs are not sent.';
+    case 'physical_operations':{
+      if(!s.tradeId)return 'Physical instrument operations under the header context. Unsaved edits are not sent.';
+      const tab=physicalTabs(String(s.instrumentType)).find(([id])=>id===s.tab)?.[1];if(!tab)throw inconsistent();
+      return `Selected physical instrument, revision ${s.revision} · ${tab}${s.day?` · Gas day ${s.day} · ${gasStages[Number(s.stage)]} stage`:''}. Unsaved edits are not sent.`;
+    }
+    case 'gas_setup':case 'crude_setup':return 'Published delivery setup and field definitions in the header context. Unsaved edits are not sent.';
+    case 'facility_quantities':return 'Facility quantities and allocations at the header operating date and knowledge cutoff. Unsaved edits are not sent.';
+    case 'risk_jobs':return (s.operation?'The retained report open here · ':'')+'Authorized page operations, reads and previews. Changes require your authorization.';
+    default:return ['dashboard','physical_gas','physical_crude','vol_surfaces','options'].includes(report.page)?'The assistant does not read this page.':'Authorized page operations, reads and previews. Changes require your authorization.';
+  }
+}
+function contextLine(context:PageContext){
+  if(context.mode==='unapplied')return 'Historical selection not applied · apply it to ask about it';
+  const frame=context.frameLabel?`As of ${context.frameLabel}`:'';
+  if(context.mode==='current')return `Working data · ${context.businessDate?`Operating date ${context.businessDate}`:frame||'no As of date selected'}`;
+  return `Historical view · ${context.effectiveOn}, as known at ${context.knownAtLabel} · ${frame||'no As of date chosen'}`;
+}
+// Looking at's line for the Blotter's layout: its details and charts open or closed, and the window it is in.
+const layoutLine=({pane,poppedOut}:BlotterLayoutShown)=>
+  [`Details ${pane.details?'open':'closed'}`,`Charts ${pane.charts?'open':'closed'}`,poppedOut?'Pop-out window':'Main window'].join(' · ');
+// The Risk view a report names, as its sidebar names it.
+function riskViewName(report:PageReport){
+  const view=riskViews.find(v=>riskReportViews[v]===report.selection.view);
+  if(!view)throw inconsistent();
+  return riskViewNames[view];
+}
+// Looking at: the page, what it shows, the Blotter's layout where it reports one, and the context the next question will pin, or that the
+// page is not read.
+export function lookingAt(report:PageReport,context:PageContext,names:Names,extra:{trade?:string}={}){
+  if(!Object.hasOwn(pageNames,report.page))throw inconsistent();
+  // A page whose report names no selection yet, Reference data before it shows a table or PPA bookings before it lists a
+  // book, has nothing to be asked from.
+  const named=!(report.page==='reference_data'&&report.selection.table===''||report.page==='ppa'&&report.selection.view==='ppa_book'&&!(report.selection.bookIds as string[]).length);
+  return {page:report.page==='risk_jobs'?`${pageNames.risk_jobs} · ${riskViewName(report)}`:pageNames[report.page],shows:shows(report,names,extra.trade)+(report.focus?.tradeIds.length?` · ${counted(report.focus.tradeIds.length,'selected position')}`:report.focus?.pivotCell?' · Selected pivot cell':''),...(report.layout?{layout:layoutLine(report.layout)}:{}),context:contextLine(context),supported:!unreadTrade(report)&&(readPages.includes(report.page)||unopened.includes(report.page)),
+    askable:named&&askKnowledge(context)!==undefined};
+}
+
+// A target changes context when its pinned knowledge or As of frame is not what the page has selected.
+export function changesContext(target:TargetContext,page:PageContext){
+  if(target.mode==='operational')return page.mode!=='current';
+  if(page.mode==='unapplied')return true;
+  return target.mode==='current'?page.mode!=='current'||page.frameId!==target.frameId
+    :page.mode!=='retained'||page.contextId!==target.contextId||page.frameId!==target.frameId;
+}
+// Only a target that arrives live, keeps the context and leaves nothing unsaved moves the page; any other waits for Go, and so does one
+// the person reviews: a proposed curve or a saved draft (D260).
+export const targetAction=(target:{live:boolean;changesContext:boolean;unsaved:boolean;review?:boolean})=>target.live&&!target.changesContext&&!target.unsaved&&!target.review?'move':'go';
+
+const webPages:Record<string,string>={lifecycle:'lifecycle',physical_operations:'physical-operations',facility_quantities:'facilities',gas_setup:'gas-setup',crude_setup:'crude-setup',curves:'market',contract_definitions:'schedules',schedules:'schedules',power_tous:'power',reference_data:'reference',
+  parties:'parties',blotter:'futures',custom_curves:'custom-curves',jobs:'jobs',risk_jobs:'risk',delivery_prices:'delivery',interval_series:'interval-series',
+  interval_curves:'interval-curves',users_access:'admin',settings_ai:'ai',blotter_risk:'futures',blotter_risk_lens:'futures',blotter_new_trade:'futures',blotter_new_future:'futures',blotter_new_swap:'futures'};
+// The web page a target opens: only one the assistant reads.
+export function webPage(page:string){if(!Object.hasOwn(webPages,page))throw inconsistent();return webPages[page];}
+
+// A place a move left: the web page, what it showed in report form and the context it showed it in.
+export type Place={page:string;report:PageReport;context:PageContext};
+// The places this tab's moves left, for their notices' Back, kept in memory only: a reload forgets them.
+export class NavigationHistory{
+  #places=new Map<string,Place>();
+  #moves=0;
+  record(place:Place){const key=`move-${++this.#moves}`;this.#places.set(key,cloneRead(place));return key;}
+  origin(key:string){const place=this.#places.get(key);return place&&cloneRead(place);}
+  clear(){this.#places.clear();}
+}
+
+const toolNames:Record<string,string>={present_walkthrough:'Present walkthrough',read_page_digest:'Read page digest',read_current_page:'Read the page',read_market_data:'Read market data',read_trades:'Read trades',futures_option_catalog:'Read the futures option catalog',
+  read_trade_parties:'Read trade parties',read_schedules:'Read schedules',read_reference_data:'Read reference data',read_custom_curves:'Read curve ingredients',prepare_custom_curve:'Prepare proposed curve',save_custom_curve_draft:'Prepare curve draft',read_jobs:'Read your jobs',navigate:'Navigate',
+  search_chat_history:'Search your earlier chats',read_workspace_page:'Read workspace page',discover_page_operations:'Inspect available operations',read_page_operation:'Read or preview page data',propose_page_action:'Prepare change for authorization'};
+const reasons:Record<string,string>={walkthrough_plan_invalid:'the plan names an unavailable step, page or target',walkthrough_fill_requires_explicit_terms:'state the exact unsaved ticket terms in a new ask',tool_arguments_invalid:'the request was not one this tool accepts',result_too_large:'the result was larger than one read returns',
+  page_not_supported:'the assistant does not read the page you asked from',tool_not_enabled:'this agent does not read the page you asked from',
+  page_selection_unavailable:'what the page showed is not available in the pinned context',snapshot_missing:'it needs an As of date, and none was chosen',
+  power_historical:'a historical view does not read current definitions',access_denied:'the agent’s access does not cover it',
+  missing_curve:'that curve is not in the pinned market data',missing_observation:'market data it needs is missing',blotter_view:'that Blotter view is not available',
+  futures_trade:'that trade is not available in the pinned context',swap_trade:'that trade is not available in the pinned context',
+  job_not_found:'that job is not one of yours',jobs_current_only:'a historical view does not read current jobs',tool_failed:'the read failed',
+  limit_tool_read:'the read took longer than this agent’s time per read',historical_read_only:'a historical view is read-only',
+  custom_curve_open_unsaved:'the curve is open with unsaved edits',custom_curve_agent_scope:'the assistant saves only new curves and its own drafts',
+  custom_curve_conflict:'the curve, its code or its inputs changed',delegation_denied:'your authoring or the agent’s grant does not allow it'};
+// A step: the tool's name and, for a refusal or failure, why in plain words; a withheld earlier turn has a line of its own.
+export function stepLine(step:Step){
+  if('withheld' in step)return 'An earlier answer was left out: what it read can no longer be read for you';
+  if(!Object.hasOwn(toolNames,step.tool))throw inconsistent();
+  if(step.code===null)return toolNames[step.tool];
+  return `${toolNames[step.tool]} · ${Object.hasOwn(reasons,step.code)?reasons[step.code]:'the tool refused this request'}`;
+}
+
+const tooLong='This conversation is too long to continue. Start a new conversation.';
+const failures:Record<string,string>={limit_elapsed:'The answer ran out of time.',limit_tool_steps:'The answer used as many reads as this agent may make.',
+  limit_output_tokens:'The answer reached this agent’s length limit.',limit_input_tokens:tooLong,context_window_exceeded:tooLong,
+  limit_input_unverifiable:'The answer stopped because the provider’s token usage could not be verified. Ask an administrator to check the provider’s usage mapping.',
+  access_changed:'The answer stopped because access to what it read changed.',tool_failed:'A read failed, so the answer could not finish.',
+  limit_tool_read:'A read took longer than this agent’s time per read, so the answer could not finish.'};
+const cancellations:Record<string,string>={session_ended:'The answer stopped because your session changed.',
+  access_changed:'The answer stopped because your grant to this agent ended.',agent_retired:'The answer stopped because the agent was retired.',
+  model_disabled:'The answer stopped because its model was switched off.',model_provider_disabled:'The answer stopped because its provider was switched off.'};
+// Why an answer stopped; a completed answer needs no line.
+export function endingLine(ending:Ending){
+  switch(ending.state){
+    case 'completed':return null;
+    case 'interrupted':return 'The answer was interrupted when the assistant restarted.';
+    case 'cancelled':return ending.code===null?'You stopped this answer.':Object.hasOwn(cancellations,ending.code)?cancellations[ending.code]:'The answer was stopped.';
+    default:return ending.code!==null&&Object.hasOwn(failures,ending.code)?failures[ending.code]:'The answer could not finish.';
+  }
+}
+export const startsOver=(ending:Ending)=>endingLine(ending)===tooLong;
+
+const grouped=new Intl.NumberFormat('en-US',{maximumFractionDigits:0});
+const figure=(d:{count:number;unknownCalls:number})=>d.unknownCalls?'unknown':grouped.format(d.count);
+// Tokens by dimension and each currency's exact cost as the payload carries it, its code included; unknown and
+// unpriced say so rather than showing a partial figure.
+export function usageLine(usage:Usage){
+  if(usage.calls===0)return 'No model calls';
+  if(!usage.cost.length)throw inconsistent();
+  const cost=usage.cost.map(c=>`${c.currency.code} ${c.amount===null?'unpriced':c.amount}`).join(', ');
+  return `Tokens: ${figure(usage.uncachedInput)} input · ${figure(usage.cacheRead)} cache read · ${figure(usage.cacheWrite)} cache write · `
+    +`${figure(usage.output)} output (${figure(usage.reasoning)} reasoning) · Cost: ${cost}`;
+}
+
+export type UsableAgent={id:string;name:string;version:number;draft:boolean;model:{id:string;version:number;vendor:string;identifier:string;displayName:string};
+  permissions:string[];tools?:string[];grantDays:number;grant:{id:string;expiresAt:string}|null};
+const vendorName=(vendors:Vendor[],code:string)=>{const vendor=vendors.find(v=>v.code===code);if(!vendor)throw inconsistent();return vendor.name;};
+// A usable version as the picker lists it.
+export const agentChoice=(agent:UsableAgent,vendors:Vendor[])=>
+  `${agent.name} · version ${agent.version} · ${vendorName(vendors,agent.model.vendor)} ${agent.model.displayName}${agent.draft?' · Draft':''}`;
+// The last explicit choice, while it is listed; a stored value in any other form chooses nothing.
+export function preselect(agents:UsableAgent[],stored:string|null){
+  try{
+    const v=JSON.parse(stored??'null');
+    if(!v||typeof v!=='object'||Object.keys(v).length!==2||typeof v.agentId!=='string'||!Number.isSafeInteger(v.version))return undefined;
+    return agents.find(a=>a.id===v.agentId&&a.version===v.version);
+  }catch{return undefined;/* Invalid browser state chooses nothing. */}
+}
+
+// The version a reopened conversation asks with: the one its last question used while that is listed, otherwise the only
+// listed version of its agent; with neither, the person chooses.
+export function conversationChoice(agents:UsableAgent[],agentId:string,version:number){
+  const listed=agents.filter(a=>a.id===agentId);
+  return listed.find(a=>a.version===version)??(listed.length===1?listed[0]:undefined);
+}
+
+const unavailableModel='This agent’s model is not available right now. Ask an administrator, or choose another agent.';
+const messages:Record<string,string>={turn_active:'Wait for your current answer to finish, or stop it, before asking again.',
+  workspace_turn_limit:'This workspace is answering as many questions as it can at once. Ask again shortly.',
+  question_too_long:'This question is longer than the assistant accepts. Shorten it and send it again.',
+  conversation_not_found:'This conversation is no longer available. Start a new conversation.',
+  conversation_agent_mismatch:'This conversation is with another agent. Start a new conversation to ask this one.',
+  access_changed:'This agent no longer has the access an earlier answer in this conversation used, so it cannot continue it. Start a new '
+    +'conversation, or ask an administrator to restore the agent\'s access.',
+  context_required:'Ask over the knowledge the page shows: working data, or the selected historical view.',
+  snapshot_missing:'Choose an As of date to ask about working data.',page_report_invalid:'The page could not say what it shows. Reload it and ask again.',
+  agent_runtime_unavailable:'The assistant is not running right now. Try again shortly.',
+  agent_not_allowed:'This agent version is not one you may use. Choose another agent.',agent_retired:'This agent is retired. Choose another agent.',
+  grant_permission_missing:'You lack a permission this agent version’s tools need.',access_denied:'Your current access cannot use the assistant.',
+  turn_not_found:'You have no such question here.',session_ended:'Your session changed. Reload the page to continue.',
+  grant_required:'Allow this agent version its reads before asking it.',
+  model_changed:unavailableModel,model_disabled:unavailableModel,model_unqualified:unavailableModel,model_unpriced:unavailableModel,
+  model_provider_disabled:unavailableModel,model_provider_unqualified:unavailableModel,credential_unavailable:unavailableModel};
+// Why the panel's own request was refused; a code it does not name keeps the page's message.
+export const panelMessage=(code:string|undefined)=>code!==undefined&&Object.hasOwn(messages,code)?messages[code]:undefined;
+
+const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const isUuid=(value:unknown):value is string=>typeof value==='string'&&uuid.test(value);
+const exact=(value:unknown,names:string[])=>!!value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===names.length
+  &&names.every(n=>Object.hasOwn(value,n));
+// An ask kept in this tab's storage, read back only in the exact form the panel stores it, as a request whose outcome is
+// unknown: Retry sends it as it was first sent, and the server answers a repeat as it answered the original.
+export function keptAsk(stored:string|null){
+  try{
+    const v=JSON.parse(stored??'null'),b=v?.body,k=b?.knowledge;
+    if(!exact(v,['operationId','path','body'])||!isUuid(v.operationId)||v.path!=='assistant/turns/ask'
+      ||!exact(b,['conversationId','agentId','version','question','pageReport','knowledge',...(Object.hasOwn(b??{},'searchHistory')?['searchHistory']:[])])
+      ||Object.hasOwn(b,'searchHistory')&&typeof b.searchHistory!=='boolean'||b.conversationId!==null&&!isUuid(b.conversationId)
+      ||!isUuid(b.agentId)||!Number.isSafeInteger(b.version)||b.version<1||typeof b.question!=='string'||!b.question.trim()
+      ||!exact(b.pageReport,['page','selection',...['layout','view','focus','businessDate'].filter(key=>Object.hasOwn(b.pageReport??{},key))])||!exact(k,['mode','contextId','frameId']))return undefined;
+    return {operationId:v.operationId as string,path:v.path as string,body:b as Record<string,unknown>,uncertain:true};
+  }catch{return undefined;/* Invalid browser state keeps no request. */}
+}
+
+// The date a grant given now would end in the person's zone: it runs its days from the instant it is given.
+export function grantExpiry(now:Date,days:number,zone:string){
+  const parts=new Intl.DateTimeFormat('en-US',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(now.getTime()+days*86_400_000));
+  const part=(type:string)=>parts.find(p=>p.type===type)!.value;
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+// The consent §7.1 asks for, naming only the reads the version's switched-on tools need.
+export function consentText(agent:Pick<UsableAgent,'name'|'model'|'permissions'>,vendors:Vendor[],until:string){
+  return `Allow ${agent.name}, which sends your questions and the data it reads to ${vendorName(vendors,agent.model.vendor)} (${agent.model.displayName}) through `
+    +`the vendor account your administrators configured, whose owner may be able to see them, to ${grantPhrase(agent.permissions)} on your behalf until ${until}?`;
+}

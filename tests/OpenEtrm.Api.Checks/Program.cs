@@ -1,0 +1,486 @@
+using System.Text.Json;
+using System.Collections.Immutable;
+using System.Globalization;
+using OpenEtrm.Api;
+using OpenEtrm.MarketData;
+using var nativeInputs=NativeReadInputs.Open(args);
+if(args is ["--read-references"]){ReadReferenceChecks.Run();return;}
+if(args is ["--managed-pool-controller",var poolConnection]){RiskWorkerConnectionChecks.Run();await ManagedPoolGatewayChecks.Run(poolConnection);return;}
+if(args is ["--gas-source-instrument-evidence"]){GasSourceInstrumentEvidenceChecks.Run();return;}
+if(args is ["--point-trader-mark-identity"]){PointTraderMarkIdentityChecks.Run();return;}
+if(args is ["--point-trader-mark-inputs"]){PointTraderMarkInputSelectionChecks.Run();return;}
+if(args is ["--point-trader-mark-commands"]){PointTraderMarkCommandChecks.Run();return;}
+if(args is ["--point-trader-mark-receipts"]){PointTraderMarkReceiptChecks.Run();return;}
+
+if(args is ["--delivery-nomination-batch"]){DeliveryNominationBatchChecks.Run();return;}
+if(args is ["--delivery-workbench"]){DeliveryWorkbenchChecks.Run();return;}
+if(args is ["--gas-transport-financial-commands"]){GasTransportFinancialCommandChecks.Run();return;}
+if(args is ["--gas-transport-financial-source"]){GasTransportFinancialSourceChecks.Run();return;}
+if(args is ["--instrument-side-presentation"]){InstrumentSidePresentationChecks.Run();return;}
+if(args is ["--gas-transport-financial-ticket"]){GasTransportFinancialTicketChecks.Run();return;}
+if(args is ["--gas-transport-financial-native",var financialTransportFixture]){await GasTransportFinancialNativeChecks.Run(financialTransportFixture);return;}
+if(args is ["--gas-transport-financial-positions"]){GasTransportFinancialPositionChecks.Run();return;}
+if(args is ["--gas-transport-financial-adapters"]){GasTransportFinancialAdapterChecks.Run();return;}
+if(args is ["--gas-transport-financial-labels"]){GasTransportFinancialLabelChecks.Run();return;}
+if(args is ["--gas-transport-financial-value",var financialTransportValue]){await GasTransportFinancialValueChecks.Run(financialTransportValue);return;}
+if(args is ["--gas-transport-financial-worker-submit",var financialTransportWorker]){await GasTransportFinancialWorkerChecks.Run(financialTransportWorker,false);return;}
+if(args is ["--gas-transport-financial-worker-verify",var financialTransportWorkerReceipt]){await GasTransportFinancialWorkerChecks.Run(financialTransportWorkerReceipt,true);return;}
+if(args is ["--gas-transport-financial-setup"]){GasTransportFinancialSetupChecks.Run();return;}
+if(args is ["--storage-facility-native",var storageFixture]){await StorageFacilityNativeChecks.RunNative(storageFixture);return;}
+if(args is ["--storage-facility-adapters"]){StorageFacilityAdapterChecks.Run();return;}
+if(args is ["--gas-transport-capacity-adapters"]){GasTransportCapacityAdapterChecks.Run();return;}
+if(args is ["--operational-business-context"]){OperationalBusinessContextChecks.Run();return;}
+if(args is ["--gas-transport-capacity-source"]){GasTransportCapacitySourceChecks.Run();return;}
+if(args is ["--gas-transport-route-adapters"]){GasTransportRouteAdapterChecks.Run();return;}
+if(args is ["--gas-transport-route-source"]){GasTransportRouteSourceChecks.Run();return;}
+if(args is ["--gas-transport-route-native",var routeFixture]){await GasTransportRouteNativeChecks.Run(routeFixture);return;}
+if(args is ["--gas-transport-route-metadata"]){GasTransportRouteMetadataChecks.Run();GasTransportRoutePresentationChecks.Run();return;}
+if(args is ["--gas-transport-capacity-metadata"]){GasTransportCapacityMetadataChecks.Run();GasTransportCapacityPresentationChecks.Run();return;}
+if(args is ["--gas-transport-capacity-normalize",var transportInput,var transportOutput]){GasTransportCapacityPacket.Normalize(transportInput,transportOutput);return;}
+if(args is ["--storage-facility-setup"]){StorageFacilityMetadataChecks.Run();return;}
+if(args is ["--structured-power"]){StructuredPowerChecks.Run();return;}
+if(args is ["--power-hedge"]){StructuredPowerHedgeChecks.Run();return;}
+if(args is ["--assistant-prompts"]){TurnWorkerChecks.Run();AgentToolChecks.Run();await ModelProviderChecks.Run();return;}
+if(args is ["--json-read-transport"]){await JsonReadTransportChecks.Run();return;}
+if(args is ["--large-catalog-http"]){await LargeCatalogReadChecks.Run();return;}
+if(args is ["--observation-pin-payload",var payloadPath,var payloadRows]){await ObservationPinPayloadChecks.Run(payloadPath,int.Parse(payloadRows,CultureInfo.InvariantCulture));return;}
+if(args is ["--async-read-budget"]){await AsyncReadBudgetChecks.Run();return;}
+if(args is ["--async-reads"]){await JsonReadTransportChecks.Run();await ObservationPinPayloadChecks.Run();await AsyncReadStreamChecks.Run();AsyncReadContractChecks.Run();await AsyncReadChecks.Run();await UngatedReadChecks.Run();return;}
+if(args is ["--ungated-reads"]){await UngatedReadChecks.Run();return;}
+if(args is ["--async-read-contracts"]){AsyncReadContractChecks.Run();return;}
+if(args is ["--calendar-authoring"]){CalendarAuthoringSchemaChecks.Run();return;}
+if(args is ["--published-clock"]){PublishedClockChecks.Run();return;}
+if(args is ["--position-adjustment"]){PositionAdjustmentChecks.Run();return;}
+
+if(args is ["--gas-operator-physical-value",var operatorPhysicalPath]){await GasOperatorPhysicalValueChecks.Run(operatorPhysicalPath);return;}
+if(args is ["--gas-operator-ordinary-value",var operatorOrdinaryPath]){await GasOperatorPhysicalValueChecks.Run(operatorOrdinaryPath,true);return;}
+if(args is ["--cash-option-value-policy"]){CashOptionPolicyChecks.Run();return;}
+if(args is ["--selected-option-inputs"]){SelectedOptionInputChecks.Run();return;}
+if(args is ["--option-sensitivity-request"]){OptionSensitivityRequestChecks.Run();return;}
+if(args is ["--option-position-analytics"]){OptionPositionAnalyticsChecks.Run();return;}
+if(args is ["--option-strategy-request"]){OptionStrategyRequestChecks.Run();return;}
+if(args is ["--cash-option-value",var cashOptionPath]){await CashOptionValueChecks.Run(cashOptionPath);return;}
+if(args is ["--physical-option-economic",var physicalEconomicPath]){await PhysicalOptionValueChecks.Run(physicalEconomicPath,true);return;}
+if(args is ["--gas-physical-completion-fixture",var completionPath]){await GasPhysicalCompletionFixture.Run(completionPath);return;}
+if(args is ["--gas-physical-projection",var physicalProjectionPath]){await GasPhysicalProjectionChecks.Run(physicalProjectionPath);return;}
+if(args is ["--physical-option-worker-verify",var physicalWorkerPath]){await PhysicalOptionWorkerChecks.Verify(physicalWorkerPath);return;}
+if(args is ["--physical-option-policy"]){PhysicalOptionPolicyChecks.Run();return;}
+if(args is ["--physical-option-value",var physicalOptionPath]){await PhysicalOptionValueChecks.Run(physicalOptionPath);return;}
+if(args is ["--lifecycle-residual-currencies"]){LifecycleResidualCurrencyChecks.Run();return;}
+if(args is ["--gas-principal-carrying",var principalCarryingPath]){await GasPrincipalCarryingChecks.Run(principalCarryingPath);return;}
+if(args is ["--gas-accepted-order"]){GasAcceptedOrderChecks.Run();GasPhysicalQuantitySourceChecks.Run();return;}
+if(args is ["--gas-cashout-native",var cashoutNativePath]){await GasCashoutNativeChecks.Run(cashoutNativePath);return;}
+if(args is ["--gas-owned-setup-native",var gasSetupPath]){await GasOwnedSetupChecks.RunNative(gasSetupPath);return;}
+if(args is ["--gas-owned-setup"]){GasOwnedSetupChecks.Run();return;}
+if(args is ["--gas-accepted-native",var acceptedGasPath]){await GasAcceptedNativeChecks.Run(acceptedGasPath);return;}
+if(args is ["--lifecycle-option-expiry-read",var expiryReadFixture]){await LifecycleOptionExpiryChecks.Run(expiryReadFixture);return;}
+if(args is ["--lifecycle-delivery-choices"]){LifecycleDeliveryChoiceChecks.Run();return;}
+if(args is ["--lifecycle-actions"]){LifecycleActionChecks.Run();return;}
+if(args is ["--economic-risk-contract"]){EconomicRiskContractChecks.Run();return;}
+if(args is ["--economic-future-worker-submit",var futureEconomicPath]){await EconomicFutureWorkerChecks.Submit(futureEconomicPath);return;}
+if(args is ["--physical-futures-value",var physicalValuePath]){await PhysicalFuturesValueChecks.Run(physicalValuePath);return;}
+if(args is ["--lifecycle-schedule-no-result",var lifecycleNoResultPath]){await LifecycleScheduleNativeChecks.WithoutResult(lifecycleNoResultPath);return;}
+if(args is ["--lifecycle-schedule-read",var lifecycleScheduleReadPath]){await LifecycleScheduleNativeChecks.Read(lifecycleScheduleReadPath);return;}
+if(args is ["--lifecycle-schedule-run",var lifecycleSchedulePath]){await LifecycleScheduleNativeChecks.Run(lifecycleSchedulePath);return;}
+if(args is ["--economic-worker-submit",var economicWorkerFixture]){await EconomicWorkerChecks.Run(economicWorkerFixture,false);return;}
+if(args is ["--economic-worker-verify",var economicWorkerResult]){await EconomicWorkerChecks.Run(economicWorkerResult,true);return;}
+if(args is ["--lifecycle-schedule-contract"]){LifecycleScheduleChecks.Run();return;}
+if(args is ["--lifecycle-actions-native",var lifecycleFixture]){await LifecycleActionChecks.RunNative(lifecycleFixture);return;}
+if(args is ["--lifecycle-swap-native",var lifecycleSwapFixture]){await LifecycleSwapChecks.Run(lifecycleSwapFixture);return;}
+if(args is ["--gas-futures-delivery",var gasDeliveryFixture]){await GasFuturesDeliveryChecks.Run(gasDeliveryFixture);return;}
+if(args is ["--gas-quantity-reconciliation",var gasQuantityReconciliation]){await GasQuantityReconciliationChecks.Run(gasQuantityReconciliation);return;}
+if(args is ["--gas-quantity-batch",var gasQuantityBatch]){await GasQuantityBatchChecks.Run(gasQuantityBatch);return;}
+if(args is ["--gas-quantity-batch-contract"]){await GasQuantityBatchChecks.Contract();return;}
+if(args is ["--gas-owned-correction",var gasOwnedCorrection]){await GasOwnedQuantityCorrectionChecks.Run(gasOwnedCorrection);return;}
+if(args is ["--gas-mixed-correction",var gasMixedCorrection]){await GasQuantityBundleChecks.Run(gasMixedCorrection);return;}
+if(args is ["--gas-owned-correction-contract"]){await GasOwnedQuantityCorrectionChecks.Contract();return;}
+if(args is ["--gas-owned-correction-form"]){GasOwnedQuantityFormChecks.Run();return;}
+if(args is ["--gas-lifecycle-agent",var gasAgentPath]){await GasLifecycleAgentChecks.Run(gasAgentPath);return;}
+if(args is ["--configured-gas-lifecycle-agent",var configuredGasAgentPath]){await GasLifecycleAgentChecks.RunConfigured(configuredGasAgentPath);return;}
+if(args is ["--gas-loan-correction",var gasLoanCorrection]){await GasLoanQuantityCorrectionChecks.Run(gasLoanCorrection);return;}
+if(args is ["--gas-loan-maturity-fee",var gasLoanMaturity]){await GasLoanMaturityFeeChecks.Run(gasLoanMaturity);return;}
+if(args is ["--gas-loan-withdrawal",var gasLoanWithdrawal]){await GasLoanWithdrawalChecks.Run(gasLoanWithdrawal);return;}
+if(args is ["--gas-loan-correction-form",var gasLoanForm]){await GasLoanQuantityFormChecks.Run(gasLoanForm);return;}
+if(args is ["--gas-scope-authority",var gasScopeAuthority]){await GasOwnedScopeAdmissionChecks.Run(gasScopeAuthority);return;}
+if(args is ["--gas-loan-fee",var gasLoanFee]){await GasLoanFeeChecks.Run(gasLoanFee);return;}
+if(args is ["--gas-loan-fee-zero-pv",var zeroFeePv]){await GasLoanFeeChecks.Run(zeroFeePv,true);return;}
+if(args is ["--gas-operator-correction",var operatorCorrection]){await GasOperatorQuantityChecks.Run(operatorCorrection);return;}
+if(args is ["--gas-operator-contract"]){GasOperatorQuantityChecks.Contract();GasKnownCashoutChecks.Contract();return;}
+if(args is ["--gas-known-cashout",var knownCashout]){await GasKnownCashoutChecks.Run(knownCashout);return;}
+if(args is ["--gas-owned",var gasOwnedFixture]){await GasOwnedChecks.Run(gasOwnedFixture);return;}
+if(args is ["--gas-owned-known",var gasKnownFixture]){await GasOwnedKnownHistoryChecks.Run(gasKnownFixture);return;}
+if(args is ["--gas-physical-known",var physicalKnownFixture]){await GasPhysicalKnownChecks.Run(physicalKnownFixture);return;}
+if(args is ["--gas-applied-source",var appliedSourceFixture]){await GasAppliedSourceChecks.Run(appliedSourceFixture);return;}
+if(args is ["--gas-owned-profile",var gasProfileFixture]){await GasOwnedKnownHistoryChecks.Run(gasProfileFixture,true);return;}
+if(args is ["--futures-margin-journal",var marginJournalFixture]){await FuturesMarginJournalChecks.Run(marginJournalFixture);return;}
+if(args is ["--selected-physical-authority",var selectedPhysicalFixture]){await SelectedPhysicalAuthorityChecks.Run(selectedPhysicalFixture);return;}
+if(args is ["--futures-physical-delivery",var physicalFinalFixture]){await FuturesPhysicalDeliveryChecks.Run(physicalFinalFixture);return;}
+if(args is ["--futures-margin-adoption",var marginAdoptionFixture]){await FuturesMarginAdoptionChecks.Run(marginAdoptionFixture);return;}
+if(args is ["--futures-margin-sources"]){FuturesMarginSourceChecks.Run();return;}
+if(args is ["--native-futures-margin-sources",var marginSourceFixture]){await FuturesMarginSourceChecks.RunNative(marginSourceFixture);return;}
+if(args is ["--cash-instrument"]){CashInstrumentChecks.Run();return;}
+if(args is ["--shared-native-markets"]){SharedNativeMarketChecks.Run();return;}
+if(args is ["--curve-risk-axes"])
+{
+    var f=PreviewDataChecks.Fixture(3);
+    f.Definitions["curves"]=[..f.Definitions["curves"].Select(row=>{var fields=JsonSerializer.Deserialize<Dictionary<string,JsonElement>>(row)!;fields["name"]=JsonSerializer.SerializeToElement(row.Text("code"));return JsonSerializer.SerializeToElement(fields);})];
+    f.References["currencies"]=[JsonSerializer.SerializeToElement(new{code="usd",display_code="USD"})];
+    f.References["units"]=[JsonSerializer.SerializeToElement(new{code="mwh",symbol="MWh"})];
+    CurveRiskAxisChecks.Run(new(f.Manifest,f.Definitions,f.References,f.Observations),f.Frame);return;
+}
+if(args is ["--curve-display"]){CurveDisplayChecks.Run();return;}
+if(args is ["--pnl-persistence",var pnlFixture]){await PnlPersistenceChecks.Run(pnlFixture);return;}
+if(args is ["--pnl-artifacts"]){PnlArtifactChecks.Run();return;}
+if(args is ["--pnl-factors"]){PnlFactorSelectionChecks.Run();return;}
+if(args is ["--pnl-time"]){PnlTimeSelectionChecks.Run();return;}
+if(args is ["--risk-bump-price-steps"]){RiskBumpPriceStepChecks.Run();return;}
+if(args is ["--option-policy"]){OptionPolicySelectionChecks.Run();return;}
+if(args is ["--risk-pricing-policy"]){RiskPricingPolicyChecks.Run();return;}
+if(args is ["--power-close-context",var powerContext]){await PowerCloseContextChecks.Run(powerContext);return;}
+if(args is ["--catalogue-trading",var catalogueFixture]){await CatalogueTradingChecks.Run(catalogueFixture);return;}
+if(args is ["--close-listings",var listingFixture]){await CloseListingChecks.Run(listingFixture);return;}
+if(args is ["--selected-rate-sources"]){SelectedRateSourceChecks.Run();return;}
+if(args is ["--context-resolution"]){ContextResolutionChecks.Run();return;}
+if(args is ["--unified-catalogue"]){UnifiedCatalogueChecks.Run();return;}
+if(args is ["--curve-version-inputs"]){CurveVersionInputChecks.Run();return;}
+if(args is ["--generic-schedules"]){await BookedScheduleReaderChecks.Run();return;}
+if(args is ["--delivery-setup-defaults"]){DeliverySetupDefaultsChecks.Run();return;}
+if(args is ["--market-calendar-demand"]){await MarketCalendarDemandChecks.Run();return;}
+if(args is ["--historical-risk"]){HistoricalRiskContractChecks.Run();return;}
+if(args is ["--monte-carlo-risk"]){MonteCarloRiskContractChecks.Run();return;}
+if(args is ["--reference-reuse",var referenceReuse]){await ReferenceReuseChecks.Run(referenceReuse);return;}
+if(args is ["--lng-admission",var lngAdmission]){await LngAdmissionChecks.Run(lngAdmission);return;}
+if(args is ["--tool-output-limits",var toolOutputFile]){ToolOutputLimitChecks.Run(toolOutputFile);return;}
+if(args is ["--reference-presentation"]){ReferencePresentationChecks.Run();return;}
+if(args is ["--assistant-workspace"]){AssistantWorkspaceChecks.Run();AssistantDigestChecks.Run();AssistantSelectionChecks.Run();AssistantWalkthroughChecks.Run();TradingBlotterChecks.Run();return;}
+if(args is ["--market-preparation-reuse"]){MarketPreparationReuseChecks.Run();return;}
+if(args is ["--publication-inputs"]){PricePublicationInputChecks.Run();return;}
+if(args is ["--crude-instants"]){CrudeInstantChecks.Run();return;}
+if(args is ["--crude-lifecycle"]){CrudeLifecycleChecks.Run();return;}
+if(args is ["--crude-positions"]){CrudePositionChecks.Run();return;}
+if(args is ["--preview-failure-diagnostics"]){OpenEtrm.Api.Checks.PreviewFailureDiagnosticChecks.Run();return;}
+if(args is ["--position-qualification"]){await PositionQualificationChecks.Run();return;}
+
+if(args is ["--book-scope"]){BookScopeChecks.Run();return;}
+if(args is ["--risk-trade-scope"]){RiskTradeScopeChecks.Run();return;}
+if(args is ["--derivative-methods"]){DerivativeMethodChecks.Run();return;}
+if(args is ["--portfolio-joint-risk"]){PortfolioJointRiskChecks.Run();return;}
+if(args is ["--database-login-boundaries",var boundaryConnectionFile,var boundaryTracking]){await DatabaseLoginBoundaryChecks.Run(boundaryConnectionFile,bool.Parse(boundaryTracking));return;}
+if(args is ["--date-lists"]){SchedulePublicationChecks.Run();return;}
+if(args is ["--schedule-preview"]){SchedulePreviewChecks.Run();return;}
+if(args is ["--ticket-description"]){TicketDescriptionChecks.Run();return;}
+if(args is ["--gas-ticket"]){GasTicketChecks.Run();return;}
+if(args is ["--gas-park-loan-ticket"]){GasParkLoanTicketChecks.Run();GasParkLoanPortfolioChecks.Run();GasParkLoanPositionChecks.Run();GasParkLoanActionChecks.Run();return;}
+if(args is ["--gas-park-loan-balance-fee"]){GasParkLoanBalanceFeeAdapterChecks.Run();return;}
+if(args is ["--gas-park-custody"]){GasParkCustodyAdapterChecks.Run();GasParkCustodyDraftChecks.Run();GasParkCustodyPositionChecks.Run();return;}
+if(args is ["--gas-park-custody-ticket"]){GasParkCustodyTicketChecks.Run();return;}
+if(args is ["--gas-park-custody-evidence"]){GasParkCustodyEvidenceChecks.Run();GasParkCustodyBookingStatusChecks.Run();return;}
+if(args is ["--gas-park-custody-actions"]){GasParkCustodyActionChecks.Run();return;}
+if(args is ["--gas-park-custody-effects"]){GasParkCustodyEffectChecks.Run();return;}
+if(args is ["--gas-park-custody-handler"]){await GasParkCustodyHandlerChecks.Run();return;}
+if(args is ["--gas-park-custody-setup"]){GasParkCustodySetupChecks.Run();return;}
+if(args is ["--gas-park-custody-overview"]){GasParkCustodyOverviewChecks.Run();return;}
+if(args is ["--ticket-status-routing"]){TicketStatusRoutingChecks.Run();return;}
+if(args is ["--cash-payment-status"]){CashPaymentStatusChecks.Run();return;}
+if(args is ["--gas-instant-ingress"]){GasInstantIngressChecks.Run();return;}
+if(args is ["--lifecycle-context-ingress"]){LifecycleContextIngressChecks.Run();return;}
+if(args is ["--gas-park-custody-worker-submit",var custodyWorkerPacket]){await GasParkCustodyWorkerChecks.Run(custodyWorkerPacket,false);return;}
+if(args is ["--gas-park-custody-worker-verify",var custodyWorkerReceipt]){await GasParkCustodyWorkerChecks.Run(custodyWorkerReceipt,true);return;}
+if(args is ["--gas-park-custody-native",var custodyNativePacket]){await GasParkCustodyWorkerChecks.Run(custodyNativePacket,false,true);return;}
+if(args is ["--gas-park-loan-setup"]){GasParkLoanSetupChecks.Run();return;}
+if(args is ["--gas-park-loan-native",var parkLoanPacket]){await GasParkLoanNativeChecks.Run(parkLoanPacket);return;}
+if(args is ["--gas-park-loan-worker-submit",var parkLoanWorkerPacket]){await GasParkLoanWorkerChecks.Run(parkLoanWorkerPacket,false);return;}
+if(args is ["--gas-park-loan-worker-verify",var parkLoanWorkerReceipt]){await GasParkLoanWorkerChecks.Run(parkLoanWorkerReceipt,true);return;}
+if(args is ["--swap-payment-calendar"]){SwapPaymentCalendarChecks.Run();return;}
+if(args is ["--booked-programs",var bookedProgramsFixture]){await BookedProgramStorageChecks.Run(bookedProgramsFixture);return;}
+if(args is ["--ppa-blotter-admission"]){await PpaBlotterAdmissionChecks.Run();return;}
+if(args is ["--position-facts"]){TradePositionFactsChecks.Run();return;}
+if(args is ["--swap-holding-markets",var holdingMarketFixture]){await SwapHoldingMarketChecks.Run(holdingMarketFixture);return;}
+if(args is ["--swap-settlement-agent",var settlementAgentFixture]){await SwapSettlementAgentChecks.Run(settlementAgentFixture);return;}
+if(args is ["--custom-curve-savers",var curveSaverFixture]){await CustomCurveSaverChecks.Run(curveSaverFixture);return;}
+if(args is ["--custom-curve-tool",var curveToolFixture]){await CustomCurveToolChecks.Run(curveToolFixture);return;}
+if(args is ["--reference-intake"]){await ReferenceCaptureChecks.Run();await ReferenceImportChecks.Run();return;}
+if(args is ["--reference-import-plan",var referenceOutput]){await ReferenceImportChecks.Run(referenceOutput);return;}
+if(args is ["--swap-change-review"]){SwapChangeReviewChecks.Run();return;}
+if(args is ["--whole-term-swaps"]){WholeTermSwapAssemblyChecks.Run();return;}
+if(args is ["--retained-schedule-limits"]){RetainedScheduleLimitChecks.Run();return;}
+if(args is ["--trading-read-selection"]){TradingReadSelectionChecks.Run();return;}
+if(args is ["--booked-schedule-lookups"]){BookedScheduleLookupChecks.Run();return;}
+if(args is ["--contract-observation-authoring"]){ContractObservationAuthoringChecks.Run();return;}
+if(args is ["--contract-observation-reads"]){ContractObservationReadBoundChecks.Run();await PreviewHistoryChecks.Run();return;}
+if(args is ["--contract-observation-projections",var observationProjections]){await ContractObservationProjectionChecks.Run(observationProjections);return;}
+if(args is ["--side-observation-compatibility"]){SideObservationCompatibilityChecks.Run();return;}
+if(args is ["--curve-activation-inputs"]){CurveActivationInputChecks.Run();return;}
+if(args is ["--curve-projection-shape"]){CurveProjectionShapeChecks.Run();return;}
+if(args is ["--connected-samples"]){ConnectedSampleChecks.Run();return;}
+if(args is ["--live-calculation"]){LiveContextChecks.Run();return;}
+if(args is ["--history-chart"]){HistoryChartChecks.Run();return;}
+
+if(args is ["--close-risk"]){CloseRiskChecks.Run();return;}
+if(args is ["--ppa-limits"]){PpaLimitChecks.Run();return;}
+if(args is ["--preview-data"]){PreviewDataChecks.Run();MarketPreparationReuseChecks.Run();return;}
+if(args is ["--portfolio-risk-scope",var portfolioScopeFixture]){await SwapRiskHoldingChecks.Scope(portfolioScopeFixture);return;}
+if(args is ["--swap-risk-reuse-revoked",var reuseFixture]){await SwapRiskHoldingChecks.ReuseRevoked(reuseFixture);return;}
+if(args is ["--swap-risk-holdings",var swapRiskFixture]){await SwapRiskHoldingChecks.Run(swapRiskFixture,false);return;}
+if(args is ["--close-out-drafts",var closeOutFixture]){await CloseOutDraftChecks.Run(closeOutFixture);return;}
+if(args is ["--swap-risk-holdings-denied",var deniedSwapRiskFixture]){await SwapRiskHoldingChecks.Run(deniedSwapRiskFixture,true);return;}
+if(args is ["--swap-risk-holdings-expired",var expiredSwapRiskFixture]){await SwapRiskHoldingChecks.Run(expiredSwapRiskFixture,false,true);return;}
+if(args is ["--vol-surface-fit",var volSurfaceFitFixture]){await VolSurfaceFitChecks.Run(volSurfaceFitFixture);return;}
+if(args is ["--ppa-portfolio",var ppaPortfolioFixture]){await PpaPortfolioChecks.Run(ppaPortfolioFixture);return;}
+if(args is ["--ppa-portfolio-denied",var deniedPpaPortfolioFixture]){await PpaPortfolioChecks.Run(deniedPpaPortfolioFixture,true);return;}
+
+if (args is ["--automation"])
+{
+    AutomationChecks.Run();return;
+}
+if(args is ["--automation-controller",var connectionFile,var profileId])
+{
+    await AutomationChecks.Controller(connectionFile,profileId);return;
+}
+
+if(args is ["--futures-execution"]){FuturesExecutionChecks.Run();return;}
+
+if (args is ["--hosted-access"])
+{
+    HostedAccessChecks.Run();
+    return;
+}
+if(args is ["--power-collection"]){Environment.ExitCode=await PowerImportChecks.MalformedCollection();return;}
+if(args is ["--direct-reads",var readFixture]){await DirectReadChecks.Run(readFixture);return;}
+if(args is ["--exact-pin-reads",var pinFixture]){await ExactPinReadChecks.Run(pinFixture);return;}
+if(args is ["--observation-fact-reads",var factFixture]){await ObservationFactReadChecks.Run(factFixture);return;}
+if(args is ["--frame-read-authority",var frameAuthorityFixture]){await FrameReadAuthorityChecks.Run(frameAuthorityFixture);return;}
+if(args is ["--gas-billing-read-work",var billingReadFixture]){await GasBillingReadChecks.Run(billingReadFixture);return;}
+if(args is ["--stream-read-faults",var streamFixture]){await DirectReadChecks.StreamFault(streamFixture);return;}
+if(args is ["--stored-credentials",var credentialFixture]){CredentialCustodyChecks.Stored(credentialFixture);return;}
+if (args is ["--power-imports"])
+{
+    PowerImportChecks.Run();return;
+}
+if(args is ["--model-providers"]){await ModelProviderChecks.Run();return;}
+if(args is ["--turn-streams"]){await TurnStreamChecks.Run();return;}
+if(args is ["--blotter-stream"]){await BlotterStreamChecks.Run();return;}
+
+if (args is ["--schedules"])
+{
+    GasSourceInstrumentEvidenceChecks.Run();
+    StorageFacilityAdapterChecks.Run();
+    GasTransportCapacityAdapterChecks.Run();
+    OperationalBusinessContextChecks.Run();
+    GasTransportCapacitySourceChecks.Run();
+    GasTransportRouteAdapterChecks.Run();
+    GasTransportRouteSourceChecks.Run();
+    GasTransportFinancialCommandChecks.Run();
+    GasTransportFinancialSourceChecks.Run();
+    GasTransportFinancialTicketChecks.Run();
+    GasTransportFinancialPositionChecks.Run();
+    GasTransportFinancialAdapterChecks.Run();
+    GasTransportFinancialLabelChecks.Run();
+    GasTransportFinancialSetupChecks.Run();
+    GasTransportRouteMetadataChecks.Run();
+    GasTransportRoutePresentationChecks.Run();
+    GasTransportCapacityMetadataChecks.Run();
+    GasTransportCapacityPresentationChecks.Run();
+    StorageFacilityMetadataChecks.Run();
+    StructuredPowerChecks.Run();
+    FuturesMarginSourceChecks.Run();
+    CashInstrumentChecks.Run();
+    CurveDisplayChecks.Run();
+    DeliverySetupDefaultsChecks.Run();
+    RiskValuationAdmissionChecks.Run();
+    PnlArtifactChecks.Run();
+    PnlFactorSelectionChecks.Run();
+    PnlTimeSelectionChecks.Run();
+    RiskBumpPriceStepChecks.Run();
+    OptionPolicySelectionChecks.Run();
+    RiskPricingPolicyChecks.Run();
+    CashOptionPolicyChecks.Run();
+    SelectedOptionInputChecks.Run();
+    OptionSensitivityRequestChecks.Run();
+    OptionPositionAnalyticsChecks.Run();
+    OptionStrategyRequestChecks.Run();
+    ReferencePresentationChecks.Run();
+    CurveActivationInputChecks.Run();
+    ConnectedSampleChecks.Run();
+    FuturesExecutionChecks.Run();
+    HostedAccessChecks.Run();
+    HostedConfigurationChecks.Run();
+    CredentialCustodyChecks.Run();
+    await ModelProviderChecks.Run();
+    TurnWorkerChecks.Run();
+    AgentToolChecks.Run();
+    AssistantWorkspaceChecks.Run();
+    AssistantDigestChecks.Run();
+    AssistantSelectionChecks.Run();
+    AssistantWalkthroughChecks.Run();
+    TradingBlotterChecks.Run();
+    await TurnStreamChecks.Run();
+    await BlotterStreamChecks.Run();
+    PowerImportChecks.Run();
+    SwapChangeReviewChecks.Run();
+    WholeTermSwapAssemblyChecks.Run();
+    CalendarPolicyReplayChecks.Run();
+    PublishedClockChecks.Run();
+    RetainedScheduleLimitChecks.Run();
+    TradingReadSelectionChecks.Run();
+    await BookedScheduleReaderChecks.Run();
+    CrudePositionChecks.Run();
+    CrudeLifecycleChecks.Run();
+    PricePublicationInputChecks.Run();
+    UnifiedCatalogueChecks.Run();
+    CurveVersionInputChecks.Run();
+    SelectedRateSourceChecks.Run();
+    CrudeInstantChecks.Run();
+    TradePositionFactsChecks.Run();
+    BookScopeChecks.Run();
+    RiskTradeScopeChecks.Run();
+    PortfolioJointRiskChecks.Run();
+    DerivativeMethodChecks.Run();
+    BookedScheduleLookupChecks.Run();
+    SideObservationCompatibilityChecks.Run();
+    SwapPriceSourceChecks.Run();
+    SwapPaymentCalendarChecks.Run();
+    ContractObservationAuthoringChecks.Run();
+    SchedulePreviewChecks.Run();
+    TicketDescriptionChecks.Run();
+    InstrumentSidePresentationChecks.Run();
+    GasTicketChecks.Run();
+    GasParkLoanTicketChecks.Run();
+    GasParkLoanBalanceFeeAdapterChecks.Run();
+    GasParkCustodyAdapterChecks.Run();
+    GasParkCustodyDraftChecks.Run();
+    GasParkCustodyPositionChecks.Run();
+    GasParkCustodyTicketChecks.Run();
+    GasParkCustodyEvidenceChecks.Run();
+    GasParkCustodyBookingStatusChecks.Run();
+    GasParkCustodyActionChecks.Run();
+    GasParkCustodyEffectChecks.Run();
+    await GasParkCustodyHandlerChecks.Run();
+    GasParkCustodySetupChecks.Run();
+    GasParkCustodyOverviewChecks.Run();
+    TicketStatusRoutingChecks.Run();
+    PointTraderMarkIdentityChecks.Run();
+    PointTraderMarkInputSelectionChecks.Run();
+    PointTraderMarkCommandChecks.Run();
+    PointTraderMarkReceiptChecks.Run();
+    CashPaymentStatusChecks.Run();
+    GasInstantIngressChecks.Run();
+    LifecycleContextIngressChecks.Run();
+    GasParkLoanPortfolioChecks.Run();
+    GasParkLoanPositionChecks.Run();
+    GasParkLoanActionChecks.Run();
+    GasParkLoanSetupChecks.Run();
+    DateWorkspaceChecks.Run();
+    CurveDefinitionChecks.Run();
+    SchedulePublicationChecks.Run();
+    DirectReadChecks.ReportsDifferences();
+    PpaLimitChecks.Run();
+    CloseRiskChecks.Run();
+    HistoryChartChecks.Run();
+    return;
+}
+
+BookedScheduleLookupChecks.Run();
+await PositionQualificationChecks.Run();
+OpenEtrm.Api.Checks.PreviewFailureDiagnosticChecks.Run();
+SideObservationCompatibilityChecks.Run();
+ContractObservationAuthoringChecks.Run();
+ContractObservationReadBoundChecks.Run();await PreviewHistoryChecks.Run();
+TradePartyChecks.Run();
+AmountJsonChecks.Run();
+PilotReportChecks.Run();
+TableViewChecks.Run();
+TradingBlotterChecks.Run();
+await PpaBlotterAdmissionChecks.Run();
+RiskExclusionChecks.Run();
+RiskJobRunChecks.Run();
+PpaLimitChecks.Run();
+
+var cat=Guid.NewGuid(); var revision=Guid.NewGuid(); var reference=Guid.NewGuid(); var referenceRevision=Guid.NewGuid();
+var manifest=new PreviewManifest("local-synthetic-preview",cat,revision,reference,referenceRevision,Guid.NewGuid(),Guid.NewGuid(),[],new(DateTimeOffset.UtcNow,"local_power"),FuturesConvention:"contract_lot_execution_pnl_v2");
+var row=new Dictionary<string,object> { ["catalog_id"]=cat,["id"]=revision,["reference_catalog_id"]=reference,["reference_revision_id"]=referenceRevision,["state"]="sealed" };
+PreviewData.RequireBundlePin(manifest,JsonSerializer.SerializeToElement(row));
+Console.WriteLine("PASS exact persisted sealed bundle matches manifest");
+foreach(var key in new[]{"catalog_id","id","reference_catalog_id","reference_revision_id","state"})
+{
+    var changed=new Dictionary<string,object>(row); changed[key]=key=="state"?"draft":Guid.NewGuid();
+    try {PreviewData.RequireBundlePin(manifest,JsonSerializer.SerializeToElement(changed)); throw new Exception($"Accepted mismatched {key}");}
+    catch(MarketDataException e) when(e.Code=="reference_pin_mismatch") {Console.WriteLine($"PASS rejects mismatched bundle {key}");}
+}
+var supplemental=manifest with{RevisionId=Guid.NewGuid()};
+var supplementalRow=new Dictionary<string,object>(row){["id"]=supplemental.RevisionId,["reference_revision_id"]=Guid.NewGuid()};
+var resolvedBundle=PreviewData.ResolveBundleManifest(supplemental,JsonSerializer.SerializeToElement(supplementalRow));
+if(resolvedBundle.ReferenceRevisionId!=(Guid)supplementalRow["reference_revision_id"]||resolvedBundle.CatalogId!=manifest.CatalogId)
+    throw new Exception("A selected bundle must retain its persisted exact reference version.");
+Console.WriteLine("PASS supplemental market uses its own persisted reference revision");
+var foreignCatalog=new Dictionary<string,object>(supplementalRow){["reference_catalog_id"]=Guid.NewGuid()};
+var foreign=PreviewData.ResolveBundleManifest(supplemental,JsonSerializer.SerializeToElement(foreignCatalog));
+if(foreign.ReferenceCatalogId!=(Guid)foreignCatalog["reference_catalog_id"])throw new Exception("An exact source lost its native reference-catalog coordinate.");
+Console.WriteLine("PASS exact source coordinates are resolved from its immutable native header; database reads separately prove authority");
+
+var correctedPin=Guid.NewGuid();var contextId=Guid.NewGuid();var sourceDefinition=Guid.NewGuid();
+var selectedFrame=new InputFrame(Guid.NewGuid(),"Reviewed corrected inputs",DateTimeOffset.UtcNow,OpenEtrm.Shared.Temporal.BusinessTime.UtcSnapshot(DateTimeOffset.UtcNow).Date,[],ImmutableDictionary<string,ImmutableArray<Guid>>.Empty,contextId)
+ {SwapMarketSelections=ImmutableDictionary<Guid,ImmutableArray<Guid>>.Empty.Add(sourceDefinition,[correctedPin]),ResolvesLatestCorrection=true,OriginCloseId=Guid.NewGuid()};
+var sourceFrame=selectedFrame.ForMarketSource([correctedPin],ImmutableDictionary<string,ImmutableArray<Guid>>.Empty,[]);
+if(sourceFrame.SwapMarketSelections!=selectedFrame.SwapMarketSelections||!sourceFrame.ResolvesLatestCorrection||sourceFrame.ContextId!=contextId||
+ sourceFrame.OriginCloseId is not null||sourceFrame.Id!=selectedFrame.Id)
+ throw new Exception("Supplemental booking revalidation lost the reviewed correction or retained source context.");
+Console.WriteLine("PASS supplemental market revalidation preserves reviewed correction selections and context");
+var passed=10;
+if(args.Length==1)
+{
+    using var fixture=JsonDocument.Parse(File.ReadAllText(args[0])); var root=fixture.RootElement;
+    Dictionary<string,ImmutableArray<JsonElement>> Rows(string name)=>root.GetProperty(name).EnumerateObject().ToDictionary(p=>p.Name,p=>p.Value.EnumerateArray().Select(r=>r.Clone()).ToImmutableArray());
+    var definitions=Rows("definitions");var references=Rows("references");
+    var observations=root.GetProperty("observations").EnumerateArray().Select(r=>r.Clone()).ToImmutableArray();
+    var persisted=definitions["revisions"][0];
+    var realManifest=new PreviewManifest("local-synthetic-preview",persisted.Id("catalog_id"),persisted.Id("id"),persisted.Id("reference_catalog_id"),persisted.Id("reference_revision_id"),Guid.NewGuid(),Guid.NewGuid(),[],new(DateTimeOffset.UtcNow,"local_power"),FuturesConvention:"contract_lot_execution_pnl_v2");
+    var f=root.GetProperty("frames").EnumerateArray().Single(f=>f.GetProperty("at").GetString()!.StartsWith("2020-12-18",StringComparison.Ordinal));
+    var frame=new InputFrame(f.Id("id"),"Exact fixture",f.Instant("at"),OpenEtrm.Shared.Temporal.BusinessTime.UtcSnapshot(f.Instant("at")).Date,f.GetProperty("observationIds").EnumerateArray().Select(id=>id.GetGuid()).ToImmutableArray(),
+        f.GetProperty("curveContracts").EnumerateObject().ToImmutableDictionary(p=>p.Name,p=>p.Value.EnumerateArray().Select(id=>id.GetGuid()).ToImmutableArray()));
+    var previous=CultureInfo.CurrentCulture;
+    try
+    {
+        foreach(var culture in new[]{"th-TH","ar-SA"})
+        {
+            CultureInfo.CurrentCulture=CultureInfo.GetCultureInfo(culture);
+            var data=new PreviewData(realManifest,definitions,references,observations);
+            var result=data.Build(frame,"local_power");
+            if(result.Values[0].Price.Value.ToString()!="29.1" || data.Definitions["contracts"].Any(c=>c.Text("delivery_from").Length!=10))throw new Exception("Culture changed adapter values");
+            Console.WriteLine($"PASS full PostgreSQL adapter fixture under {culture}");passed++;
+            if(data.BuildRates(frame,data.RateDefinition("interest_rates",data.Definitions["rate_curve_tenors"].Where(t=>t.Text("curve_code")=="interest_rates")
+                .ToDictionary(t=>t.Text("label"),t=>DateOnly.ParseExact(t.Text("label"),"yyyy-MM-dd",CultureInfo.InvariantCulture)))).Values[^1].DisplayDiscountFactor!="0.966184")throw new Exception("Culture changed rate calculation");
+            Console.WriteLine($"PASS rate convention adapter under {culture}");passed++;
+        }
+    }
+    finally {CultureInfo.CurrentCulture=previous;}
+    passed+=PowerContractSelectionChecks.Run(new PreviewData(realManifest,definitions,references,observations),frame);
+    CurveRiskAxisChecks.Run(new PreviewData(realManifest,definitions,references,observations),frame);passed++;
+    // A power curve settled on an index difference is unsupported by the hour preview; it must not hide the other curves.
+    JsonElement With(JsonElement row,string field,string value){var copy=JsonSerializer.Deserialize<Dictionary<string,JsonElement>>(row)!;copy[field]=JsonSerializer.SerializeToElement(value);return JsonSerializer.SerializeToElement(copy);}
+    var target=references["settlement_targets"].Single(r=>r.Text("code")=="test_power_target");
+    var difference=With(With(With(target,"code","synthetic_power_difference"),"kind","index_difference"),"index_b_code","test_power_price_b");
+    var changedReferences=new Dictionary<string,ImmutableArray<JsonElement>>(references){["settlement_targets"]=references["settlement_targets"].Add(difference)};
+    var changedDefinitions=new Dictionary<string,ImmutableArray<JsonElement>>(definitions){["curves"]=[..definitions["curves"].Select(c=>c.Text("code")=="local_power_all_in"?With(c,"settlement_target_code","synthetic_power_difference"):c)]};
+    var mixed=new PreviewData(realManifest,changedDefinitions,changedReferences,observations);
+    var catalog=JsonSerializer.SerializeToElement(PowerPreview.Catalog(mixed,frame,new([],[])));
+    var listed=catalog.GetProperty("curves").EnumerateArray().Select(c=>c.GetProperty("code").GetString()).ToArray();
+    if(listed.Contains("local_power_all_in") || listed.Length==0)throw new Exception("Unsupported power curve hid or polluted the catalog");
+    Console.WriteLine("PASS power catalog lists only single-index curves without failing the rest");passed++;
+    // Commodity identities are reference data. Rename this one consistently in
+    // the retained fixture while preserving its exact MW/MWh specifications.
+    const string relabeledCommodity="synthetic_electricity";
+    JsonElement Relabel(JsonElement row)=>JsonSerializer.Deserialize<JsonElement>(row.GetRawText().Replace("\"test_power\"","\""+relabeledCommodity+"\"",StringComparison.Ordinal));
+    Dictionary<string,ImmutableArray<JsonElement>> RelabelRows(Dictionary<string,ImmutableArray<JsonElement>> rows)=>rows.ToDictionary(p=>p.Key,p=>p.Value.Select(Relabel).ToImmutableArray());
+    var relabeled=new PreviewData(realManifest,RelabelRows(definitions),RelabelRows(references),observations);
+    var powerCatalog=JsonSerializer.SerializeToElement(PowerPreview.Catalog(relabeled,frame,new([],[])));
+    var quantityChoices=powerCatalog.GetProperty("quantityChoices").EnumerateArray().ToArray();
+    if(!quantityChoices.Select(q=>q.GetProperty("basis").GetString()).ToHashSet().SetEquals(["flat_power","total_energy"]))
+        throw new Exception("A compatible reference commodity lost its MW/MWh quantity choices");
+    if(quantityChoices.Any(q=>q.GetProperty("commodityCode").GetString()!=relabeledCommodity)||
+        powerCatalog.GetProperty("curves").EnumerateArray().Any(c=>c.GetProperty("commodityCode").GetString()!=relabeledCommodity)||
+        !PowerPreview.CurveCodes(relabeled).Contains("local_power")||PowerPreview.CurveCodes(relabeled).Contains("base_forward"))
+        throw new Exception("Power eligibility lost its exact commodity identity or included a non-MWh curve");
+    Console.WriteLine("PASS power eligibility follows commodity references rather than fixture identifiers");passed++;
+}
+Console.WriteLine($"{passed} preview adapter checks passed.");
