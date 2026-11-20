@@ -1,0 +1,57 @@
+name: Import LeanETRM source archive
+on:
+  push:
+    branches: [import/leanetrm-source]
+    paths:
+      - .github/workflows/unpack-leanetrm.yml
+permissions:
+  contents: write
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Unpack archive at repository root, without altering source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, zipfile, shutil, stat
+          archive = pathlib.Path("leanetrm-master.zip")
+          assert archive.is_file(), "Archive not found"
+          with zipfile.ZipFile(archive) as z:
+              members = z.infolist()
+              assert 0 < len(members) <= 20000, "Unexpected number of archive members"
+              total = sum(i.file_size for i in members)
+              assert total <= 1_000_000_000, "Archive exceeds extraction limit"
+              paths = []
+              for item in members:
+                  name = item.filename.replace("\\", "/")
+                  parts = pathlib.PurePosixPath(name).parts
+                  assert parts and parts[0] == "leanetrm-master", "Unexpected archive root: " + name
+                  assert not name.startswith("/") and not any(p in ("..", ".") for p in parts), "Unsafe archive path: " + name
+                  assert not (item.external_attr >> 16 & 0o170000) == stat.S_IFLNK, "Symlink forbidden: " + name
+                  if len(parts) == 1 or item.is_dir():
+                      continue
+                  rel = pathlib.Path(*parts[1:])
+                  assert rel.parts[0] not in (".git",), "Unsafe target: " + name
+                  assert not rel.exists(), "Existing destination: " + str(rel)
+                  paths.append((item, rel))
+              assert len(paths) > 1000, "Archive unexpectedly small"
+              for info, rel in paths:
+                  rel.parent.mkdir(parents=True, exist_ok=True)
+                  with z.open(info) as source, rel.open("wb") as target:
+                      shutil.copyfileobj(source, target)
+              print(f"Unpacked {len(paths)} files ({total} uncompressed bytes).")
+          archive.unlink()
+          pathlib.Path(".github/workflows/unpack-leanetrm.yml").unlink()
+          PY
+      - name: Commit extracted source
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import extracted LeanETRM source [unpack-complete]"
+          git push origin HEAD:import/leanetrm-source
