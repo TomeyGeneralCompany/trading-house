@@ -1,0 +1,277 @@
+import {retainedKnowledge} from './read-references.js';
+import {sideCalendar,referenceCalendarChoices,type SideCalendar,type SideCalendarPolicy} from './side-calendar.js';
+import {decorateSideCard,sideAddButton,alignSideCard,prepareSideDeck} from './side-card.js';
+import type {ContractObservationSource} from './contract-observation-ticket.js';
+import {explainUnavailableValue,markUnavailableValue,renderChangeReview,unavailableValueLabel,type ChangeReview} from './saved-trade-terms.js';
+import {priceSourceElement,priceSourceNote,renderCloseOut,type CloseOutShown,type SwapCloseOut} from './close-out-draft.js';
+import {mountScheduledFloatingEditor,type ScheduledFloatingTerms} from './scheduled-floating-editor.js';
+import {tradeAnnotations,type Annotation} from './trade-annotations.js';
+import {trackEdits} from './edit-tracking.js';
+import {renderRegularTable} from './regular-table.js';
+import {dealFormatEditor} from './deal-format-editor.js';
+import {renderSwapTradePayments,renderSwapPricingRows,sideDirection,swapPaymentQuote} from './swap-trade-review.js';
+import type {Catalog,Index,Valuation} from './swap-editor.js';
+import type {PaymentInput} from './swap-contract.js';
+import type {ReferenceKey} from './swap-observations.js';
+import type {RequestCommand} from './pending-command.js';
+import {publicText,curveName} from './market-view.js';
+
+type Api=<T>(path:string,body?:unknown)=>Promise<T>;
+type Period={amount:string|null;fixed:{price:string|null;currency:string;deliveryFrom:string;deliveryTo:string;paymentSchedule:PaymentInput}|null;floating:(ScheduledFloatingTerms&{paymentSchedule:PaymentInput})|null};
+type BulkTerms={amount?:string|null;price?:string;payment?:PaymentInput;observations?:ScheduledFloatingTerms};
+type QuantitySide={calendarPolicy:SideCalendarPolicy;basis:string;quantity:ReferenceKey;amount:string|null;allocation:string|null;priceApplication:string;power:{clock:ReferenceKey;product:string;startHour:number|null;endHour:number|null;saturday:boolean|null;calendar:ReferenceKey|null}|null;periods:Period[]};
+type Factor={value:string;numeratorQuantity:ReferenceKey;denominatorQuantity:ReferenceKey;implementation:string;unitConversionImplementation:string};
+export type Scheduled={implementation:string;first:QuantitySide;second:QuantitySide;factor?:Factor};
+type ExtendedCatalog=Omit<Catalog,'paymentCalendars'>&{contractObservationSources?:ContractObservationSource[];factorOptions:{swapImplementation:string;factorImplementation:string;unitConversionImplementation:string;quantityBasis:string};scheduledOptions:{implementation:string;priceApplication:string;maximumPeriods:number;powerQuantities:{definitionRevisionId:string;specification:ReferenceKey;unit:string;commodity:string}[];clocks:{definitionRevisionId:string;reference:ReferenceKey;label:string}[]};paymentCalendars:{definitionRevisionId:string;code:string;reference:ReferenceKey}[]};
+export type QuantityReview={slot:number;basis:string;power:{product:string;clock:ReferenceKey|string;clockFingerprint?:string}|null;periods:{amount:string|null;deliveryHours?:string;clockFingerprint?:string}[]};
+type Detail={quantityInputs?:QuantityReview[];state:Partial<Annotation>&{tradeId:string;revision:number;tradeReference:string;terms:Record<string,unknown>&{scheduled:Scheduled;bookId:string;discounting:boolean;commodity:string;firstCoefficient:string};[key:string]:unknown};history:{revision:number;kind:string}[];catalog:ExtendedCatalog;valuation:Valuation;canAmend:boolean;canBook?:boolean;asOf:string;context:unknown;amendUnavailableReason:string|null};
+const convention='independent_side_financial_swap_v2';
+/** The quantity bases, allocations and delivery products of a scheduled side (D214), as the ticket offers them and the panel's Terms name them. */
+export const quantityBases=[{value:'period_total',label:'Explicit total for each period'},{value:'calendar_day_rate',label:'Quantity per calendar delivery day'},{value:'contract_total',label:'One total for this side’s whole contract'},{value:'selected_interval_power',label:'MW throughout selected delivery hours'}] as const;
+export const allocations=[{value:'equal_periods',label:'Equal quantities in each monthly period'},{value:'calendar_days',label:'Proportion to calendar days in each monthly period'}] as const;
+export const deliveryProducts=[{value:'all_hours',label:'All actual delivery hours'},{value:'weekday_block',label:'Selected weekday block, excluding calendar holidays'}] as const;
+type IntervalRow={slot:number;period:number;ordinal:number;start:string;end:string;operatingDate:string;energyNumerator:string;energyDenominator:string;energyQuantity:string};
+/** What a scheduled swap's review is drawn with: the catalog's indices and clocks, the deal's own amount text, the person's zone, and the page's busy state and action. */
+export type ScheduledReview={indices:Pick<Index,'currencyCode'|'currency'|'quantityCode'|'unit'|'quoteMultiplier'>[];clocks:readonly {reference:{code:string};label:string}[];text:(value:string,kind:'money'|'price'|'quantity'|'factor',role?:string)=>string;zone:string;busy:()=>boolean;
+  act:(work:()=>Promise<void>)=>Promise<void>;
+  /** Reads a power schedule's retained UTC delivery intervals, for a swap that has one. */
+  intervals?:()=>Promise<IntervalRow[]>};
+/** The read of a retained scheduled revision's UTC delivery intervals, in the certified context it was read in. */
+export const retainedIntervals=(api:Api,context:Record<string,unknown>,detail:{state:{tradeId:string;revision:number};context:unknown})=>async()=>
+ (await api<{intervals:IntervalRow[]}>('swaps/quantity-schedule',{context:{...context,...retainedKnowledge(detail.context as {contextId:string})},tradeId:detail.state.tradeId,revision:detail.state.revision})).intervals;
+/**
+ * A scheduled swap's valuation review (D214), as its ticket and the side panel's Terms show it: its trade PV, and for each side its
+ * direction, a power schedule's delivery hours, its resolved period quantities with signed cash, dates, discount factors and PV, its
+ * contractual prices and their states, the observation behind each payment, and the normalized calculations and exact lineage beneath.
+ * A power schedule's retained UTC intervals can be inspected.
+ */
+export function renderScheduledReview(host:HTMLElement,value:Valuation,quantities:QuantityReview[]|undefined,c:ScheduledReview){
+ const node=<K extends keyof HTMLElementTagNameMap>(tag:K,label?:string)=>{const n=document.createElement(tag);if(label!==undefined)n.textContent=publicText(label);return n;};
+ const settlement=swapPaymentQuote(value.sides[value.sides.length-1],c.indices);
+ host.append(node('h3',`Trade PV · ${c.text(value.presentValue,'money')} ${settlement.currency}`));
+ for(const side of value.sides){const section=node('section'),i=swapPaymentQuote(side,c.indices);host.append(section);section.append(node('h4',`${side.slot===0?'First':'Second'} side · ${sideDirection(side.coefficient)}`));const quantity=quantities?.find(q=>q.slot===side.slot);if(quantity?.power){const clock=quantity.power.clock,clockCode=typeof clock==='string'?clock:clock.code,clockLabel=c.clocks.find(k=>k.reference.code===clockCode)?.label??clockCode;section.append(node('p',`Delivery product: ${quantity.power.product.replaceAll('_',' ')} · clock ${clockLabel}. Period-average price × integrated period energy.`));quantity.periods.forEach((p,n)=>{if(p.deliveryHours)section.append(node('p',`${side.payments[n]?.deliveryFrom??''}: ${p.deliveryHours} selected delivery hours · entered ${p.amount??''} MW.`));});}renderSwapTradePayments(section,'scheduled',side,i,c.busy,(amount,kind,selected)=>c.text(amount,kind,selected));
+  renderSwapPricingRows(section,'scheduled',side,i,c.zone,c.busy,(amount,kind,role)=>c.text(amount,kind,role));
+  const technical=node('details'),summary=node('summary','Normalized unit calculations and exact fixing / discount lineage'),evidence=node('pre');evidence.className='swap-evidence';evidence.textContent=JSON.stringify({side,quantityInputs:quantity},null,2);technical.append(summary,evidence);section.append(technical);
+ }
+ const read=c.intervals;if(!read)return;
+ const button=node('button','Inspect retained UTC delivery intervals');button.type='button';button.className='secondary';host.append(button);
+ button.onclick=()=>void c.act(async()=>{const intervals=await read();if(!button.isConnected)return;const table=node('div');table.className='table-wrap';host.append(table);
+  renderRegularTable(table,'scheduled-delivery-intervals',JSON.stringify(intervals),['Side','Period','UTC start','UTC end','Operating date','Exact energy','Quantity reference'],intervals.map(p=>[String(p.slot+1),String(p.period+1),p.start,p.end,p.operatingDate,p.energyDenominator==='1'?p.energyNumerator:p.energyNumerator+'/'+p.energyDenominator,p.energyQuantity]),[0,1,5],c.busy);});
+}
+
+// Serialize side compatibility reads across periods. The host action gate ignores
+// concurrent actions while busy; an edited period must not lose its refresh. A refresh
+// reads its period's fields when it starts, so one still waiting covers later edits.
+export function observationRefreshQueue(run:(work:()=>Promise<void>)=>Promise<void>){
+ let queue=Promise.resolve();const waiting=new Set<()=>Promise<void>>();
+ return(work:()=>Promise<void>)=>{
+  if(waiting.has(work))return;
+  waiting.add(work);queue=queue.then(()=>{waiting.delete(work);return run(work);});
+ };
+}
+/**
+ * The scheduled swap ticket (D214), which the side panel hosts as it hosts the swap ticket (D221): a new scheduled swap, or the
+ * amendment or read of a scheduled trade's revision. `host` is the panel's form part; the ticket is kept on the page's shelf until
+ * it opens there, and goes back when it is reset. Another revision and the trade's settlement view are the page's to open, after
+ * it has asked about what the ticket holds: `reopen` and `onSettlement`.
+ */
+export function setupScheduledSwapEditor(options:{api:Api;act:(work:()=>Promise<void>)=>Promise<void>;busy:()=>boolean;zone:()=>string;context:()=>Record<string,unknown>;queue:(command:RequestCommand)=>Promise<void>;pending:()=>RequestCommand|undefined;onDenied:()=>void;
+ host:()=>HTMLElement;unsavedChanged:()=>void;reopen:(revision:number)=>void;onSettlement:()=>void;ask:(question:{text:string;keep:string;go:string})=>Promise<boolean>}){
+ const node=<K extends keyof HTMLElementTagNameMap>(tag:K,label?:string)=>{const n=document.createElement(tag);if(label!==undefined)n.textContent=publicText(label);return n;};
+ const shelf=document.getElementById('editor-shelf')!,root=node('div');root.id='scheduled-swap-editor';root.className='editing scheduled-swap-editing';root.hidden=true;root.setAttribute('aria-labelledby','scheduled-swap-title');
+ const mounted=()=>root.parentElement!==shelf,mount=()=>{options.host().append(root);root.hidden=false;};
+ const heading=node('div');heading.className='scheduled-swap-heading';const title=node('h3','Scheduled financial swap');title.id='scheduled-swap-title';const settlementButton=node('button','Settlement and P&L');settlementButton.id='scheduled-settlement-open';settlementButton.type='button';settlementButton.className='secondary';settlementButton.hidden=true;settlementButton.onclick=()=>{if(detail&&!options.busy())options.onSettlement();};heading.append(title,settlementButton);
+ const message=node('p');message.setAttribute('role','status');const error=node('p');error.setAttribute('role','alert');
+ const changeReview=node('section');changeReview.id='scheduled-change-review';changeReview.className='trade-change-review';changeReview.hidden=true;
+ const form=node('form'),fields=node('fieldset'),review=node('section'),confirmation=node('div');form.id='scheduled-swap-form';
+ const ownership=node('section');ownership.id='scheduled-trade-terms';ownership.className='trade-booking-terms';
+ const product=node('section'),delivery=node('div');delivery.className='scheduled-side-columns entry-side-deck';
+ // A close-out draft heads the ticket, and its fixed prices are labelled with their source until a price or the pricing choice is changed.
+ const closeOut=node('div');closeOut.id='scheduled-close-out';closeOut.hidden=true;
+ const annotationsHost=ownership;shelf.append(root);root.append(heading,closeOut,message,error,form);fields.append(product,delivery,annotationsHost);form.append(fields,review,changeReview,confirmation);
+ prepareSideDeck(delivery);
+ const annotations=tradeAnnotations('scheduled',options.zone),edits=trackEdits(form,[],options.unsavedChanged);ownership.querySelector('h3')!.textContent='Ownership and parties';
+ let catalog:ExtendedCatalog|undefined,detail:Detail|undefined,prepared:RequestCommand|undefined,generation=0;
+ let sideEditors:ReturnType<typeof sideEditor>[]=[];
+ let visibleValuation:Valuation|undefined,visibleQuantities:QuantityReview[]|undefined;
+ const formatHost=node('section');formatHost.id='scheduled-amount-format';fields.append(formatHost);
+ const display=dealFormatEditor(formatHost,{api:options.api,act:options.act,busy:options.busy,changed:async()=>{const version=generation,value=visibleValuation;if(value){await prepare(value);if(version===generation&&value===visibleValuation)render(value,visibleQuantities);}}});
+ async function prepare(value:Valuation){await display.prepare(value);for(const side of value.sides)await display.prepare(side,side.kind);}
+ const context=()=>({...options.context(),convention});
+ const field=(host:HTMLElement,label:string,input:HTMLInputElement|HTMLSelectElement)=>{const wrap=node('div'),caption=node('label',label);input.id=input.id||'scheduled-field-'+crypto.randomUUID();caption.htmlFor=input.id;wrap.append(caption,input);host.append(wrap);return input;};
+ const identify=(field:HTMLInputElement|HTMLSelectElement,id:string)=>{field.id=id;field.parentElement!.querySelector('label')!.htmlFor=id;};
+ const input=(host:HTMLElement,label:string,type='text',value='')=>{const n=node('input');n.type=type;n.value=value;if(type==='text')n.inputMode='decimal';field(host,label,n);return n;};
+ const select=(host:HTMLElement,label:string,choices:readonly {value:string;label:string}[],value='')=>{const n=node('select');n.append(new Option('Choose…',''),...choices.map(c=>new Option(publicText(c.label),c.value)));n.value=value;field(host,label,n);return n;};
+ const button=(host:HTMLElement,label:string,work:()=>Promise<void>|void)=>{const n=node('button',label);n.type='button';n.onclick=()=>void run(work);host.append(n);return n;};
+ const refreshObservations=observationRefreshQueue(run);
+ async function run(work:()=>Promise<void>|void){await options.act(async()=>{error.textContent='';try{await work();}catch(e){invalidate();error.textContent=(e as Error).message;error.scrollIntoView({block:'nearest'});if((e as {code?:string}).code==='access_denied'){reset();options.onDenied();}}});sync();}
+ const invalidate=()=>{renderChangeReview(changeReview,null);generation++;prepared=undefined;confirm.checked=false;visibleValuation=undefined;visibleQuantities=undefined;review.replaceChildren();confirmation.hidden=true;};
+ product.append(node('h3','Product and commodity'),node('p','Author complete monthly periods. Stubs, irregular periods, non-monthly payment aggregation and arbitrary daily/hourly quantity profiles are unsupported. Existing single-payment contracts retain their original terms.'));
+ const kind=select(product,'Swap structure',[{value:'fixed_floating',label:'Fixed for floating'},{value:'floating_floating',label:'Floating for floating'},{value:'factor_floating',label:'Heat rate · cross-commodity floating for floating'}]);identify(kind,'scheduled-kind');
+ const structureButtons=document.createElement('div');structureButtons.className='ticket-add scheduled-side-adder';structureButtons.setAttribute('aria-label','Add scheduled swap sides');
+ for(const choice of [...kind.options].filter(o=>o.value)){const button=sideAddButton(choice.text,()=>{if(options.busy()||options.pending()||!catalog||detail&&!detail.canAmend||kind.value===choice.value)return;edits.mark();kind.value=choice.value;kind.dispatchEvent(new Event('change',{bubbles:true}));});button.dataset.scheduledStructure=choice.value;structureButtons.append(button);}
+ kind.parentElement!.hidden=true;product.append(structureButtons);
+
+ const commodity=select(product,'Commodity',[]);identify(commodity,'scheduled-commodity');
+ const secondCommodity=select(product,'Second-side commodity',[]);identify(secondCommodity,'scheduled-second-commodity');
+ const factorFields=node('fieldset');factorFields.append(node('legend','Contractual quantity factor'));product.append(factorFields);
+ const factorValue=input(factorFields,'Factor value');identify(factorValue,'scheduled-factor-value');
+ const factorNumerator=select(factorFields,'Factor numerator unit · second-side commodity',[]);identify(factorNumerator,'scheduled-factor-numerator');
+ const factorDenominator=select(factorFields,'Factor denominator unit · first-side commodity',[]);identify(factorDenominator,'scheduled-factor-denominator');
+ factorFields.append(node('p','Each first-side delivery quantity is converted to the denominator unit, multiplied by the factor, then converted from the numerator unit to the second side’s quote quantity. The factor is fixed under price shocks.'));
+ for(const unit of [factorNumerator,factorDenominator])unit.onchange=()=>{factorValue.value='';message.textContent='Factor unit changed. Enter the contractual value in the selected numerator and denominator units.';invalidate();};
+ const market=select(product,'Available price-curve set',[]);identify(market,'scheduled-market');
+ const direction=select(product,'First side direction',[{value:'-1',label:'Pay first / receive second'},{value:'1',label:'Receive first / pay second'}]);identify(direction,'scheduled-direction');
+ const discount=select(product,'Discounting',[{value:'none',label:'No discounting · factor 1'},{value:'currency_default',label:'Selected currency default curve'}]);identify(discount,'scheduled-discounting');
+ const pricing=select(product,'Fixed price',[{value:'agreed',label:'Enter agreed fixed prices'},{value:'par',label:'Calculate one common par fixed price'}]);identify(pricing,'scheduled-price-mode');
+ const priceNote=priceSourceElement('scheduled-price-source');pricing.parentElement!.append(priceNote);
+ const priceSource=priceSourceNote(form,target=>(target as HTMLElement|null)?.dataset?.role==='fixed-price'||target===pricing,priceNote,options.zone);
+ const precision=input(product,'Par precision · decimal places','number');precision.min='0';precision.max='18';identify(precision,'scheduled-par-precision');
+ const revision=input(product,'Trade revision · selected by context');revision.readOnly=true;identify(revision,'scheduled-revision');root.insertBefore(revision.parentElement!,form);revision.parentElement!.hidden=true;
+ const reason=input(ownership,'Amendment reason');reason.inputMode='text';identify(reason,'scheduled-reason');reason.maxLength=500;
+ const valuationTerms=node('section');valuationTerms.append(node('h3','Valuation review and booking'),discount.parentElement!);fields.append(valuationTerms);
+ const actions=node('div');actions.className='trade-editor-actions';const status=node('p');status.className='field-help';status.setAttribute('role','status');status.id='scheduled-action-status';
+ const preview=node('button','Preview booking');preview.type='submit';preview.id='scheduled-preview';preview.setAttribute('form',form.id);
+ const confirm=node('input');confirm.type='checkbox';confirm.id='scheduled-confirm';const confirmLabel=node('label','I reviewed these exact quantities, prices, payment dates and signed cashflows.');confirmLabel.htmlFor=confirm.id;
+ const submit=node('button','Book scheduled swap');submit.type='button';submit.id='scheduled-submit';confirmation.className='trade-editor-confirmation';confirmation.append(confirm,confirmLabel);confirmation.hidden=true;
+ actions.append(status,preview,submit);form.before(actions);form.append(changeReview,confirmation,review);fields.prepend(reason.parentElement!);
+ const factorContract=()=>kind.value==='factor_floating';
+ const available=(slot=0)=>catalog?.indices.filter(i=>i.commodity===(factorContract()&&slot===1?secondCommodity.value:commodity.value)&&i.definitionRevisionId===market.value)??[];
+ const sourceCatalog=()=>catalog?.contractObservationSources??[];
+ const allQuotes=()=>[...(catalog?.indices??[]),...sourceCatalog()];
+ const availableSources=(slot=0)=>sourceCatalog().filter(i=>i.commodity===(factorContract()&&slot===1?secondCommodity.value:commodity.value)&&i.definitionRevisionId===market.value);
+ const availableQuotes=(slot=0)=>[...available(slot),...availableSources(slot)];
+ const calendars=()=>market.value?catalog!.sideCalendars:[];
+ const clocks=()=>catalog!.scheduledOptions.clocks.filter(c=>c.definitionRevisionId===market.value);
+ const powerQuantities=()=>catalog!.scheduledOptions.powerQuantities.filter(q=>q.definitionRevisionId===market.value);
+ const factorChoices=(slot:number)=>[...new Map(availableQuotes(slot).flatMap(i=>i.quantityChoices).map(q=>[JSON.stringify(q.specification),q])).values()];
+ function populateFactor(saved?:Factor){factorFields.hidden=!factorContract();secondCommodity.parentElement!.hidden=!factorContract();for(const [field,slot,value] of [[factorNumerator,1,saved?.numeratorQuantity],[factorDenominator,0,saved?.denominatorQuantity]] as const){field.replaceChildren(new Option('Choose…',''),...factorChoices(slot).map(q=>new Option(q.unit,JSON.stringify(q.specification))));field.value=value?JSON.stringify(value):'';}factorValue.value=saved?.value??'';}
+ const key=(i:Index)=>JSON.stringify([i.definitionRevisionId,i.curve,i.index]);
+ function paymentEditor(host:HTMLElement,calendar:SideCalendar,initial?:PaymentInput|null){
+  const p=node('fieldset');p.append(node('legend','Payment rule'));host.append(p);p.append(node('p','Monthly frequency. Payment rules generate dates independently of quantity and price observations.'));
+  const rule=select(p,'Payment date rule',catalog!.paymentOptions.rules,initial?.rule),days=input(p,'Lag days','number',initial?.days?.toString()),day=input(p,'Day of following month','number',initial?.dayOfMonth?.toString());
+  const basis=select(p,'Lag day basis',catalog!.paymentOptions.dayBases,initial?.dayBasis??''),short=select(p,'Missing day',catalog!.paymentOptions.shortMonths,initial?.shortMonth??''),adjust=select(p,'Date adjustment',catalog!.paymentOptions.adjustments,initial?.adjustment);
+  const toggle=()=>{const lag=rule.value==='days_after_period_end',locked=options.busy()||!!options.pending()||!!detail&&!detail.canAmend;days.required=lag;day.required=!lag;basis.required=lag;short.required=!lag;adjust.required=true;days.disabled=locked||!lag;day.disabled=locked||lag;basis.disabled=locked||!lag;short.disabled=locked||lag;};rule.onchange=toggle;basis.onchange=toggle;adjust.onchange=toggle;toggle();
+  const read=():PaymentInput=>({frequency:'monthly',rule:rule.value,days:rule.value==='days_after_period_end'&&days.value?Number(days.value):null,dayOfMonth:rule.value==='day_of_following_month'&&day.value?Number(day.value):null,dayBasis:rule.value==='days_after_period_end'?basis.value:null,shortMonth:rule.value==='day_of_following_month'?short.value:null,adjustment:adjust.value,calendar:null,implementation:catalog!.paymentOptions.implementation} as PaymentInput);
+  button(p,'Apply displayed starting payment terms',()=>{const start=catalog!.entryTemplate.payment;rule.value=start.rule;days.value=String(start.days??'');day.value=String(start.dayOfMonth??'');basis.value=start.dayBasis??'';short.value=start.shortMonth??'';adjust.value=start.adjustment;toggle();invalidate();});
+  return{read,sync:toggle,restore:(value:PaymentInput)=>{rule.value=value.rule;days.value=String(value.days??'');day.value=String(value.dayOfMonth??'');basis.value=value.dayBasis??'';short.value=value.shortMonth??'';adjust.value=value.adjustment;toggle();}};
+ }
+ // Align only periods with the same displayed boundaries. Each side retains
+ // its independent dates, quantities and payment terms.
+ function layoutPeriods(){
+  const periods=[...delivery.querySelectorAll<HTMLElement>('.scheduled-period')];
+  const keys=[...new Set(periods.map(p=>p.dataset.period!))].sort();
+  delivery.style.setProperty('--side-period-rows',String(Math.max(1,keys.length*5)));
+  for(const period of periods)period.style.setProperty('--period-row',String(keys.indexOf(period.dataset.period!)*5+1));
+ }
+ function periodEditor(host:HTMLElement,slot:number,from:string,to:string,calendar:SideCalendar,saved?:Period){
+  const card=node('section');card.className='scheduled-period';card.dataset.period=from+'/'+to;card.append(node('h4',`${from} to ${to} · exclusive end`));host.append(card);const selected=node('input');selected.type='checkbox';selected.dataset.role='bulk-period';field(card,'Select for common-term edit',selected);
+  const amount=input(card,'Period quantity','text',saved?.amount??'');amount.dataset.role='period-amount';
+  const terms=node('div');terms.className='scheduled-period-price';card.append(terms);
+  const fixed=slot===0&&kind.value==='fixed_floating';let read:()=>Period;let selectedQuote:()=>Index|ContractObservationSource|undefined=()=>undefined;let syncPayment=()=>{};let refreshPeriod=async()=>{};let disposePeriod=()=>{};let applyTerms=async(_value:BulkTerms,_requireCurrent:()=>void)=>{};let bulkRead=(_groups:string[]):BulkTerms=>({});
+  if(fixed){
+   const price=input(terms,'Agreed price · choose the settlement index to resolve its quote','text',saved?.fixed?.price??'');price.dataset.role='fixed-price';
+   const pay=paymentEditor(card,calendar,saved?.fixed?.paymentSchedule);syncPayment=pay.sync;applyTerms=async(value)=>{if(value.price!==undefined)price.value=value.price;if(value.payment)pay.restore(value.payment);};bulkRead=groups=>({...(groups.includes('price')?{price:price.value}:{}),...(groups.includes('payment')?{payment:pay.read()}:{})});
+   read=()=>({amount:amount.value||null,floating:null,fixed:{price:pricing.value==='par'?null:price.value,currency:settlementIndex()?.currencyCode??'',deliveryFrom:from,deliveryTo:to,paymentSchedule:pay.read()}});
+  }else{
+   const editor=mountScheduledFloatingEditor({host:terms,from,to,sideCalendar:()=>calendar.reference('observation'),calendarPolicy:calendar.read,initial:saved?.floating,retainedObservations:detail?.valuation?.sides.find(s=>s.slot===slot)?.payments.find(p=>p.deliveryFrom===from&&p.deliveryTo===to)?.resets.map(r=>(r as typeof r&{contractObservation?:unknown}).contractObservation).filter(v=>v!=null),indices:()=>available(slot),contractSources:()=>availableSources(slot),payment:()=>pay.read(),context:()=>({...context(),...retainedKnowledge(catalog?.context??{})}),
+    enabled:()=>!detail||detail.canAmend,busy:options.busy,api:options.api,run:refreshObservations,changed:invalidate,quoteChanged:()=>syncFixedQuotes(true)});
+   const pay=paymentEditor(card,calendar,saved?.floating?.paymentSchedule);syncPayment=()=>{pay.sync();editor.sync();};
+   selectedQuote=editor.quote;refreshPeriod=editor.refresh;disposePeriod=editor.dispose;applyTerms=async(value,requireCurrent)=>{if(value.observations)await editor.apply(value.observations);requireCurrent();if(value.price!==undefined)editor.setSpread(value.price);if(value.payment)pay.restore(value.payment);};bulkRead=groups=>({...(groups.includes('observations')?{observations:editor.read()}:{}),...(groups.includes('price')?{price:editor.spread()}:{}),...(groups.includes('payment')?{payment:pay.read()}:{})});
+   read=()=>({amount:amount.value||null,fixed:null,floating:{...editor.read(),paymentSchedule:pay.read()}});
+
+  }
+  return{read,quote:()=>selectedQuote(),card,amount,from,to,selected,bulkRead:(groups:string[])=>({...bulkRead(groups),...(groups.includes('quantity')?{amount:amount.value}:{})}),apply:async(value:BulkTerms,groups:string[],requireCurrent:()=>void)=>{if(groups.includes('quantity'))amount.value=value.amount??'';await applyTerms(value,requireCurrent);},sync:()=>syncPayment(),refresh:()=>refreshPeriod(),dispose:()=>disposePeriod()};
+ }
+ function sideEditor(slot:number,saved?:QuantitySide){
+  const host=node('section');host.className='instrument-side';delivery.append(host);host.append(node('h3',slot===0?'First side':'Second side'),node('p','Keep one index and quote basis within each side. Enter each period quantity, price observations and payment rule explicitly.'));
+  decorateSideCard(host,host.querySelector('h3')!,slot===0&&kind.value==='fixed_floating'?'Fixed':'Floating',slot===0?'cash':'fee');
+  const calendar=sideCalendar({id:'scheduled-side-calendar-'+slot,choices:()=>referenceCalendarChoices(calendars()),purposes:()=>({delivery:true,observation:!(slot===0&&kind.value==='fixed_floating'),payment:true}),changed:()=>{invalidate();rows.forEach(row=>row.sync());refreshObservations(async()=>{for(const row of rows)await row.refresh();});}});
+  calendar.restore(saved?.calendarPolicy);
+  const from=input(host,'Contract delivery start','date',saved?.periods[0]?.fixed?.deliveryFrom??saved?.periods[0]?.floating?.deliveryFrom??'');from.dataset.role='delivery-from';
+  const last=saved?.periods.at(-1),to=input(host,'Contract delivery end · exclusive','date',last?.fixed?.deliveryTo??last?.floating?.deliveryTo??'');to.dataset.role='delivery-to';
+  const quantity=node('fieldset');quantity.append(node('legend','Quantity amount, unit and application'));host.append(quantity);
+  const derived=slot===1&&factorContract();
+  const powerOffered=available(slot).some(i=>i.powerQuantitySupported)&&powerQuantities().some(q=>q.commodity===commodity.value);
+  const basis=select(quantity,'Application basis',derived?[{value:catalog!.factorOptions.quantityBasis,label:'Derived from first-side quantity × factor'}]:quantityBases.filter(b=>powerOffered||b.value!=='selected_interval_power'),derived?catalog!.factorOptions.quantityBasis:saved?.basis);basis.dataset.role='quantity-basis';
+  const units=select(quantity,'Quantity unit',[],saved?JSON.stringify(saved.quantity):'');units.dataset.role='quantity-unit';
+  const total=input(quantity,'Total for this side’s whole contract','text',saved?.amount??'');total.dataset.role='contract-amount';
+  const allocation=select(quantity,'Allocate the contract total',allocations,saved?.allocation??'');
+  const power=node('fieldset');power.append(node('legend','Power delivery hours'));quantity.append(power);
+  const clock=select(power,'Contract time zone / market clock',clocks().map(c=>({value:JSON.stringify(c.reference),label:c.label})),saved?.power?JSON.stringify(saved.power.clock):'');
+  const product=select(power,'Delivery product',deliveryProducts,saved?.power?.product);
+  const start=input(power,'Local hour beginning · inclusive','number',saved?.power?.startHour?.toString()),end=input(power,'Local hour end · exclusive','number',saved?.power?.endHour?.toString());
+  const saturday=select(power,'Include Saturdays',[{value:'false',label:'Monday through Friday'},{value:'true',label:'Monday through Saturday'}],saved?.power?.saturday?.toString());
+  const quantityHelp=node('p');quantityHelp.className='field-help';quantity.append(quantityHelp);
+  if(slot===0)host.append(direction.parentElement!,pricing.parentElement!,precision.parentElement!);
+  const otherDirection=node('p','The opposite of the first side');otherDirection.className='field-help';
+  const directionNote=node('div');directionNote.append(node('label','Second side direction'),otherDirection);
+  const cards=node('div');cards.className='scheduled-periods';host.append(cards);let rows:ReturnType<typeof periodEditor>[]=[];
+  const unitChoices=()=>basis.value==='selected_interval_power'?powerQuantities().filter(q=>q.commodity===commodity.value):[...new Map(availableQuotes(slot).flatMap(i=>i.quantityChoices.filter(q=>!derived||q.specification.code===i.quantityCode)).map(q=>[JSON.stringify(q.specification),q])).values()];
+  const toggle=()=>{const old=units.value;units.replaceChildren(new Option('Choose…',''),...unitChoices().map(q=>new Option(q.unit,JSON.stringify(q.specification))));units.value=old;total.parentElement!.hidden=basis.value!=='contract_total';allocation.parentElement!.hidden=basis.value!=='contract_total';power.hidden=basis.value!=='selected_interval_power';for(const row of rows){row.amount.parentElement!.hidden=derived||basis.value==='contract_total';row.amount.parentElement!.querySelector('label')!.textContent=basis.value==='calendar_day_rate'?'Quantity per calendar delivery day':basis.value==='selected_interval_power'?'Power throughout selected delivery hours · MW':'Total quantity for this period';}quantityHelp.textContent=(derived?'Derive this side’s quantities from the first-side schedule and the explicitly selected factor. ':basis.value==='calendar_day_rate'?'Count every calendar delivery day, including weekends and holidays. ':basis.value==='selected_interval_power'?'Integrate MW over actual selected UTC durations. ':basis.value==='contract_total'?'Allocate this side’s total once using the selected rule. ':'Apply each entered total once to its period. ')+'The independently agreed period-average price multiplies the resolved period quantity.';const block=product.value==='weekday_block';for(const n of [start,end,saturday]){n.parentElement!.hidden=!block;n.required=basis.value==='selected_interval_power'&&block;}clock.required=basis.value==='selected_interval_power';product.required=clock.required;};
+  // Rows that hold entries are replaced only when the person says so, which the panel asks before the page is busy.
+  const generate=node('button','Generate monthly period rows');generate.type='button';host.append(generate);
+  generate.onclick=()=>void (async()=>{if(options.busy()||rows.length&&!await options.ask({text:'Replace the current period entries with empty rows?',keep:'Keep the entries',go:'Replace them'}))return;await run(generateRows);})();
+  async function generateRows(){const version=generation,selection=JSON.stringify(options.context());const response=await options.api<{periods:{deliveryFrom:string;deliveryTo:string}[]}>('swaps/scheduled-periods',{context:context(),from:from.value,to:to.value});if(version!==generation||selection!==JSON.stringify(options.context()))return;rows.forEach(row=>row.dispose());cards.replaceChildren();rows=response.periods.map(p=>periodEditor(cards,slot,p.deliveryFrom,p.deliveryTo,calendar));layoutPeriods();invalidate();toggle();selectionRows();}
+  const bulk=node('fieldset');bulk.className='scheduled-bulk';bulk.append(node('legend','Apply explicitly selected common terms'));
+  const source=select(bulk,'Copy terms from period',[]),groups=new Map<string,HTMLInputElement>();
+  for(const [value,label] of [...(derived?[]:[['quantity','Period quantity amount']]),['price','Fixed price / floating spread'],['payment','Payment rule'],...(slot===1||kind.value!=='fixed_floating'?[['observations','Observation and projection terms']]:[])]){const checkbox=node('input');checkbox.type='checkbox';field(bulk,label,checkbox);groups.set(value,checkbox);}
+  const affected=node('p'),bulkReview=node('div');bulkReview.setAttribute('role','status');let bulkPrepared:{version:number;value:BulkTerms;groups:string[];targets:typeof rows}|undefined;
+  const targets=()=>rows.filter(row=>row.selected.checked);const summary=()=>{affected.textContent=targets().length?'Selected periods: '+targets().map(row=>row.from+' to '+row.to).join('; '):'Select the periods to change. Unselected periods retain every value.';bulkPrepared=undefined;bulkReview.replaceChildren();};
+  const reviewButton=button(bulk,'Review common-term changes',()=>{if(!source.value||!targets().length)throw Error('Choose a source period and select the periods to change.');const selected=[...groups].filter(([,field])=>field.checked).map(([name])=>name);if(!selected.length)throw Error('Select which terms to copy.');if(selected.includes('quantity')&&basis.value==='contract_total')throw Error('A contract total is a side-level term; edit it in the quantity section.');bulkPrepared={version:generation,value:rows[Number(source.value)].bulkRead(selected),groups:selected,targets:targets()};bulkReview.textContent='Apply '+selected.join(', ')+' from '+rows[Number(source.value)].from+' to '+targets().map(row=>row.from).join(', ')+'. Delivery dates and unselected values stay as entered. Quantity-weighted observation intervals require their own explicit weights where dates differ.';});
+  const applyButton=button(bulk,'Apply reviewed common terms',async()=>{const plan=bulkPrepared;if(!plan||plan.version!==generation)throw Error('Review the currently selected periods and terms before applying.');invalidate();const version=generation,scope=JSON.stringify(options.context());const requireCurrent=()=>{if(version!==generation||scope!==JSON.stringify(options.context()))throw Error('The bulk edit was interrupted by changed terms or financial context. Remaining periods were not changed; review the visible entries.');};for(const row of plan.targets){requireCurrent();await row.apply(plan.value,plan.groups,requireCurrent);requireCurrent();}summary();});applyButton.dataset.role='bulk-apply';reviewButton.dataset.role='bulk-review';
+  bulk.append(affected,bulkReview);host.append(bulk);bulk.onchange=summary;
+  const selectionRows=()=>{const old=source.value;source.replaceChildren(new Option('Choose…',''),...rows.map((row,n)=>new Option(row.from+' to '+row.to,String(n))));source.value=old;for(const row of rows)row.selected.onchange=summary;summary();};
+  if(saved)rows=saved.periods.map(p=>periodEditor(cards,slot,p.fixed?.deliveryFrom??p.floating!.deliveryFrom,p.fixed?.deliveryTo??p.floating!.deliveryTo,calendar,p));
+  const clearAmounts=()=>{total.value='';rows.forEach(r=>r.amount.value='');message.textContent=derived?'The backend derives this side’s quantities in the selected native quote unit.':'Quantity basis or unit changed. Enter the amounts in the selected basis and unit.';invalidate();};basis.onchange=()=>{clearAmounts();toggle();};units.onchange=()=>{clearAmounts();toggle();};product.onchange=toggle;selectionRows();toggle();if(saved)units.value=JSON.stringify(saved.quantity);
+  alignSideCard(host,{product:[calendar.element],direction:[slot===0?direction.parentElement!:directionNote],start:[from.parentElement!],end:[to.parentElement!],quantity:[quantity,generate],
+   ...(slot===0?{price:[pricing.parentElement!,precision.parentElement!]}:{}),periods:[cards]});
+  return{host,quote:()=>rows[0]?.quote(),sync:()=>{calendar.sync(options.busy()||!!options.pending()||!!detail&&!detail.canAmend);rows.forEach(row=>row.sync());},refresh:async()=>{for(const row of rows)await row.refresh();},dispose:()=>rows.forEach(row=>row.dispose()),read:():QuantitySide=>{calendar.check();if(!basis.value||!units.value)throw Error('Choose a quantity unit and application basis on each side.');if(!rows.length||from.value!==rows[0].from||to.value!==rows.at(-1)!.to)throw Error('Generate the period rows for the currently entered delivery dates.');return{calendarPolicy:calendar.read(),basis:basis.value,quantity:JSON.parse(units.value),amount:basis.value==='contract_total'?total.value:null,allocation:basis.value==='contract_total'?allocation.value:null,priceApplication:catalog!.scheduledOptions.priceApplication,
+   power:basis.value==='selected_interval_power'?{clock:JSON.parse(clock.value),product:product.value,startHour:product.value==='weekday_block'?Number(start.value):null,endHour:product.value==='weekday_block'?Number(end.value):null,saturday:product.value==='weekday_block'?saturday.value==='true':null,calendar:null}:null,
+   periods:rows.map(r=>({...r.read(),amount:derived||basis.value==='contract_total'?null:r.amount.value}))};}};
+ }
+ let fixedQuote:string|undefined;
+ function syncFixedQuotes(clearChanged=false){const i=settlementIndex(),signature=i?JSON.stringify([i.currencyCode,i.quantityCode,i.quoteMultiplier]):undefined;const changed=clearChanged&&fixedQuote!==undefined&&signature!==fixedQuote;fixedQuote=signature;for(const price of root.querySelectorAll<HTMLInputElement>('[data-role=fixed-price]')){if(changed)price.value='';price.disabled=!i||pricing.value==='par';price.required=!!i&&pricing.value==='agreed';price.parentElement!.querySelector('label')!.textContent=i?`Agreed price · ${i.currency??i.currencyCode}/${i.unit} × ${i.quoteMultiplier}`:'Agreed price · choose the settlement index to resolve its quote';}}
+ function settlementIndex(){return sideEditors[1]?.quote();}
+ function syncPricing(){const fixed=kind.value==='fixed_floating',par=fixed&&pricing.value==='par';pricing.disabled=!fixed;pricing.parentElement!.hidden=!fixed;precision.parentElement!.hidden=!par;precision.disabled=!par;precision.required=par;}
+ function rebuild(saved?:Scheduled){populateFactor(saved?.factor);delivery.hidden=!kind.value||!commodity.value||!market.value;pricing.parentElement!.hidden=kind.value!=='fixed_floating';sideEditors.forEach(side=>side.dispose());delivery.replaceChildren();sideEditors=[sideEditor(0,saved?.first),sideEditor(1,saved?.second)];layoutPeriods();syncPricing();syncFixedQuotes();sync();}
+ function render(value:Valuation,quantities?:QuantityReview[]){
+  visibleValuation=value;visibleQuantities=quantities;review.replaceChildren();
+  if(factorContract())review.append(node('p',`Contractual factor: ${factorValue.value} ${factorNumerator.selectedOptions[0]?.text??''} / ${factorDenominator.selectedOptions[0]?.text??''}.`));
+  renderScheduledReview(review,value,quantities,{indices:allQuotes().filter(i=>i.definitionRevisionId===market.value).map(i=>({...i,currency:i.currency??i.currencyCode})),clocks:clocks(),text:(amount,kind,role)=>display.text(amount,kind,role),zone:options.zone(),busy:options.busy,act:run,
+   intervals:detail&&(detail.state.terms.scheduled.first.power||detail.state.terms.scheduled.second.power)?retainedIntervals(options.api,context(),detail):undefined});
+ }
+ function readFactor():Factor{if(!factorValue.value||!factorNumerator.value||!factorDenominator.value)throw Error('Enter the factor value and explicitly select its numerator and denominator units.');return{value:factorValue.value,numeratorQuantity:JSON.parse(factorNumerator.value),denominatorQuantity:JSON.parse(factorDenominator.value),implementation:catalog!.factorOptions.factorImplementation,unitConversionImplementation:catalog!.factorOptions.unitConversionImplementation};}
+ function body(){const first=sideEditors[0].read(),second=sideEditors[1].read(),i=settlementIndex();if(!i||!direction.value||!discount.value||!kind.value)throw Error('Choose complete product, direction, pricing and discounting terms.');if(kind.value==='fixed_floating'&&!pricing.value)throw Error('Choose agreed fixed prices or calculate par.');return{...context(),...annotations.read(),knowledgeMode:'current',operationId:crypto.randomUUID(),bookId:(document.getElementById('scheduled-book') as HTMLSelectElement).value,executedAt:null,quantity:null,fixedCoefficient:null,discounting:discount.value==='currency_default',fixed:null,floating:null,definitionRevisionId:i.definitionRevisionId,commodity:commodity.value,swapType:'scheduled_financial_swap',firstCoefficient:direction.value,scheduled:{implementation:factorContract()?catalog!.factorOptions.swapImplementation:catalog!.scheduledOptions.implementation,first,second,...(factorContract()?{factor:readFactor()}:{} )},...(detail?{tradeId:detail.state.tradeId,expectedRevision:detail.state.revision,effectiveAt:detail.asOf,reason:reason.value}:{})};}
+ form.oninput=event=>{if(fields.contains(event.target as Node)){invalidate();sideEditors.forEach(side=>side.sync());}};form.onchange=event=>{if(fields.contains(event.target as Node)){invalidate();sideEditors.forEach(side=>side.sync());}};
+ form.onsubmit=event=>{event.preventDefault();void run(async()=>{const request=body(),version=generation,selection=JSON.stringify(options.context());const response=await options.api<{terms:Record<string,unknown>;valuation:Valuation;quantityInputs:QuantityReview[];changeReview:ChangeReview|null;parRate:{price:{value:string}}|null}>('swaps/scheduled-price',{terms:request,priceMode:kind.value==='fixed_floating'?pricing.value:'agreed',parRatePolicy:pricing.value==='par'&&kind.value==='fixed_floating'?{implementation:catalog!.parRateOptions.implementation,decimalPlaces:Number(precision.value),tieRule:'to_even'}:null});if(version!==generation||selection!==JSON.stringify(options.context()))return;await prepare(response.valuation);if(version!==generation||selection!==JSON.stringify(options.context()))return;if(detail&&!response.changeReview)throw Error('Preview the amendment again to review its changes.');renderChangeReview(changeReview,response.changeReview);if(response.changeReview?.action==='keep_booked_terms'){prepared=undefined;render(response.valuation,response.quantityInputs);confirmation.hidden=true;sync();return;}submit.textContent=detail?'Save amendment':'Book scheduled swap';confirmLabel.textContent=detail?'I reviewed the booked and proposed terms and will submit a trade amendment.':'I reviewed these exact quantities, prices, payment dates and signed cashflows.';prepared={operationId:request.operationId,path:detail?'swaps/amend':'swaps/book',label:detail?`Swap amendment of ${detail.state.tradeReference}`:'New swap',body:{...response.terms,operationId:request.operationId}};render(response.valuation,response.quantityInputs);confirmation.hidden=false;confirm.checked=false;message.textContent=response.parRate?`Calculated par price: ${response.parRate.price.value}. Review the retained rounded price and resulting trade PV.`:'Review the authoritative trade cashflows before saving.';confirmation.scrollIntoView({block:'nearest'});});};
+ submit.onclick=()=>void run(async()=>{if(!prepared||!confirm.checked)throw Error('Calculate, review and confirm the current contract first.');await options.queue(prepared);});confirm.onchange=sync;
+ secondCommodity.onchange=()=>{invalidate();if(catalog)rebuild();};
+ kind.onchange=()=>{invalidate();pricing.disabled=kind.value!=='fixed_floating';if(catalog)rebuild();};commodity.onchange=()=>{invalidate();market.replaceChildren(new Option('Choose…',''),...[...new Set(allQuotes().filter(i=>i.commodity===commodity.value).map(i=>i.definitionRevisionId))].map(value=>new Option([...new Set(allQuotes().filter(i=>i.definitionRevisionId===value&&i.commodity===commodity.value).map(i=>curveName(i.curve)))].join(', '),value)));if(catalog)rebuild();message.textContent=market.options.length===1?'No qualified swap price curves are available for this commodity in the selected market context. Configure compatible index fixing schedules and projection data, or select another context.':'Commodity changed. Select compatible units and re-enter the independent period terms.';};market.onchange=()=>{invalidate();if(catalog)rebuild();};pricing.onchange=()=>{invalidate();syncPricing();for(const field of root.querySelectorAll<HTMLInputElement>('[data-role=fixed-price]'))field.value='';syncFixedQuotes();};
+ function sync(){
+  display.sync();
+  preview.textContent=detail?'Preview changes':'Preview booking';submit.textContent=detail?'Save amendment':'Book scheduled swap';
+  preview.classList.toggle('secondary',!!prepared);submit.classList.toggle('secondary',!prepared);
+  status.textContent=detail&&!detail.canAmend?(detail.amendUnavailableReason??'This revision is read-only.'):prepared?(confirm.checked?detail?'Ready to save this amendment.':'Ready to book these reviewed terms.':'Review the preview below and tick the confirmation to enable saving.'):detail?'Change the terms, enter an amendment reason, then preview changes.':'Enter the trade terms, then preview the booking.';
+  const waiting=options.busy()||!!options.pending(),locked=waiting||!!detail&&!detail.canAmend;
+  settlementButton.hidden=!detail;settlementButton.disabled=waiting;fields.disabled=locked;
+  for(const button of structureButtons.querySelectorAll<HTMLButtonElement>('button')){const selected=button.dataset.scheduledStructure===kind.value;button.disabled=locked||!catalog||selected;button.setAttribute('aria-pressed',String(selected));}
+  sideEditors.forEach(side=>side.sync());syncFixedQuotes();revision.disabled=waiting;reason.required=!!detail?.canAmend;
+  preview.disabled=locked||!catalog||!kind.value||!commodity.value||!market.value||(!detail&&!catalog.canBook);
+  submit.disabled=locked||!prepared||!confirm.checked;confirm.disabled=locked||!prepared;
+ }
+
+ function reset(){renderChangeReview(changeReview,null);generation++;sideEditors.forEach(side=>side.dispose());sideEditors=[];delivery.replaceChildren();display.reset();visibleValuation=undefined;visibleQuantities=undefined;fixedQuote=undefined;prepared=undefined;catalog=undefined;detail=undefined;shelf.append(root);root.hidden=true;form.reset();revision.value='';review.replaceChildren();confirmation.hidden=true;error.textContent='';message.textContent='';closeOut.replaceChildren();closeOut.hidden=true;priceSource.clear();edits.clear();}
+ async function populate(c:ExtendedCatalog,saved?:Detail,drafted?:{terms:Detail['state']['terms'];show:()=>void}){invalidate();const version=generation;catalog=saved?{...c,context:saved.context as ExtendedCatalog['context']}:c;detail=saved;annotations.populate(c.bookingActor,c,saved?.state??drafted?.terms as Partial<Annotation>|undefined);const t=saved?.state.terms??drafted?.terms;const book=document.getElementById('scheduled-book') as HTMLSelectElement;book.replaceChildren(new Option('Choose…',''),...c.books.map(b=>new Option(`${b.portfolio} / ${b.name}`,b.id)));if(t)book.value=t.bookId;commodity.replaceChildren(new Option('Choose…',''),...c.commodities.map(v=>new Option(v.name,v.code)));secondCommodity.replaceChildren(new Option('Choose…',''),...c.commodities.map(v=>new Option(v.name,v.code)));if(t){commodity.value=t.commodity;market.replaceChildren(...[...new Set(allQuotes().filter(i=>i.commodity===t.commodity).map(i=>i.definitionRevisionId))].map(value=>new Option([...new Set(allQuotes().filter(i=>i.definitionRevisionId===value&&i.commodity===commodity.value).map(i=>curveName(i.curve)))].join(', '),value)));market.value=t.definitionRevisionId as string;kind.value=t.scheduled.factor?'factor_floating':t.scheduled.first.periods[0].fixed?'fixed_floating':'floating_floating';if(t.scheduled.factor)secondCommodity.value=allQuotes().find(i=>i.definitionRevisionId===t.definitionRevisionId&&i.curve===t.scheduled.second.periods[0].floating?.curve)?.commodity??'';direction.value=t.firstCoefficient;discount.value=t.discounting?'currency_default':'none';pricing.value=kind.value==='fixed_floating'?'agreed':'';}if(saved){revision.value=String(saved.state.revision);message.textContent=saved.canAmend?'Booked terms are unchanged. Preview proposed changes before submitting an amendment.':saved.amendUnavailableReason??'Historical read-only view';}else message.textContent=drafted?'Close-out draft terms. Each period shows its drafted values.':'Enter each side independently. Period quantities, price observations and payment rules are distinct contractual terms.';revision.parentElement!.hidden=!saved;reason.parentElement!.hidden=!saved;rebuild(t?.scheduled);for(const side of sideEditors)await side.refresh();if(version!==generation)return;syncPricing();syncFixedQuotes();if(saved){await display.load(saved.state.tradeId,context(),saved.canAmend,saved.state.terms.scheduled.first.periods[0].fixed?['trade','fixed','floating']:['trade','floating']);await prepare(saved.valuation);if(version!==generation)return;render(saved.valuation,saved.quantityInputs);}drafted?.show();edits.clear();sync();mount();}
+ async function openNew(){reset();const version=generation,selection=JSON.stringify(options.context());const c=await options.api<ExtendedCatalog>('swaps/catalog',context());if(version!==generation||selection!==JSON.stringify(options.context()))return;await populate(c);}
+ /** Opens a new scheduled swap on the terms of a close-out the backend drafted, headed by the draft and its price labelled with its source. */
+ async function openCloseOut(terms:Record<string,unknown>,drafted:SwapCloseOut,shown:CloseOutShown){reset();const version=generation,selection=JSON.stringify(options.context());const c=await options.api<ExtendedCatalog>('swaps/catalog',context());if(version!==generation||selection!==JSON.stringify(options.context()))return;
+  if(!c.books.some(b=>b.id===terms.bookId))throw Error('The drafted book is not one you can book for.');
+  await populate(c,undefined,{terms:terms as Detail['state']['terms'],show:()=>{renderCloseOut(closeOut,drafted,shown);priceSource.show(drafted.price);}});}
+ return{openNew,openCloseOut,openDetail:(value:unknown)=>populate((value as Detail).catalog,value as Detail),reset,sync,refresh(){invalidate();annotations.refresh();priceSource.refresh();sync();},
+  /** A booking or amendment the backend refused for good: what was prepared for it is dropped, and the ticket, with what was typed in it, stays to be corrected. */
+  unprepare(){invalidate();sync();},
+  /** Restores the displayed revision when the person keeps the open ticket. */
+  keepRevision(){if(detail)revision.value=String(detail.state.revision);},
+  revision:()=>mounted()?detail?.state.revision:undefined,unsaved:()=>mounted()&&edits.edited(),isOpen:mounted};
+}

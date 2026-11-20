@@ -1,0 +1,147 @@
+using System.Collections.Immutable;
+using System.Globalization;
+using OpenEtrm.Rates;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.Trading;
+
+if(args is ["--monthly-swap-benchmark"]){MonthlySwapRateChecks.Benchmark();return;}
+if(args is ["--instant-discount"]){InstantDiscountChecks.Run();return;}
+if(args is ["--instant-cash"]){InstantCashDiscountChecks.Run();return;}
+if(args is ["--lifecycle-currency"]){LifecycleCurrencyChecks.Run();return;}
+if(args is ["--option-clock-resolution"]){OptionClockResolutionChecks.Run();return;}
+
+var passed=0;
+passed+=RatesCurveChecks.Run();
+passed+=RateCurveMathChecks.Run();
+passed+=InstantDiscountChecks.Run();
+passed+=InstantCashDiscountChecks.Run();
+passed+=LifecycleCurrencyChecks.Run();
+passed+=OptionClockResolutionChecks.Run();
+void Check(string label,Action test){test();Console.WriteLine("PASS "+label);passed++;}
+void Reject(string code,Action test){try{test();}catch(MarketDataException e)when(e.Code==code){return;}throw new Exception("Expected "+code);}
+var revision=new DefinitionRevision(Guid.NewGuid(),Guid.NewGuid());var reference=new ReferenceRevision(Guid.NewGuid(),Guid.NewGuid());
+ReferenceKey R(string code)=>new(reference,code);
+var series=new SeriesKey(revision,Guid.NewGuid());
+var observation=new MarketObservation(new(revision.CatalogId,Guid.NewGuid()),series,R("source"),ObservationRole.Parameter,PublicationState.Final,DateTimeOffset.Parse("2021-01-01T00:00:00Z",CultureInfo.InvariantCulture),ExactDecimal.Parse("0.05"));
+var definition=new RateCurveDefinition(new(revision,"rates"),R("currency"),R("source"),RateConventionSet.Parse("actual_365_fixed","simple","log_linear_discount","none","decimal_per_year"),[new("1Y",series,new(2022,1,1))],Guid.NewGuid(),1);
+var snapshot=new MarketSnapshot(Guid.NewGuid(),revision,observation.ObservedAt,observation.ObservedAt,InputSelectionPolicy.ExactPinnedFinalObservationsNoAgeFiltering,[new(new(series,InputUse.Variable),observation)]);
+ZeroRateBuild Build(MarketObservation? value=null,RateCurveDefinition? terms=null,MarketSnapshot? context=null)=>new ZeroRateCurve(terms??definition).Build(context??snapshot with {Selections=[new(new(series,InputUse.Variable),value??observation)]});
+double DF(ZeroRateBuild result)=>double.Parse(result.Values[0].DiscountFactor,CultureInfo.InvariantCulture);
+void Near(double actual,double expected){if(Math.Abs(actual-expected)>1e-15)throw new Exception($"Expected {expected}, got {actual}");}
+Check("simple annual discount factor",()=>{Near(DF(Build()),1/1.05);if(Build().NumericalPolicy!=ZeroRateCurve.Policy)throw new Exception("Missing numerical policy");});
+Check("zero rate discounts to one",()=>Near(DF(Build(observation with {Value=ExactDecimal.Parse("0")})),1));
+Check("negative rates produce a factor above one",()=>Near(DF(Build(observation with {Value=ExactDecimal.Parse("-0.01")})),1/.99));
+Check("actual365 fixed counts leap days explicitly",()=>{var start=DateTimeOffset.Parse("2020-01-01T00:00:00Z",CultureInfo.InvariantCulture);Near(DF(Build(terms:definition with {Tenors=[new("T",series,new(2021,1,1))]},context:snapshot with {ValuationAt=start,MarketCutoff=start,Selections=[new(new(series,InputUse.Variable),observation with {ObservedAt=start})]})),1/(1+.05*366/365));});
+Check("unsupported day count is never silently replaced",()=>Reject("unsupported_rate_convention",()=>RateConventionSet.Parse("unknown","simple","log_linear_discount","none","decimal_per_year")));
+Check("unsupported compounding is never silently replaced",()=>Reject("unsupported_rate_convention",()=>RateConventionSet.Parse("actual_365_fixed","semi_annual","log_linear_discount","none","decimal_per_year")));
+Check("missing exact rate observation rejected",()=>Reject("missing_observation",()=>Build(context:snapshot with {Selections=[]})));
+Check("wrong source rejected",()=>Reject("rate_observation",()=>Build(observation with {Source=R("other")})));
+Check("preliminary rate cannot masquerade as final",()=>Reject("rate_observation",()=>Build(observation with {State=PublicationState.Preliminary})));
+Check("rate newer than cutoff rejected",()=>Reject("rate_observation",()=>Build(observation with {ObservedAt=observation.ObservedAt.AddMinutes(1)})));
+Check("duplicate selected input rejected",()=>Reject("observation_conflict",()=>Build(context:snapshot with {Selections=snapshot.Selections.Add(snapshot.Selections[0])})));
+Check("future rate knowledge cannot enter a past valuation",()=>Reject("rate_snapshot",()=>Build(context:snapshot with {MarketCutoff=snapshot.ValuationAt.AddDays(1)})));
+Check("non-UTC context rejected",()=>Reject("rate_snapshot",()=>Build(context:snapshot with {ValuationAt=snapshot.ValuationAt.ToOffset(TimeSpan.FromHours(1))})));
+Check("unsupported rate date rejected",()=>Reject("rate_date",()=>Build(context:snapshot with {ValuationAt=new(2300,1,1,0,0,0,TimeSpan.Zero)})));
+Check("matured pillar cannot silently roll",()=>Reject("rate_maturity",()=>Build(terms:definition with {Tenors=[new("T",series,new(2021,1,1))]})));
+Check("ambiguous maturity order rejected",()=>Reject("rate_definition",()=>Build(terms:definition with {Tenors=[new("A",series,new(2022,1,1)),new("B",new(revision,Guid.NewGuid()),new(2021,6,1))]})));
+Check("unsupported rate domain rejected",()=>Reject("rate_domain",()=>Build(observation with {Value=ExactDecimal.Parse("2")})));
+Check("nonpositive implied factor rejected",()=>Reject("rate_domain",()=>Build(observation with {Value=ExactDecimal.Parse("-0.1")},terms:definition with {Tenors=[new("T",series,new(2042,1,1))]})));
+Check("rational division has an exact declared 18-digit result",()=>{var v=Build().Values[0];if(v.DiscountFactor!="0.952380952380952381"||v.Days!=365)throw new Exception("Incorrect exact factor");});
+Check("display division uses six-digit even ties directly from rational",()=>{var v=Build(observation with {Value=ExactDecimal.Parse("0.024")}).Values[0];if(v.DiscountFactor!="0.9765625"||v.DisplayDiscountFactor!="0.976562")throw new Exception("Incorrect display tie");});
+Check("18-digit rational division uses ties to even",()=>{var v=Build(observation with {Value=ExactDecimal.Parse("0.34217728")}).Values[0];if(v.DiscountFactor!="0.745058059692382812")throw new Exception("Incorrect 18-digit tie");});
+Check("parallel repeatability has no global evaluation date",()=>{var expected=Build().Values[0].DiscountFactor;Parallel.For(0,500,_=>{if(Build().Values[0].DiscountFactor!=expected)throw new Exception("Nonrepeatable result");});});
+Check("log discount interpolation matches independent high precision midpoint and unequal-day oracles",()=>{
+    var start=new DateOnly(2040,1,1);
+    string At(string a,string b,int n,int d)=>DiscountInterpolation.Factor(start,ExactDecimal.Parse(a),start.AddDays(d),ExactDecimal.Parse(b),start.AddDays(n),DiscountInterpolation.Policy).ToString();
+    if(At("0.99","0.95",1,2)!="0.969793792514676802" || At("0.99","0.95",17,31)!="0.967860375643978351" ||
+       At("1.01","1.05",3,7)!="1.026952802995532224" || At("1","0.81",1,2)!="0.9" ||
+       At("0.952380952380952381","0.909090909090909091",30,181)!="0.94506585697270284")throw new Exception("Incorrect geometric interpolation");
+});
+Check("log interpolation retains endpoints and small exact geometric roots",()=>{
+    var start=new DateOnly(2040,1,1);var end=start.AddDays(2);
+    string At(string a,string b,int n)=>DiscountInterpolation.Factor(start,ExactDecimal.Parse(a),end,ExactDecimal.Parse(b),start.AddDays(n),DiscountInterpolation.Policy).ToString();
+    if(At("0.999999999999999999","0.81",0)!="0.999999999999999999" || At("1","0.81",2)!="0.81" ||
+       At("0.000000000000000001","0.000000000000000004",1)!="0.000000000000000002" ||
+       At("0.000000000000000002","0.000000000000000008",1)!="0.000000000000000004")throw new Exception("Endpoint or small factor changed");
+});
+Check("log interpolation rejects extrapolation missing policy nonpositive factors and oversized spans",()=>{
+    var start=new DateOnly(2040,1,1);var one=ExactDecimal.Parse("1");
+    Reject("discount_interpolation",()=>DiscountInterpolation.Factor(start,one,start.AddDays(2),one,start.AddDays(3),DiscountInterpolation.Policy));
+    Reject("discount_interpolation",()=>DiscountInterpolation.Factor(start,one,start.AddDays(2),one,start,""));
+    Reject("discount_interpolation",()=>DiscountInterpolation.Factor(start,default,start.AddDays(2),one,start.AddDays(1),DiscountInterpolation.Policy));
+    Reject("discount_interpolation",()=>DiscountInterpolation.Factor(start,one,start,one,start,DiscountInterpolation.Policy));
+    Reject("discount_interpolation",()=>DiscountInterpolation.Factor(start,one,start.AddDays(DiscountInterpolation.MaximumPillarDays+1),one,start.AddDays(1),DiscountInterpolation.Policy));
+});
+Check("discounting false uses one without any default mapping or rate observations",()=>{
+    var value=PaymentDiscount.Resolve(false,R("currency"),new(2021,7,1),snapshot with {Selections=[]},null);
+    if(value.Factor.ToString()!="1"||value.MappingId is not null||value.Curve is not null||!value.Observations.IsEmpty)throw new Exception("Unexpected discount input");
+});
+Check("currency default discount retains exact mapping curve snapshot and selected pillar evidence",()=>{
+    var mapping=new CurrencyDiscountCurve(Guid.NewGuid(),R("currency"),definition);
+    var value=PaymentDiscount.Resolve(true,R("currency"),new(2022,1,1),snapshot,mapping);
+    if(value.Factor.ToString()!="0.952380952380952381"||value.MappingId!=mapping.Id||value.Curve!=definition.Key||
+       value.Snapshot!=snapshot||value.Observations.Single()!=observation.Key||value.RateNumericalPolicy!=ZeroRateCurve.Policy||value.Conventions!=definition.Conventions)throw new Exception("Lost exact discount evidence");
+});
+Check("discount default does not cross currency definition context or coverage",()=>{
+    var mapping=new CurrencyDiscountCurve(Guid.NewGuid(),R("currency"),definition);
+    Reject("discount_curve_missing",()=>PaymentDiscount.Resolve(true,R("currency"),new(2022,1,1),snapshot,null));
+    Reject("discount_curve",()=>PaymentDiscount.Resolve(true,R("other"),new(2022,1,1),snapshot,mapping));
+    Reject("rate_snapshot",()=>PaymentDiscount.Resolve(true,R("currency"),new(2022,1,1),snapshot with {Definitions=new(Guid.NewGuid(),Guid.NewGuid())},mapping));
+    // Before the first pillar the t_0 anchor (factor 1) is the left bracket (D359).
+    if(PaymentDiscount.Resolve(true,R("currency"),new(2021,7,1),snapshot,mapping) is not {Pillars.Length:1} anchored||anchored.Factor.CompareTo(ExactDecimal.Parse("1"))>=0||anchored.Factor.CompareTo(ExactDecimal.Parse("0.952380952380952381"))<=0)throw new Exception("The t_0 anchor did not bracket the first pillar");
+    Reject("discount_coverage",()=>PaymentDiscount.Resolve(true,R("currency"),new(2023,1,1),snapshot,mapping));
+    Reject("discount_curve",()=>PaymentDiscount.Resolve(true,R("currency"),new(2022,1,1),snapshot,mapping with {Id=Guid.Empty}));
+});
+Check("currency default interpolates only bracketing factors in the complete selected rate context",()=>{
+    var nextSeries=new SeriesKey(revision,Guid.NewGuid());
+    var first=new DateOnly(2022,1,1);var second=first.AddDays(181);
+    var terms=definition with {Tenors=[new("1Y",series,first),new("18M",nextSeries,second)]};
+    var selected=snapshot with {Selections=snapshot.Selections.Add(new(new(nextSeries,InputUse.Variable),observation with {Key=new(revision.CatalogId,Guid.NewGuid()),Series=nextSeries,Value=ExactDecimal.Parse("0.1")}))};
+    var mapping=new CurrencyDiscountCurve(Guid.NewGuid(),R("currency"),terms);
+    var rates=new ZeroRateCurve(terms).Build(selected);
+    var expected=DiscountInterpolation.Factor(first,ExactDecimal.Parse(rates.Values[0].DiscountFactor),second,ExactDecimal.Parse(rates.Values[1].DiscountFactor),first.AddDays(30),DiscountInterpolation.Policy);
+    var value=PaymentDiscount.Resolve(true,R("currency"),first.AddDays(30),selected,mapping);
+    if(value.Factor!=expected||value.Observations.Length!=2||value.Snapshot!=selected)throw new Exception("Lost bracketing inputs");
+    Reject("missing_observation",()=>PaymentDiscount.Resolve(true,R("currency"),first.AddDays(30),snapshot,mapping));
+});
+Check("undiscounted helper still requires structurally exact currency context and future payment",()=>{
+    Reject("discount_context",()=>PaymentDiscount.Resolve(false,default,new(2022,1,1),snapshot,null));
+    Reject("discount_context",()=>PaymentDiscount.Resolve(false,R("currency"),new(2022,1,1),snapshot with {Id=Guid.Empty},null));
+    Reject("discount_context",()=>PaymentDiscount.Resolve(false,R("currency"),new(2022,1,1),snapshot with {ValuationAt=snapshot.ValuationAt.ToOffset(TimeSpan.FromHours(1))},null));
+    Reject("discount_context",()=>PaymentDiscount.Resolve(false,R("currency"),new(2020,1,1),snapshot,null));
+});
+Check("payment-day value is nominal without rate observations or a rate mapping",()=>{
+    var selected=snapshot with{ValuationAt=snapshot.ValuationAt.AddHours(12),Selections=[]};
+    var today=DateOnly.FromDateTime(selected.ValuationAt.UtcDateTime);
+    var value=PaymentDiscount.Resolve(true,R("currency"),today,selected,null);
+    if(value.Factor!=ExactDecimal.Parse("1")||!value.Pillars.IsEmpty||value.Curve is not null)
+        throw new Exception("Same-day cash acquired a discount factor or rate dependency.");
+    var key=new OpenEtrm.MarketData.Trading.SidePaymentKey(Guid.NewGuid(),0,snapshot.ValuationAt,R("currency"));
+    var provider=new CurrencyDefaultDiscounting([key],snapshot,true,null);
+    var rolled=provider.ResolveForValuation([key],snapshot,snapshot.ValuationAt.AddHours(8),OpenEtrm.MarketData.Calculation.ClockChange.FrozenInputs).Single();
+    if(rolled.DiscountFactor!=ExactDecimal.Parse("1")||rolled.RateDefinition is not null||rolled.Source!=OpenEtrm.MarketData.Trading.DiscountFactorSource.PaymentDay)
+        throw new Exception("An intraday payment-day clock roll acquired a curve or changed nominal cash.");
+});
+Check("same-date instant values retain their rate contract independently of standard cash",()=>{
+    var mapping=new CurrencyDiscountCurve(Guid.NewGuid(),R("currency"),definition);
+    var at=snapshot.ValuationAt.AddHours(8);
+    var selected=snapshot with{ValuationAt=at};
+    var cash=new SidePaymentKey(Guid.NewGuid(),0,snapshot.ValuationAt,R("currency"));
+    var instant=new SidePaymentKey(Guid.NewGuid(),1,snapshot.ValuationAt.AddHours(18),R("currency")){Timing=ValueTimingKind.Instant};
+    Reject("discount_curve_missing",()=>new CurrencyDefaultDiscounting([cash,instant],selected,true,null));
+    foreach(var keys in new[]{ImmutableArray.Create(cash,instant),ImmutableArray.Create(instant,cash)})
+    {
+        var discounting=new CurrencyDefaultDiscounting(keys,selected,true,mapping);
+        var factors=discounting.Resolve(keys,selected);
+        if(factors.Single(f=>f.Payment==cash).Source!=DiscountFactorSource.PaymentDay||
+            factors.Single(f=>f.Payment==instant).Source!=DiscountFactorSource.CurrencyDefault||
+            discounting.Inputs[instant].Timing!=ValueTimingKind.Instant||discounting.Inputs[instant].Curve!=definition.Key)
+            throw new Exception("A date-only cache or nominal shortcut erased an instant's selected rate contract.");
+        Reject("valuation_time_event",()=>discounting.ResolveForValuation([instant],selected,instant.PaymentAt,OpenEtrm.MarketData.Calculation.ClockChange.FrozenInputs));
+    }
+});
+passed += SwapValuationChecks.Run();
+passed += MonthlySwapRateChecks.Run();
+passed += DiscountLookupChecks.Run();
+passed += DiscountInterpolationChecks.Run();
+Console.WriteLine($"{passed} rate convention checks passed.");

@@ -1,0 +1,189 @@
+using System.Collections.Immutable;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Npgsql;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.CustomCurves;
+
+namespace OpenEtrm.Api;
+
+// Report adapter over the same authorized product valuation operations. Numeric
+// values stay typed in the backend; unsupported measures remain unavailable.
+public sealed partial class TradingBlotter(PreviewDatabase database,FuturesStore futures,SwapStore swaps,Func<string,bool> sideSchedules)
+{
+ private PreviewManifest manifest=>database.Manifest;
+ public const string Convention="trading_workspace_v1";
+ public const string PivotConvention="trading_blotter_totals_v1";
+ // D223: money of one currency adds across quantity units, so this convention measures money and trade counts only.
+ public const string MoneyTotalsConvention="trading_blotter_money_totals_v1";
+ // How many extra groupings of its one valuation a request may ask for.
+ public const int MaximumSummaries=4;
+ internal static readonly IReadOnlyDictionary<string,(string Field,PriceStatistic Statistic)> PriceMeasures=
+  new[]{"executionPrice","mark","fixedPrice"}.SelectMany(field=>new[]{("Min",PriceStatistic.Minimum),("Max",PriceStatistic.Maximum),("Mean",PriceStatistic.ArithmeticMean)}
+   .Select(stat=>new KeyValuePair<string,(string,PriceStatistic)>(field+stat.Item1,(field,stat.Item2)))).ToDictionary();
+ internal static readonly JsonSerializerOptions Json=new(JsonSerializerDefaults.Web);
+ internal static MarketDataException Invalid()=>new("blotter_view","Select supported dimensions/measures and exact authorized book/portfolio scopes.");
+ internal static void ValidateView(FuturesBlotterView view)
+ {
+  if(view is null||view.Mode is not("trades" or "pivot")||view.GroupBy.IsDefault||view.Measures.IsDefault||
+   view.GroupBy.Distinct().Count()!=view.GroupBy.Length||view.Measures.Distinct().Count()!=view.Measures.Length||
+   view.GroupBy.Any(d=>d is not("portfolio" or "book" or "market" or "contract" or "instrumentType" or "commodity"))||
+   view.Measures.Any(m=>m is not("tradeCount" or "lots" or "quantity" or "executionPnl" or "presentValue")&&!PriceMeasures.ContainsKey(m))||
+   (view.Measures.Any(m=>PriceMeasures.TryGetValue(m,out var price)&&price.Statistic==PriceStatistic.ArithmeticMean)?view.PriceNumericalPolicy!=PriceStatistics.MeanPolicy:view.PriceNumericalPolicy is not null)||
+   (view.Mode=="trades"?(view.GroupBy.Length!=0||view.Measures.Length!=0||view.PivotConvention is not null):
+    (view.GroupBy.IsEmpty||view.Measures.IsEmpty||view.PivotConvention is not(PivotConvention or MoneyTotalsConvention)||
+     view.PivotConvention==MoneyTotalsConvention&&view.Measures.Any(m=>m is not("presentValue" or "executionPnl" or "tradeCount"))||
+     view.Measures.Contains("lots")&&!view.GroupBy.Contains("contract"))))throw Invalid();
+ }
+ // A summary groups the rows its request's own view reads, so it is a pivot of exactly that view's books and portfolios.
+ private static void ValidateSummaries(FuturesBlotterView view,ImmutableArray<FuturesBlotterView> summaries)
+ {
+  if(summaries.IsDefault||summaries.Length>MaximumSummaries)throw Invalid();
+  foreach(var summary in summaries)
+  {
+   ValidateView(summary);
+   if(summary.Mode!="pivot"||!SameScope(summary,view))throw Invalid();
+  }
+ }
+ // Each view names its books and its portfolios once, as the Blotter requires, and they are the same ones.
+ private static bool SameScope(FuturesBlotterView first,FuturesBlotterView second)
+ {
+  static bool SameOnce(ImmutableArray<Guid> a,ImmutableArray<Guid> b)=>
+   !a.IsDefault&&!b.IsDefault&&a.Distinct().Count()==a.Length&&b.Distinct().Count()==b.Length&&a.ToHashSet().SetEquals(b);
+  return SameOnce(first.BookIds,second.BookIds)&&SameOnce(first.PortfolioIds,second.PortfolioIds);
+ }
+ // The caller has already bound the exact certified market and trading cut.
+ internal async Task<BlotterRun?> ReadEmptyDirectory(NpgsqlConnection connection,InputFrame frame,FuturesBlotterView view,ImmutableArray<FuturesBlotterView> summaries,CancellationToken ct)
+ {
+  var source=(await MarketInputSelection.RootSource(database,connection,frame,ct)).Apply(manifest);
+  await MarketBundle.Require(connection,source,ct);
+  // Base revision tables are checked before joins or report filters. A visible
+  // revision of either product requires the unchanged complete valuation path.
+  await using var command=ScheduleStore.Command(connection,"""
+   SELECT EXISTS(SELECT 1 FROM trading.trade_revisions WHERE catalog_id=$1)
+       OR EXISTS(SELECT 1 FROM trading.swap_trade_revisions WHERE catalog_id=$1)
+       OR EXISTS(SELECT 1 FROM trading.ppa_trade_revisions WHERE catalog_id=$1)
+       OR EXISTS(SELECT 1 FROM trading.gas_trade_revisions WHERE catalog_id=$1)
+       OR EXISTS(SELECT 1 FROM trading.trades t WHERE t.catalog_id=$1 AND security.gas_park_loan_trade_head(t.catalog_id,t.id))
+       OR EXISTS(SELECT 1 FROM trading.trades t WHERE t.catalog_id=$1 AND security.gas_park_custody_trade_head(t.catalog_id,t.id))
+       OR EXISTS(SELECT 1 FROM trading.trades t WHERE t.catalog_id=$1 AND security.gas_transport_financial_trade_head(t.catalog_id,t.id))
+       OR EXISTS(SELECT 1 FROM trading.lng_trade_revisions WHERE catalog_id=$1)
+       OR EXISTS(SELECT 1 FROM trading.crude_trade_revisions WHERE catalog_id=$1)
+       OR EXISTS(SELECT 1 FROM trading.futures_option_trade_revisions WHERE catalog_id=$1)
+       OR EXISTS(SELECT 1 FROM jsonb_array_elements(security.operating_position_scope($1,ARRAY[]::uuid[],ARRAY[]::uuid[],NULL)))
+       OR EXISTS(SELECT 1 FROM jsonb_array_elements(security.rec_forward_position_scope($1,ARRAY[]::uuid[],ARRAY[]::uuid[],NULL)))
+       OR EXISTS(SELECT 1 FROM jsonb_array_elements(security.heat_rate_call_position_scope($1,ARRAY[]::uuid[],ARRAY[]::uuid[],NULL)))
+       OR EXISTS(SELECT 1 FROM jsonb_array_elements(security.gas_storage_position_scope($1,ARRAY[]::uuid[],ARRAY[]::uuid[],NULL)))
+   """,manifest.CatalogId);
+  var hasRevisions=(bool)(await command.ExecuteScalarAsync(ct)??throw new PreviewDeniedException());
+  if(hasRevisions)return null;
+  ValidateView(view);ValidateSummaries(view,summaries);
+  var books=await futures.Books(connection,ct);
+  BookScope.Validate(books,view.BookIds,view.PortfolioIds);
+  await MarketBundle.RequireObservationPins(connection,source,frame.ObservationIds,ct);
+  return BlotterRun.Empty(view,summaries,sideSchedules);
+ }
+ public async Task<BlotterRead> Read(NpgsqlConnection connection,PreviewData data,InputFrame frame,FuturesBlotterView view,ImmutableArray<FuturesBlotterView> summaries,CancellationToken ct)
+  =>await (await Begin(connection,data,frame,view,summaries,ct)).Collect(ct);
+ // A view's valuation run: each product's positions in scope, read before any is valued.
+ internal async Task<BlotterRun> Begin(NpgsqlConnection connection,PreviewData data,InputFrame frame,FuturesBlotterView view,ImmutableArray<FuturesBlotterView> summaries,CancellationToken ct)
+ {
+  ValidateView(view);ValidateSummaries(view,summaries);
+  var tradeView=view with {Mode="trades",GroupBy=[],Measures=[],PivotConvention=null,PriceNumericalPolicy=null};
+  var futuresRun=await futures.BlotterRun(connection,data,frame,tradeView,ct);
+  var swapRun=await swaps.BlotterRun(connection,data,frame,view.BookIds,view.PortfolioIds,ct);
+  var ppaRun=await PpaBlotter.Run(connection,database,data,frame,view.BookIds,view.PortfolioIds,ct);
+  var gasRun=await GasBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var parkLoanRun=await GasParkLoanBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var custodyRun=await GasParkCustodyBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var transportRun=await GasTransportFinancialBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var crudeRun=await CrudeBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var lngRun=await LngBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var optionRun=await FuturesOptionBlotter.Run(connection,database,data,frame,view.BookIds,view.PortfolioIds,ct);
+  var operatingRun=await OperatingBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var recRun=await RecBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var heatRateCallRun=await HeatRateCallBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var gasStorageRun=await GasStorageBlotter.Run(connection,database,frame,view.BookIds,view.PortfolioIds,ct);
+  var formats=await DealAmountFormats.All(connection,manifest.CatalogId,ct);
+  return new(view,summaries,futuresRun,swapRun,ppaRun,formats,sideSchedules,gasRun,crudeRun,optionRun,lngRun,parkLoanRun,custodyRun,transportRun,[operatingRun,recRun,heatRateCallRun,gasStorageRun]);
+ }
+ // The report of a view and, grouped from the same valuation, each requested summary in request order.
+ public sealed record BlotterRead(object Blotter,ImmutableArray<Summary> Summaries);
+ // A read whose rows a stream has already sent, so its report carries none.
+ internal static BlotterRead WithoutRows(BlotterRead read)=>read with{Blotter=((Report)read.Blotter) with{Holdings=[]}};
+ public sealed record Summary(FuturesBlotterView View,List<JsonObject> Groups);
+ internal static ImmutableArray<Summary> Summarize(ImmutableArray<FuturesBlotterView> summaries,List<JsonObject> rows)=>
+  [..summaries.Select(summary=>new Summary(summary,Groups(summary,rows)))];
+ internal sealed record Work(int SwapTrades,int SwapValuations,int SupplementalMarketLoads);
+ private sealed record Report(FuturesBlotterView View,string PivotNumericalPolicy,List<JsonObject> Groups,
+  List<JsonObject> Holdings,int EvaluatedContracts,JsonNode? Totals,Work Work,bool HasSwaps,string Convention,int UnvaluedPositions);
+ // D220: valuation measures add only positions the selected close values; booked facts count every position.
+ private static bool Valuation(string measure)=>measure is "presentValue" or "executionPnl"||PriceMeasures.TryGetValue(measure,out var price)&&price.Field=="mark";
+ private static string? Text(JsonObject row,string key)=>row[key]?.GetValue<string>();
+ private static ReferenceKey Key(JsonObject row,string key)=>row[key]!.Deserialize<ReferenceKey>(Json);
+ private static bool Valued(JsonObject row)=>row["unavailableReason"] is null;
+ private static int Unvalued(IEnumerable<JsonObject> selected)=>selected.Where(r=>!Valued(r)).Select(r=>Text(r,"tradeId")).Distinct().Count();
+ internal static object Project(FuturesBlotterView view,List<JsonObject> rows,int evaluatedContracts,JsonNode? totals,Work work)=>
+  new Report(view,"typed_partitioned_trade_totals_v1",view.Mode=="pivot"?Groups(view,rows):[],rows,evaluatedContracts,totals,work,
+   rows.Any(r=>Text(r,"instrumentType")=="financial_swap"),Convention,Unvalued(rows));
+ internal static List<JsonObject> Groups(FuturesBlotterView view,List<JsonObject> rows)
+ {
+  var groups=new List<JsonObject>();
+  var hasPrices=view.Measures.Any(PriceMeasures.ContainsKey);
+  // D98 keeps totals apart by quantity specification; D223's money totals add across quantity units, keeping apart only the dimensions, instrument type and currency.
+  var byQuantity=view.PivotConvention!=MoneyTotalsConvention;
+  // A market or contract is defined in one definition revision, so groups naming one are kept apart by revision and say which (D223).
+  var byDefinition=view.GroupBy.Any(d=>d is "market" or "contract");
+  var dimensions=new Dictionary<string,string>{{"portfolio","portfolioId"},{"book","bookId"},{"market","curve"},{"contract","contractId"},{"instrumentType","instrumentType"},{"commodity","commodity"}};
+  // What identifies a row's group in a dimension: the field's text, or the code of the reference the field names.
+  string? Identity(JsonObject row,string field)=>row[field] is JsonObject reference?Text(reference,"code"):Text(row,field);
+  var partitions=rows.OrderBy(r=>Text(r,"tradeId"),StringComparer.Ordinal).ThenBy(r=>Text(r,"bindingId"),StringComparer.Ordinal).GroupBy(r=>JsonSerializer.Serialize(new{
+   dimensions=view.GroupBy.Select(d=>d=="market"?Text(r,"marketKey")??Identity(r,dimensions[d]):Identity(r,dimensions[d])),type=Text(r,"instrumentType"),quantity=byQuantity?Key(r,"quantitySpecification"):(ReferenceKey?)null,currency=Key(r,"currencyReference"),
+   priceMultiplier=hasPrices?Text(r,"quoteMultiplier"):null,definition=byDefinition?Text(r,"definitionRevisionId"):null,measure=Text(r,"measure")}));
+  foreach(var partition in partitions)
+  {
+   var first=partition.First();var group=new JsonObject();
+   // Selectable native pivots need exact identities; D223 money summaries retain their established shape.
+   if(byQuantity)group["groupId"]=Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes("blotter-group-v1:"+partition.Key)));
+   // A healthy subtotal cannot be the complete value of a group whose retained
+   // schedules need rebooking. Its individual healthy positions remain valued.
+   var needsRebooking=partition.Any(row=>Text(row,"unavailableReason")==PpaBlotter.NeedsRebooking);
+   foreach(var d in view.GroupBy)
+   {
+    var field=dimensions[d];group[field=="curve"?"market":field]=(field=="curve"?first["marketKey"]??first[field]:first[field])?.DeepClone();
+    if(d=="market"&&first["marketLabel"] is {} marketLabel)group["marketLabel"]=marketLabel.DeepClone();
+    if(d is "portfolio" or "book")group[d]=first[d]?.DeepClone();
+    if(d=="contract"){group["deliveryFrom"]=first["deliveryFrom"]?.DeepClone();group["deliveryTo"]=first["deliveryTo"]?.DeepClone();}
+   }
+   if(byDefinition)group["definitionRevisionId"]=first["definitionRevisionId"]?.DeepClone();
+   // Values under different measure codes are never added together (D360): each group names its measure.
+   if(first["measure"] is {} code){group["measure"]=code.DeepClone();group["measureLabel"]=first["measureLabel"]?.DeepClone();}
+   foreach(var field in byQuantity?new[]{"instrumentType","unit","currency","quantitySpecification","currencyReference"}:new[]{"instrumentType","currency","currencyReference"})
+    group[field]=first[field]?.DeepClone();
+   if(hasPrices){group["quoteMultiplier"]=first["quoteMultiplier"]?.DeepClone();group["priceUnit"]=PreviewData.PriceUnitLabel(Text(first,"currency")!,Text(first,"unit")!,Text(first,"quoteMultiplier"));}
+   foreach(var measure in view.Measures)
+   {
+    if(measure=="tradeCount"){group[measure]=partition.Select(r=>Text(r,"tradeId")).Distinct().Count();continue;}
+    if(needsRebooking&&Valuation(measure)){group[measure]=null;continue;}
+    var counted=Valuation(measure)?partition.Where(Valued).ToArray():partition.ToArray();
+    if(PriceMeasures.TryGetValue(measure,out var price))
+    {
+     if(counted.Length==0||counted.Any(r=>r[price.Field] is null)){group[measure]=null;continue;}
+     var priceUnit=new PriceUnit(Key(first,"currencyReference"),Key(first,"quantitySpecification"),ExactDecimal.Parse(Text(first,"quoteMultiplier")??throw Invalid()));
+     group[measure]=PriceStatistics.AggregateExact(counted.Select(r=>ExactUnitPrice.Parse(Text(r,price.Field)!,priceUnit)).ToImmutableArray(),price.Statistic,
+      price.Statistic==PriceStatistic.ArithmeticMean?view.PriceNumericalPolicy:null).ToExactString();continue;
+    }
+    if(counted.Length==0||counted.Any(r=>r[measure] is null)){group[measure]=null;continue;}
+    if(measure=="quantity")group[measure]=counted.Select(r=>new Quantity(ExactDecimal.Parse(Text(r,measure)!),Key(r,"quantitySpecification"))).Aggregate((a,b)=>a.Add(b)).Amount.ToString();
+    else if(measure is "presentValue" or "executionPnl")group[measure]=counted.Select(r=>ExactMoney.Parse(Text(r,measure)!,Key(r,"currencyReference"))).Aggregate((a,b)=>a.Add(b)).ToExactString();
+    else group[measure]=counted.Select(r=>ExactDecimal.Parse(Text(r,measure)!)).Aggregate((a,b)=>a+b).ToString();
+   }
+   group["unvaluedPositions"]=Unvalued(partition);
+   if(needsRebooking)group["valuationUnavailableReason"]=PpaBlotter.NeedsRebooking;
+   groups.Add(group);
+  }
+  return groups;
+ }
+}

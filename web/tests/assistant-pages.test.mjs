@@ -1,0 +1,454 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+test('Transport capacity reports its own explicitly unsupported assistant page',()=>{
+ assert.deepEqual(pageReport({page:'facilities',facilitySection:'transport',businessDate:'2032-03-14',facilityLedger:'unrelated-physical-ledger'}),{page:'transport_capacity',selection:{}});
+});
+test('Route plans report their own explicitly unsupported assistant page without a physical ledger',()=>{
+ assert.deepEqual(pageReport({page:'facilities',facilitySection:'route',businessDate:'2032-03-14',facilityLedger:'unrelated-physical-ledger'}),{page:'transport_route_plans',selection:{}});
+});
+test('a proposed curve and a saved draft wait for explicit review on an idle unchanged page',async()=>{
+ const {targetAction}=await import('../dist/assistant-pages.js');
+ assert.equal(targetAction({live:true,changesContext:false,unsaved:false,review:true}),'go');
+});
+import {pageReport,lookingAt,reportedPages,askKnowledge,changesContext,targetAction,NavigationHistory,stepLine,endingLine,startsOver,usageLine,consentText,grantExpiry,webPage,agentChoice,preselect,conversationChoice,panelMessage,keptAsk} from '../dist/assistant-pages.js';
+
+test('independent delivery and facility views retain their display-only report identities',()=>{
+ for(const [facilitySection,page]of [['definitions','facility_definitions'],['activity','facility_activity'],['gas-delivery','delivery_workbench_gas'],['crude-delivery','delivery_workbench_crude']]){
+  const report=pageReport({page:'facilities',facilitySection,businessDate:'2032-03-14',facilityLedger:'old-ledger'});
+  assert.deepEqual(report,{page,selection:{}});
+  assert.equal(lookingAt(report,{mode:'current',frameId:null,frameLabel:null},{curve:String,table:String}).supported,false);
+ }
+});
+
+const book='d1000000-0000-4000-8000-000000000001',portfolio='d2000000-0000-4000-8000-000000000002',trade='71000000-0000-4000-8000-000000000009';
+const context='c1000000-0000-4000-8000-000000000001',frame='f1000000-0000-4000-8000-000000000001',other='f2000000-0000-4000-8000-000000000002';
+const open={pane:{details:true,charts:true},poppedOut:false},layout={pane:{details:true,charts:true},poppedOut:false};
+const blotter={mode:'trades',bookIds:[book],portfolioIds:[],groupBy:['contract'],measures:['lots']};
+
+test('dashboard, setup and volatility reports retain their labels and supported read capabilities',()=>{
+  for(const [page,label] of [['dashboard','Dashboard'],['gas-setup','Gas delivery setup'],['crude-setup','Crude delivery setup'],['vol-surfaces','Vol surfaces'],['options','Options']]){
+    const report=pageReport({page}),seen=lookingAt(report,{mode:'current',frameId:frame,frameLabel:'Synthetic close'},{curve:String,table:String});
+    assert.deepEqual(report.selection,{});assert.equal(seen.page,label);assert.equal(seen.askable,true);assert.equal(seen.supported,page==='gas-setup'||page==='crude-setup');if(!seen.supported)assert.match(seen.shows,/does not read this page/);
+  }
+});
+
+test('Curves & prices reports the directory with no curve, the curve on Prices and Dependencies, and its observations on Inputs',()=>{
+  assert.deepEqual(pageReport({page:'market',curve:null,tab:'prices'}),{page:'curves',selection:{view:'curves',curve:null}});
+  assert.deepEqual(pageReport({page:'market',curve:'future',tab:'prices'}),{page:'curves',selection:{view:'curve',curve:'future'}});
+  assert.deepEqual(pageReport({page:'market',curve:'future',tab:'dependencies'}),{page:'curves',selection:{view:'curve',curve:'future'}});
+  assert.deepEqual(pageReport({page:'market',curve:'future',tab:'inputs'}),{page:'curves',selection:{view:'observations',curve:'future'}});
+});
+
+test('Power TOUs reports power hours once an As of frame is chosen, and TOU products before',()=>{
+  assert.deepEqual(pageReport({page:'power',frame:true}),{page:'power_tous',selection:{view:'power_hours'}});
+  assert.deepEqual(pageReport({page:'power',frame:false}),{page:'power_tous',selection:{view:'tou_products'}});
+});
+
+test('every other page reports the view it shows in its read tool input form, and a page the assistant does not read an empty selection',()=>{
+  assert.throws(()=>pageReport({page:'configuration'}),/page is inconsistent/,'Contract pricing and Publications have no assistant report contract');
+  assert.deepEqual(pageReport({page:'schedules'}),{page:'schedules',selection:{view:'library'}});
+  assert.deepEqual(pageReport({page:'reference',table:'units',search:'mega'}),{page:'reference_data',selection:{table:'units',search:'mega'}});
+  assert.deepEqual(pageReport({page:'parties',kind:'counterparty'}),{page:'parties',selection:{kind:'counterparty'}});
+  // Trade rows name no grouping; the Blotter keeps its pivot choices for when totals are shown again.
+  assert.deepEqual(pageReport({page:'futures',...open,risk:false,trade:null,entry:null,view:blotter}),{page:'blotter',layout,selection:{view:'blotter',mode:'trades',bookIds:[book],portfolioIds:[],
+    groupBy:[],measures:[],tradeId:null,instrumentType:null,revision:null}});
+  assert.deepEqual(pageReport({page:'futures',...open,risk:false,trade:null,entry:null,view:{...blotter,mode:'pivot',portfolioIds:[portfolio]}}).selection,{view:'blotter',mode:'pivot',
+    bookIds:[book],portfolioIds:[portfolio],groupBy:['contract'],measures:['lots'],tradeId:null,instrumentType:null,revision:null});
+  assert.deepEqual(pageReport({page:'futures',...open,risk:false,trade:{tradeId:trade,instrumentType:'future',revision:2,reference:'TR-000009'},entry:null,view:blotter}),
+    {page:'blotter',layout,selection:{view:'trade',mode:null,bookIds:null,portfolioIds:null,groupBy:null,measures:null,tradeId:trade,instrumentType:'future',revision:2}});
+  assert.deepEqual(pageReport({page:'futures',...open,risk:true,trade:null,entry:null,view:blotter}),{page:'blotter_risk',selection:{},layout});
+  for(const [page,id] of [['facilities','facility_quantities'],['dashboard','dashboard'],['gas-setup','gas_setup'],['crude-setup','crude_setup'],['gas','physical_gas'],['crude','physical_crude'],['delivery','delivery_prices'],['interval-series','interval_series'],['interval-curves','interval_curves'],
+    ['admin','users_access'],['ai','settings_ai'],['vol-surfaces','vol_surfaces'],['options','options']])assert.deepEqual(pageReport({page}),{page:id,selection:{}});
+});
+
+test('Jobs reports the list of your jobs, or the history of the job whose details are open, as Read jobs takes them',()=>{
+  const job='a7000000-0000-0000-0000-000000000003',working={mode:'current',frameId:frame,frameLabel:'18 Dec 2020 16:00'},names={curve:String,table:String};
+  assert.deepEqual(pageReport({page:'jobs',job:null}),{page:'jobs',selection:{view:'jobs',job:null,page:0,before:null}});
+  assert.deepEqual(pageReport({page:'jobs',job}),{page:'jobs',selection:{view:'history',job,page:null,before:null}});
+  assert.deepEqual(lookingAt(pageReport({page:'jobs',job:null}),working,names),
+    {page:'Jobs',shows:'Your jobs. Other people’s jobs are not sent.',context:'Working data · As of 18 Dec 2020 16:00',supported:true,askable:true});
+  assert.equal(lookingAt(pageReport({page:'jobs',job}),working,names).shows,'The history of the job whose details are open');
+  assert.equal(webPage('jobs'),'jobs');
+  assert.equal(stepLine({ordinal:1,tool:'read_jobs',code:null}),'Read your jobs');
+  assert.equal(stepLine({ordinal:2,tool:'read_jobs',code:'job_not_found'}),'Read your jobs · that job is not one of yours');
+  assert.equal(stepLine({ordinal:3,tool:'read_jobs',code:'jobs_current_only'}),'Read your jobs · a historical view does not read current jobs');
+});
+
+test('custom curves describes the saved library as a supported page without sending unsaved edits',()=>{
+ const report=pageReport({page:'custom-curves',curve:null,unsaved:false});
+ assert.deepEqual(report,{page:'custom_curves',selection:{curve:null,unsaved:false}});
+ const open='c7000000-0000-4000-8000-000000000005';
+ assert.deepEqual(pageReport({page:'custom-curves',curve:open,unsaved:true}),{page:'custom_curves',selection:{curve:open,unsaved:true}},
+  'the report names the curve open and whether it holds unsaved edits, which the assistant will not save over (D260)');
+ const view=lookingAt(report,{mode:'current',frameId:frame,frameLabel:'18 Dec 2020'}, {curve:String,table:String});
+ assert.equal(view.supported,true);assert.equal(view.askable,true);
+ assert.equal(view.shows,'Published curve ingredients and saved curve library. Unsaved edits are not sent.');
+ assert.equal(webPage('custom_curves'),'custom-curves');
+});
+
+test('an ask retains the explicit knowledge selection with or without an As of frame',()=>{
+  assert.deepEqual(askKnowledge({mode:'current',frameId:frame,frameLabel:'18 Dec 2020'}),{mode:'current',contextId:null,frameId:frame});
+  assert.deepEqual(askKnowledge({mode:'current',frameId:null,frameLabel:null}),{mode:'current',contextId:null,frameId:null});
+  assert.deepEqual(askKnowledge({mode:'retained',contextId:context,effectiveOn:'2020-12-18',knownAtLabel:'18 Dec 2020 18:00',frameId:null,frameLabel:null}),
+    {mode:'retained',contextId:context,frameId:null});
+});
+
+test('Looking at names the page, what it shows and the context the next question will pin, or that the page is not read',()=>{
+  const names={curve:code=>code==='future'?'Synthetic future':code,table:code=>code};
+  const working={mode:'current',frameId:frame,frameLabel:'18 Dec 2020 16:00'};
+  assert.deepEqual(lookingAt(pageReport({page:'market',curve:'future',tab:'inputs'}),working,names),
+    {page:'Curves & prices',shows:'Inputs of Synthetic future',context:'Working data · As of 18 Dec 2020 16:00',supported:true,askable:true});
+  assert.deepEqual(lookingAt(pageReport({page:'futures',...open,risk:false,trade:{tradeId:trade,instrumentType:'future',revision:2,reference:'TR-000009'},entry:null,view:blotter}),working,names,
+    {trade:'TR-000009'}).shows,'Trade TR-000009, revision 2');
+  assert.deepEqual(lookingAt(pageReport({page:'admin'}),working,names),
+    {page:'Users & access',shows:'Authorized page operations, reads and previews. Changes require your authorization.',context:'Working data · As of 18 Dec 2020 16:00',supported:true,askable:true});
+  assert.deepEqual(lookingAt(pageReport({page:'schedules'}),{mode:'current',frameId:null,frameLabel:null},names),
+    {page:'Schedules',shows:'Schedule library',context:'Working data · no As of date selected',supported:true,askable:true});
+  assert.equal(lookingAt(pageReport({page:'reference',table:'units',search:'mega'}),
+    {mode:'retained',contextId:context,effectiveOn:'2020-12-18',knownAtLabel:'18 Dec 2020 18:00',frameId:null,frameLabel:null},names).context,
+    'Historical view · 2020-12-18, as known at 18 Dec 2020 18:00 · no As of date chosen');
+});
+
+test('Looking at says what each read page shows in words, never with an identifier',()=>{
+  const working={mode:'current',frameId:frame,frameLabel:'18 Dec 2020 16:00'},names={curve:code=>code==='future'?'Synthetic future':code,table:code=>code==='units'?'Units':code};
+  const shows=state=>lookingAt(pageReport(state),working,names).shows;
+  assert.equal(shows({page:'market',curve:null,tab:'prices'}),'Curve directory');
+  assert.equal(shows({page:'market',curve:'future',tab:'dependencies'}),'Prices of Synthetic future');
+  assert.equal(lookingAt({page:'contract_definitions',selection:{view:'contract_definitions',curve:null}},working,names).shows,'Contract date definitions');
+  assert.equal(shows({page:'power',frame:false}),'TOU products');
+  assert.equal(shows({page:'power',frame:true}),'TOU products and power hours');
+  assert.equal(shows({page:'reference',table:'units',search:''}),'Units');
+  assert.equal(shows({page:'reference',table:'units',search:'mega'}),'Units · rows matching “mega”');
+  // Before Reference data shows a table its report has none to name, so nothing can be asked from it yet.
+  assert.deepEqual(lookingAt(pageReport({page:'reference',table:'',search:''}),working,names),
+    {page:'Reference data',shows:'No table is shown yet',context:'Working data · As of 18 Dec 2020 16:00',supported:true,askable:false});
+  assert.equal(shows({page:'parties',kind:'legal_entity'}),'Legal entities');
+  assert.equal(shows({page:'parties',kind:'counterparty'}),'Counterparties');
+  assert.equal(shows({page:'futures',...open,risk:false,trade:null,view:blotter}),'Trade rows · 1 book');
+  assert.equal(shows({page:'futures',...open,risk:false,trade:null,view:{...blotter,bookIds:[]}}),'Trade rows · every book you can read');
+  assert.equal(shows({page:'futures',...open,risk:false,trade:null,view:{...blotter,mode:'pivot',bookIds:[],portfolioIds:[portfolio,book],groupBy:['contract','instrumentType']}}),
+    'Totals by contract and instrument type · 2 portfolios');
+  assert.equal(shows({page:'futures',...open,risk:false,trade:null,view:{...blotter,mode:'pivot',bookIds:[],groupBy:['commodity','instrumentType'],measures:['tradeCount']}}),
+    'Totals by commodity and instrument type · every book you can read');
+  assert.deepEqual(lookingAt(pageReport({page:'futures',...open,risk:true,trade:null,entry:null,view:blotter}),working,names),
+    {page:'Blotter',shows:'Risk operations and calculations under the pinned context.',layout:'Details open · Charts open · Main window',context:'Working data · As of 18 Dec 2020 16:00',supported:true,askable:true});
+  // A historical selection that is not yet applied pins nothing the page shows, so nothing can be asked.
+  assert.deepEqual(lookingAt(pageReport({page:'schedules'}),{mode:'unapplied'},names),
+    {page:'Schedules',shows:'Schedule library',context:'Historical selection not applied · apply it to ask about it',supported:true,askable:false});
+  assert.equal(askKnowledge({mode:'unapplied'}),undefined);
+  assert.equal(changesContext({mode:'current',contextId:context,frameId:frame},{mode:'unapplied'}),true);
+});
+
+test('a target changes context when the pinned knowledge or As of frame differs from what the page has selected',()=>{
+  const working={mode:'current',frameId:frame,frameLabel:''},historical={mode:'retained',contextId:context,effectiveOn:'2020-12-18',knownAtLabel:'',frameId:frame,frameLabel:''};
+  const captured='c3000000-0000-4000-8000-000000000003';
+  assert.equal(changesContext({mode:'current',contextId:captured,frameId:frame},working),false);
+  assert.equal(changesContext({mode:'current',contextId:captured,frameId:other},working),true);
+  assert.equal(changesContext({mode:'current',contextId:captured,frameId:frame},historical),true);
+  assert.equal(changesContext({mode:'retained',contextId:context,frameId:frame},historical),false);
+  assert.equal(changesContext({mode:'retained',contextId:captured,frameId:frame},historical),true);
+  assert.equal(changesContext({mode:'retained',contextId:context,frameId:null},historical),true);
+  assert.equal(changesContext({mode:'retained',contextId:context,frameId:frame},working),true);
+});
+
+test('only a live target that keeps the context and leaves nothing unsaved moves the page; any other waits for Go',()=>{
+  assert.equal(targetAction({live:true,changesContext:false,unsaved:false}),'move');
+  for(const held of [{live:false,changesContext:false,unsaved:false},{live:true,changesContext:true,unsaved:false},{live:true,changesContext:false,unsaved:true}])
+    assert.equal(targetAction(held),'go');
+});
+
+test("Back restores the place a move left, for that move's notice only, and nothing after the history is cleared",()=>{
+  const history=new NavigationHistory();
+  const left={page:'market',report:pageReport({page:'market',curve:'future',tab:'prices'}),context:{mode:'current',frameId:frame,frameLabel:''}};
+  const later={...left,report:pageReport({page:'schedules'})};
+  const first=history.record(left),second=history.record(later);
+  assert.notEqual(first,second);
+  assert.deepEqual(history.origin(first),left);assert.deepEqual(history.origin(second),later);
+  assert.equal(history.origin('elsewhere'),undefined);
+  history.clear();
+  assert.equal(history.origin(first),undefined);
+});
+
+test('a target opens the web page its report names',()=>{
+  assert.deepEqual(['curves','contract_definitions','schedules','power_tous','reference_data','parties','blotter'].map(webPage),
+    ['market','schedules','schedules','power','reference','parties','futures']);
+  assert.equal(webPage('settings_ai'),'ai');
+  assert.throws(()=>webPage('unknown_page'),/page is inconsistent/);
+});
+
+test('step lines name the tool and, for a refusal or failure, say why in plain words, never with an identifier',()=>{
+  assert.equal(stepLine({ordinal:1,tool:'read_market_data',code:null}),'Read market data');
+  assert.equal(stepLine({ordinal:2,tool:'read_trades',code:'result_too_large'}),'Read trades · the result was larger than one read returns');
+  assert.equal(stepLine({ordinal:3,tool:'navigate',code:'tool_arguments_invalid'}),'Navigate · the request was not one this tool accepts');
+  assert.equal(stepLine({ordinal:4,tool:'read_current_page',code:'some_new_refusal'}),'Read the page · the tool refused this request');
+  assert.equal(stepLine({ordinal:6,tool:'read_trades',code:'tool_failed'}),'Read trades · the read failed');
+  assert.equal(stepLine({ordinal:7,tool:'read_current_page',code:'limit_tool_read'}),'Read the page · the read took longer than this agent’s time per read','a read past its limit says so, not that it failed (D245)');
+  assert.equal(stepLine({withheld:2}),'An earlier answer was left out: what it read can no longer be read for you');
+  assert.throws(()=>stepLine({ordinal:5,tool:'delete_trades',code:null}),/page is inconsistent/);
+});
+
+test('an ending says why an answer stopped; a completed answer needs no line',()=>{
+  assert.equal(endingLine({state:'completed',code:null,incomplete:false}),null);
+  assert.equal(endingLine({state:'failed',code:'limit_elapsed',incomplete:true}),'The answer ran out of time.');
+  assert.equal(endingLine({state:'failed',code:'limit_tool_read',incomplete:false}),'A read took longer than this agent’s time per read, so the answer could not finish.');
+  assert.equal(endingLine({state:'failed',code:'some_new_failure',incomplete:false}),'The answer could not finish.');
+  assert.equal(endingLine({state:'cancelled',code:null,incomplete:true}),'You stopped this answer.');
+  assert.equal(endingLine({state:'cancelled',code:'session_ended',incomplete:false}),'The answer stopped because your session changed.');
+  assert.equal(endingLine({state:'interrupted',code:null,incomplete:false}),'The answer was interrupted when the assistant restarted.');
+  for(const code of ['limit_input_tokens','context_window_exceeded'])
+    assert.equal(endingLine({state:'failed',code,incomplete:false}),'This conversation is too long to continue. Start a new conversation.');
+  assert.equal(endingLine({state:'cancelled',code:'access_changed',incomplete:false}),'The answer stopped because your grant to this agent ended.');
+});
+
+test('unverifiable usage explains the accounting failure instead of claiming the conversation is too long',()=>{
+  const ending={state:'failed',code:'limit_input_unverifiable',incomplete:true};
+  assert.equal(endingLine(ending),'The answer stopped because the provider’s token usage could not be verified. Ask an administrator to check the provider’s usage mapping.');
+  assert.equal(startsOver(ending),false);
+  for(const code of ['limit_input_tokens','context_window_exceeded'])
+    assert.equal(startsOver({...ending,code}),true);
+});
+
+test('the usage line shows tokens by dimension and each currency\'s exact cost, unknown and unpriced as such',()=>{
+  const counted=count=>({count,unknownCalls:0});
+  const usage={calls:2,uncachedInput:counted(1234),cacheRead:counted(0),cacheWrite:counted(0),output:counted(56),reasoning:counted(12),
+    cost:[{currency:{catalogId:context,revisionId:frame,code:'usd'},amount:'0.004125',unpricedCalls:0}]};
+  // The currency is named by its reference code, exactly as the usage payload carries it.
+  assert.equal(usageLine(usage),'Tokens: 1,234 input · 0 cache read · 0 cache write · 56 output (12 reasoning) · Cost: usd 0.004125');
+  assert.equal(usageLine({...usage,output:{count:56,unknownCalls:1},cost:[{...usage.cost[0],amount:null,unpricedCalls:1}]}),
+    'Tokens: 1,234 input · 0 cache read · 0 cache write · unknown output (12 reasoning) · Cost: usd unpriced');
+  assert.equal(usageLine({...usage,cost:[...usage.cost,{currency:{catalogId:context,revisionId:other,code:'eur'},amount:'1.5',unpricedCalls:0}]}).split(' · Cost: ')[1],
+    'usd 0.004125, eur 1.5');
+  assert.equal(usageLine({...usage,calls:0,cost:[]}),'No model calls');
+  assert.throws(()=>usageLine({...usage,cost:[]}),/page is inconsistent/);
+});
+
+test('consent names the agent, provider, model, reads and the date its grant would end in the person\'s zone',()=>{
+  const agent={name:'Page guide',model:{vendor:'anthropic',identifier:'model-one',displayName:'Model one'},permissions:['ReadTradeParties','ReadMarketData','ReadTrades'],grantDays:28};
+  const vendors=[{code:'anthropic',name:'Anthropic'}];
+  assert.equal(consentText(agent,vendors,'2026-11-17'),'Allow Page guide, which sends your questions and the data it reads to '
+    +'Anthropic (Model one) through the vendor account your administrators configured, whose owner may be able to see them, to read trades, trade '
+    +'parties and market data on your behalf until 2026-11-17?');
+  assert.throws(()=>consentText({...agent,model:{...agent.model,vendor:'unknown'}},vendors,'2026-11-17'),/page is inconsistent/);
+  assert.equal(consentText({...agent,permissions:['ReadMarketData','WriteMarketDefinitions']},vendors,'2026-11-17'),'Allow Page guide, which sends your '
+    +'questions and the data it reads to Anthropic (Model one) through the vendor account your administrators configured, whose owner may be able to see '
+    +'them, to read market data and prepare curve drafts for approval on your behalf until 2026-11-17?');
+  // A grant runs its days from the instant it is given, so the date is that instant's in the zone, not today's date plus days:
+  // from 23:30 the evening before the spring change, 28 days later is already the next local day.
+  assert.equal(grantExpiry(new Date('2026-10-20T12:00:00Z'),28,'UTC'),'2026-11-17');
+  assert.equal(grantExpiry(new Date('2027-03-02T04:30:00Z'),28,'America/New_York'),'2027-03-30');
+  assert.equal(grantExpiry(new Date('2026-12-20T12:00:00Z'),14,'Asia/Tokyo'),'2027-01-03');
+});
+
+test('the picker names each usable version with its provider, model and a Draft label, and preselects only a listed choice',()=>{
+  const vendors=[{code:'anthropic',name:'Anthropic'}],model={id:context,version:1,vendor:'anthropic',identifier:'model-one',displayName:'Model one'};
+  const published={id:book,name:'Page guide',version:2,draft:false,model,permissions:[],grantDays:28,grant:null},draft={...published,version:3,draft:true};
+  assert.equal(agentChoice(published,vendors),'Page guide · version 2 · Anthropic Model one');
+  assert.equal(agentChoice(draft,vendors),'Page guide · version 3 · Anthropic Model one · Draft');
+  assert.throws(()=>agentChoice({...published,model:{...model,vendor:'elsewhere'}},vendors),/page is inconsistent/);
+  assert.equal(preselect([published,draft],JSON.stringify({agentId:book,version:3})),draft);
+  for(const saved of [null,'',JSON.stringify({agentId:book,version:4}),JSON.stringify({agentId:portfolio,version:2}),'not json',JSON.stringify({agentId:book,version:2,extra:1})])
+    assert.equal(preselect([published,draft],saved),undefined);
+});
+
+test('a conversation reopens with its agent: the version its last question used while listed, or the only listed version of that agent',()=>{
+  const model={id:context,version:1,vendor:'anthropic',identifier:'model-one',displayName:'Model one'};
+  const v2={id:book,name:'Page guide',version:2,draft:false,model,permissions:[],grantDays:28,grant:null},v3={...v2,version:3,draft:true},other={...v2,id:portfolio,name:'Other'};
+  assert.equal(conversationChoice([v2,v3,other],book,3),v3);
+  assert.equal(conversationChoice([v2,other],book,3),v2);
+  // Two listed versions and neither the one it last used: the person chooses.
+  assert.equal(conversationChoice([v2,{...v3,version:4},other],book,3),undefined);
+  assert.equal(conversationChoice([other],book,3),undefined);
+});
+
+test('the panel says why an ask, a grant or a read was refused in plain words, and leaves any other code to the page',()=>{
+  assert.equal(panelMessage('turn_active'),'Wait for your current answer to finish, or stop it, before asking again.');
+  assert.equal(panelMessage('snapshot_missing'),'Choose an As of date to ask about working data.');
+  assert.equal(panelMessage('model_disabled'),panelMessage('credential_unavailable'));
+  assert.equal(panelMessage('session_ended'),'Your session changed. Reload the page to continue.');
+  assert.equal(panelMessage('access_changed'),'This agent no longer has the access an earlier answer in this conversation used, so it cannot continue it. '
+    +'Start a new conversation, or ask an administrator to restore the agent\'s access.');
+  assert.equal(panelMessage('some_page_code'),undefined);
+  assert.equal(panelMessage(undefined),undefined);
+});
+
+test('a kept ask is read back from browser storage only in the exact form the panel stores, as a request whose outcome is unknown',()=>{
+  const body={conversationId:null,agentId:book,version:2,question:'What moved?',pageReport:{page:'curves',selection:{view:'curves',curve:null}},
+    knowledge:{mode:'current',contextId:null,frameId:frame}};
+  const stored={operationId:trade,path:'assistant/turns/ask',body};
+  assert.deepEqual(keptAsk(JSON.stringify(stored)),{...stored,uncertain:true});
+  assert.deepEqual(keptAsk(JSON.stringify({...stored,body:{...body,conversationId:context}})).body.conversationId,context);
+  for(const bad of [null,'','not json','[]',JSON.stringify({...stored,path:'assistant/grants/grant'}),JSON.stringify({...stored,operationId:'x'}),
+    JSON.stringify({...stored,extra:1}),JSON.stringify({...stored,body:{...body,question:''}}),JSON.stringify({...stored,body:{...body,version:0}}),
+    JSON.stringify({...stored,body:{...body,agentId:'../../x'}}),JSON.stringify({...stored,body:{...body,conversationId:'../x'}}),
+    JSON.stringify({...stored,body:{...body,more:1}}),JSON.stringify({...stored,body:{...body,pageReport:{page:'curves'}}})])
+    assert.equal(keptAsk(bad),undefined,bad);
+});
+
+test('PPA bookings reports the inspected PPA or the listed book, which the assistant reads but does not open (D250)',()=>{
+ const current={mode:'current',frameId:frame,frameLabel:'Synthetic frame'},names={curve:x=>x,table:x=>x};
+ const none={view:'ppa_book',mode:null,portfolioIds:null,groupBy:null,measures:null,tradeId:null,instrumentType:null,revision:null};
+ assert.deepEqual(pageReport({page:'ppa',trade:null,book:null}),{page:'ppa',selection:{...none,bookIds:[]}});
+ assert.deepEqual(pageReport({page:'ppa',trade:null,book}),{page:'ppa',selection:{...none,bookIds:[book]}});
+ assert.deepEqual(pageReport({page:'ppa',trade:{tradeId:trade,revision:3},book}),
+  {page:'ppa',selection:{view:'trade',mode:null,bookIds:null,portfolioIds:null,groupBy:null,measures:null,tradeId:trade,instrumentType:'ppa',revision:3}});
+ const empty=lookingAt(pageReport({page:'ppa',trade:null,book:null}),current,names);
+ assert.equal(empty.page,'PPA bookings');assert.equal(empty.supported,true);assert.equal(empty.askable,false);
+ assert.match(empty.shows,/^No PPA trades are listed yet/);
+ const listed=lookingAt(pageReport({page:'ppa',trade:null,book}),current,names);
+ assert.equal(listed.askable,true);assert.match(listed.shows,/^PPA trades of the selected book\. Read at the As of date and knowledge cutoff of the context below/);
+ const inspected=lookingAt(pageReport({page:'ppa',trade:{tradeId:trade,revision:3},book}),current,names);
+ assert.equal(inspected.askable,true);assert.match(inspected.shows,/^Inspected PPA trade, revision 3\./);assert.doesNotMatch(inspected.shows,new RegExp(trade));
+ assert.throws(()=>webPage('ppa'));
+});
+
+test('a new trade in the Blotter\'s panel is reported by its product, and no unsent entry is read',()=>{
+  for(const [product,id] of [[null,'blotter_new_trade'],['futures','blotter_new_future'],['swaps','blotter_new_swap'],['ppa','blotter_new_ppa'],['gas','blotter_new_gas'],['transport','blotter_new_transport'],['park-loan','blotter_new_park_loan'],['crude','blotter_new_crude'],['lng','blotter_new_lng'],['options','blotter_new_option'],['toll','blotter_new_heat_rate_call'],['storage','blotter_new_gas_storage']])
+    assert.deepEqual(pageReport({page:'futures',...open,risk:false,trade:null,entry:{product},view:blotter}),{page:id,selection:{},layout});
+  const names={curve:String,table:String},current={mode:'current',frameId:frame,frameLabel:'18 Dec 2020'};
+  for(const [id,shown] of [['blotter_new_trade','A new trade is being started: no product is chosen yet. The assistant does not read a trade being entered.'],
+    ['blotter_new_future','A new future is being entered. The assistant does not read a trade being entered.'],['blotter_new_swap','A new swap is being entered. The assistant does not read a trade being entered.'],['blotter_new_ppa','A new PPA is being entered. The assistant does not read a trade being entered.'],['blotter_new_gas','A new physical gas trade is being entered. The assistant does not read a trade being entered.'],['blotter_new_transport','A new Transport agreement is being entered. The assistant does not read a trade being entered.'],['blotter_new_crude','A new physical crude trade is being entered. The assistant does not read a trade being entered.'],['blotter_new_lng','A new physical LNG cargo is being entered. The assistant does not read a trade being entered.'],['blotter_new_option','A new futures option is being entered. The assistant does not read a trade being entered.'],['blotter_new_heat_rate_call','A new heat-rate call option is being entered. The assistant does not read a trade being entered.'],['blotter_new_gas_storage','A new gas storage contract is being entered. The assistant does not read a trade being entered.']]){
+    const expected=shown.replace('The assistant does not read a trade being entered.', ['blotter_new_trade','blotter_new_future','blotter_new_swap'].includes(id)?'The assistant can inspect available terms, preview explicit drafts and prepare changes for your authorization.':'The assistant does not read a trade being entered.');
+    const view=lookingAt({page:id,selection:{}},current,names);
+    assert.deepEqual([view.page,view.shows,view.supported],['New trade',expected,['blotter_new_trade','blotter_new_future','blotter_new_swap'].includes(id)],id);
+  }
+});
+
+test('risk results keep the page report they had, ahead of a trade entry, and a trade open in the panel is not an entry',()=>{
+  assert.deepEqual(pageReport({page:'futures',...open,risk:true,trade:null,entry:{product:'futures'},view:blotter}),{page:'blotter_risk',selection:{},layout});
+  const shown={tradeId:trade,instrumentType:'future',revision:2,reference:'TR-000009'};
+  assert.equal(pageReport({page:'futures',...open,risk:false,trade:shown,entry:null,view:blotter}).page,'blotter');
+});
+
+test('the trade rows in the Risk lens are reported as the Blotter\'s risk results, which the assistant does not read, and the Values lens as the rows',()=>{
+  assert.deepEqual(pageReport({page:'futures',...open,risk:false,trade:null,entry:null,lens:'risk',view:blotter}),{page:'blotter_risk_lens',selection:{},layout});
+  assert.deepEqual(pageReport({page:'futures',...open,risk:false,trade:null,entry:null,lens:'values',view:blotter}),pageReport({page:'futures',...open,risk:false,trade:null,entry:null,view:blotter}));
+  const names={curve:String,table:String},current={mode:'current',frameId:frame,frameLabel:'18 Dec 2020'};
+  assert.deepEqual(lookingAt({page:'blotter_risk_lens',selection:{}},current,names),
+    {page:'Blotter',shows:'Risk operations for the trade rows under the pinned context.',context:'Working data · As of 18 Dec 2020',supported:true,askable:true});
+});
+
+test('what the panel holds is reported ahead of the lens: its risk report, a trade being entered, or the position it shows',()=>{
+  const shown={tradeId:trade,instrumentType:'future',revision:2,reference:'TR-000009'};
+  assert.equal(pageReport({page:'futures',...open,risk:true,trade:null,entry:null,lens:'risk',view:blotter}).page,'blotter_risk');
+  assert.equal(pageReport({page:'futures',...open,risk:false,trade:null,entry:{product:'swaps'},lens:'risk',view:blotter}).page,'blotter_new_swap');
+  assert.deepEqual(pageReport({page:'futures',...open,risk:false,trade:shown,entry:null,lens:'risk',view:blotter}),pageReport({page:'futures',...open,risk:false,trade:shown,entry:null,lens:'values',view:blotter}));
+});
+
+test('Prepare curve draft is named in plain words, with each of its refusals',()=>{
+  assert.equal(stepLine({ordinal:2,tool:'save_custom_curve_draft',code:null}),'Prepare curve draft');
+  for(const [code,reason] of [['custom_curve_open_unsaved','the curve is open with unsaved edits'],['historical_read_only','a historical view is read-only'],
+    ['custom_curve_agent_scope','the assistant saves only new curves and its own drafts'],['custom_curve_conflict','the curve, its code or its inputs changed'],
+    ['delegation_denied','your authoring or the agent’s grant does not allow it']])
+    assert.equal(stepLine({ordinal:2,tool:'save_custom_curve_draft',code}),`Prepare curve draft · ${reason}`);
+});
+
+test('Risk reports the view it shows, and only Reports the retained report open there (D392)',()=>{
+  const job={operation:'portfolio.risk.jobs.id_v1',inputJson:JSON.stringify({body:null,parameters:{id:trade}})};
+  const working={mode:'current',frameId:frame,frameLabel:'Synthetic close'},names={curve:String,table:String};
+  for(const [view,shown,name] of [['risk','reports','Reports'],['risk-pnl','pnl_explain','P&L explain'],['risk-scenarios','scenarios_greeks','Scenarios & Greeks'],
+    ['risk-var','var_es','VaR / ES'],['risk-runs','run_history','Run history']]){
+    const report=pageReport({page:'risk',view});
+    assert.deepEqual(report,{page:'risk_jobs',selection:{view:shown}});
+    const seen=lookingAt(report,working,names);
+    assert.equal(seen.page,`Risk · ${name}`);assert.equal(seen.supported,true);assert.equal(seen.askable,true);
+    assert.deepEqual(pageReport({page:'risk',view,assistant:job}).selection,view==='risk'?{view:shown,...job}:{view:shown});
+  }
+  assert.match(lookingAt(pageReport({page:'risk',view:'risk',assistant:job}),working,names).shows,/^The retained report open here · /);
+  assert.throws(()=>lookingAt({page:'risk_jobs',selection:{}},working,names),/inconsistent/);
+});
+
+test('the Blotter report carries its pane state and whether it is popped out, and names no identifier for them',()=>{
+  const base={page:'futures',...open,risk:false,trade:null,entry:null,lens:'values',view:blotter};
+  const closed=pageReport({...base,pane:{details:false,charts:false},poppedOut:false});
+  assert.deepEqual(closed.layout,{pane:{details:false,charts:false},poppedOut:false});
+  const out=pageReport({...base,pane:{details:true,charts:false},poppedOut:true});
+  assert.deepEqual(out.layout,{pane:{details:true,charts:false},poppedOut:true});
+  assert.deepEqual(out.selection,closed.selection);
+  assert.equal(out.page,'blotter');
+  for(const state of [{...base,risk:true},{...base,entry:{product:'swaps'}},{...base,lens:'risk'}])
+    assert.deepEqual(pageReport({...state,pane:{details:true,charts:true},poppedOut:true}).layout,{pane:{details:true,charts:true},poppedOut:true});
+  assert.equal(pageReport({page:'admin'}).layout,undefined);
+});
+test('Looking at shows the Blotter\'s layout, and what it saved is compared with it, so a pane opened or closed since refuses the ask as a page change',async()=>{
+  const {lookingKey}=await import('../dist/assistant-pages.js');
+  const state={page:'futures',risk:false,trade:null,entry:null,lens:'values',view:blotter},names={curve:String,table:String},context={mode:'current',frameId:null,frameLabel:null};
+  const at=(pane,poppedOut,view=blotter)=>({report:pageReport({...state,view,pane,poppedOut}),context});
+  assert.notEqual(lookingKey(at({details:true,charts:true},false)),lookingKey(at({details:false,charts:true},false)));
+  assert.notEqual(lookingKey(at({details:true,charts:true},false)),lookingKey(at({details:true,charts:true},true)));
+  assert.equal(lookingKey(at({details:true,charts:false},false)),lookingKey(at({details:true,charts:false},false)));
+  for(const [pane,poppedOut,line] of [[{details:true,charts:false},false,'Details open · Charts closed · Main window'],
+    [{details:false,charts:true},true,'Details closed · Charts open · Pop-out window']])
+    assert.equal(lookingAt(at(pane,poppedOut).report,context,names).layout,line);
+  // A page with no layout shows none.
+  assert.equal(Object.hasOwn(lookingAt(pageReport({page:'schedules'}),context,names),'layout'),false);
+});
+test('an ask sends the Blotter report whole, its layout with it, and a kept ask keeps it',async()=>{
+  const assistant=await import('../dist/assistant-pages.js');
+  assert.equal(assistant.askReport,undefined);
+  const report=pageReport({page:'futures',...open,risk:false,trade:null,entry:null,lens:'values',view:blotter,pane:{details:true,charts:false},poppedOut:true});
+  const body={conversationId:null,agentId:book,version:2,question:'What is open?',pageReport:report,knowledge:{mode:'current',contextId:null,frameId:frame}};
+  const stored={operationId:trade,path:'assistant/turns/ask',body};
+  assert.deepEqual(keptAsk(JSON.stringify(stored)).body.pageReport,report);
+  assert.equal(keptAsk(JSON.stringify({...stored,body:{...body,pageReport:{...report,extra:1}}})),undefined);
+});
+
+test('facility questions retain the selected operating date and ledger without borrowing a pricing frame',()=>{
+ const report=pageReport({page:'facilities',businessDate:'2026-11-05',facilityLedger:trade});
+ assert.deepEqual(report,{page:'facility_quantities',businessDate:'2026-11-05',selection:{ledgerId:trade}});
+ assert.deepEqual(askKnowledge({mode:'current',businessDate:'2026-11-05',frameId:null,frameLabel:null}),{mode:'current',contextId:null,frameId:null});
+ assert.deepEqual(askKnowledge({mode:'current',frameId:null,frameLabel:null}),{mode:'current',contextId:null,frameId:null});
+ assert.equal(webPage('gas_setup'),'gas-setup');
+ assert.equal(webPage('crude_setup'),'crude-setup');
+});
+
+test('physical operations reports the selected instrument, gas day, delivery side and stage, and nothing before an instrument is chosen',()=>{
+ const binding='b1000000-0000-4000-8000-000000000001',obligation='0b100000-0000-4000-8000-000000000001';
+ const physical={tradeId:trade,bindingId:binding,revision:2,instrumentType:'physical_gas',tab:'delivery',day:'2020-12-19',obligationId:obligation,stage:1};
+ assert.deepEqual(pageReport({page:'physical-operations',physical}),{page:'physical_operations',selection:physical});
+ assert.deepEqual(pageReport({page:'physical-operations'}),{page:'physical_operations',selection:{}});
+});
+
+test('Looking at says which physical instrument revision, tab, gas day and stage an ask reports',()=>{
+ const working={mode:'current',frameId:frame,frameLabel:'18 Dec 2020 16:00'},names={curve:String,table:String};
+ const physical={tradeId:trade,bindingId:'b1000000-0000-4000-8000-000000000001',revision:2,instrumentType:'physical_gas',tab:'delivery',day:'2020-12-19',obligationId:'0b100000-0000-4000-8000-000000000001',stage:1};
+ const shows=state=>lookingAt(pageReport({page:'physical-operations',...state}),working,names).shows;
+ assert.equal(shows({physical}),'Selected physical instrument, revision 2 · Delivery · Gas day 2020-12-19 · Scheduling stage. Unsaved edits are not sent.');
+ assert.equal(shows({physical:{...physical,tab:'cash',day:null,obligationId:null,stage:null}}),'Selected physical instrument, revision 2 · Billing & corrections. Unsaved edits are not sent.');
+ assert.equal(shows({}),'Physical instrument operations under the header context. Unsaved edits are not sent.');
+});
+
+test('operating facilities report a distinct page without unsaved browser terms',()=>{
+ assert.deepEqual(pageReport({page:'physical-power'}),{page:'physical_power',selection:{}});
+});
+
+test('REC ticket and saved structured inspectors report identity with real Blotter layout while financial selections stay private',()=>{
+ const base={page:'futures',...open,risk:false,entry:null,lens:'values',view:blotter};
+ const focus={tradeIds:[trade],pivotCell:null};
+ for(const [instrumentType,page] of [['operating_right','blotter_operating_right'],['rec_forward','blotter_rec_forward']]){
+  const report=pageReport({...base,focus,trade:{tradeId:trade,instrumentType,revision:2,reference:'TR-000009'},assistant:{operation:'unsupported.financial',inputJson:'{}'}});
+  assert.deepEqual(report,{page,selection:{},layout,focus});
+  const shown=lookingAt(report,{mode:'current',frameId:frame,frameLabel:'Synthetic close'},{curve:String,table:String});
+  assert.equal(shown.page,'Blotter');assert.equal(shown.supported,false);assert.equal(shown.askable,true);assert.match(shown.shows,/does not read/);
+ }
+ const ticket=pageReport({...base,trade:null,entry:{product:'rec'},assistant:{operation:'rec/trades/book',inputJson:'private draft'}});
+ assert.deepEqual(ticket,{page:'blotter_new_rec',selection:{},layout});
+});
+
+test('a selected unqualified gas service permits questions and identifies its unavailable trade read',()=>{
+  for(const kind of ['physical_gas_park_loan','physical_gas_park_custody','physical_gas_transport']){
+  const report=pageReport({page:'futures',...open,risk:false,trade:{tradeId:trade,instrumentType:kind,revision:1,reference:'TR-000009'},entry:null,view:blotter});
+  assert.equal(report.page,'blotter');
+  assert.equal(report.selection.instrumentType,kind);
+  const seen=lookingAt(report,{mode:'current',frameId:frame,frameLabel:'Synthetic close'},{curve:String,table:String},{trade:'TR-000009'});
+  assert.equal(seen.askable,true);
+  assert.equal(seen.supported,false);
+  assert.equal(seen.shows,'Trade TR-000009, revision 1. The assistant does not read this trade.');
+  }
+});
+
+test('a trade being entered is named New trade, whichever instrument it is',()=>{
+ const nameOf=page=>lookingAt({page,selection:{}},{mode:'current',frameId:null,frameLabel:null},{curve:code=>code,table:code=>code}).page;
+ const entered=reportedPages.filter(page=>page.startsWith('blotter_new_'));
+ assert.equal(entered.length,13);
+ for(const page of entered)assert.equal(nameOf(page),'New trade',page);
+});

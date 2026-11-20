@@ -1,0 +1,122 @@
+"""Cookie/CSRF client for explicitly selected loopback synthetic previews."""
+import collections
+import http.cookiejar
+import json
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import Request, build_opener, HTTPCookieProcessor
+
+
+def initial_frame(workspace, effective_on):
+    """Select one exact original fixture frame, a built-in close or working frame, excluding saved variants."""
+    initial_ids = set(workspace['initialFrameIds'])
+    frames = [frame for frame in workspace['frames']
+              if frame['id'] in initial_ids and frame['at'].startswith(effective_on + 'T')]
+    if len(frames) != 1:
+        raise AssertionError(f'The fixture requires one exact original input frame for {effective_on}; found {len(frames)}')
+    return frames[0]
+
+
+class PreviewClient:
+    # The sessions clients open in each example's scope, which the preview caps (Program.cs): each new session cookie the
+    # preview sets is one.
+    sessions = collections.Counter()
+    COOKIES = {'baseline': 'openetrm_preview', 'exchange': 'openetrm_exchange_preview'}
+
+    def __init__(self, url, example='baseline'):
+        address = urlsplit(url)
+        if address.scheme != 'http' or address.hostname != '127.0.0.1' or not address.port or address.path not in ('', '/') or address.query or address.fragment or address.username or address.password:
+            raise ValueError('An explicit loopback preview origin is required.')
+        if example not in ('baseline','exchange'):raise ValueError('Choose a configured preview example.')
+        self.api_prefix='/api/' if example=='baseline' else '/examples/exchange/api/'
+        self.example, self.session = example, None
+        self.url = url.rstrip('/')
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = build_opener(HTTPCookieProcessor(self.jar))
+        self.token = ''
+        self.last_read_references = {}
+        self.read_references = {}
+        self.observed_inputs = {}
+        self.last_status = None
+
+    def remember_inputs(self,value):
+        if isinstance(value,dict):
+            keys=('contextId','effectiveOn','knownAt','knownThrough')
+            if all(value.get(key) is not None for key in keys):
+                self.observed_inputs[value['contextId']]={key:value[key] for key in keys}
+            for child in value.values():self.remember_inputs(child)
+        elif isinstance(value,list):
+            for child in value:self.remember_inputs(child)
+
+    def reference_headers(self,body,path=''):
+        selected={}
+        def visit(value):
+            if isinstance(value,str) and value in self.read_references:selected[value]=self.read_references[value]
+            elif isinstance(value,dict):
+                for child in value.values():visit(child)
+            elif isinstance(value,list):
+                for child in value:visit(child)
+        if isinstance(body,bytes):
+            try:body=json.loads(body)
+            except (ValueError,UnicodeDecodeError):body=None
+        visit(body)
+        for identifier,proof in self.read_references.items():
+            if identifier in path:selected[identifier]=proof
+        return {'X-OpenETRM-Read-References':json.dumps(selected)} if selected else {}
+
+    def call(self, path, body=None, expected=200, headers=None, timeout=20):
+        """POST a body, serialized unless it is already bytes, or GET without one."""
+        request_headers = {'Origin': self.url, **self.reference_headers(body,path), **(headers or {})}
+        if body is not None:
+            request_headers.update({'Content-Type':'application/json','X-Preview-CSRF':self.token})
+            request_headers.update(headers or {})
+        data = body if body is None or isinstance(body, bytes) else json.dumps(body).encode()
+        request = Request(self.url+self.api_prefix+path, data=data, headers=request_headers, method='GET' if body is None else 'POST')
+        try:
+            response = self.opener.open(request, timeout=timeout)
+        except HTTPError as error:
+            response = error
+        value = response.read()
+        self.last_read_references = json.loads(response.headers.get('X-OpenETRM-Read-References', '{}'))
+        if path=='profile':self.read_references.clear()
+        self.read_references.update(self.last_read_references)
+        session = next((c.value for c in self.jar if c.name == self.COOKIES[self.example]), None)
+        if session is not None and session != self.session:
+            self.session = session
+            PreviewClient.sessions[self.example] += 1
+        self.last_status=response.code
+        if response.code not in ((expected,) if isinstance(expected,int) else expected):
+            raise AssertionError(f'{path}: expected {expected}, got {response.code}: {value.decode()}')
+        parsed=json.loads(value) if value else None
+        self.remember_inputs(parsed)
+        return parsed
+
+    def stream(self, path, body, timeout=20):
+        """POST and yield each NDJSON frame as parsed; closing the generator closes the response (a client abort)."""
+        headers = {'Origin': self.url, 'Content-Type': 'application/json', 'X-Preview-CSRF': self.token, **self.reference_headers(body,path)}
+        request = Request(self.url+self.api_prefix+path, data=json.dumps(body).encode(), headers=headers, method='POST')
+        try:
+            response = self.opener.open(request, timeout=timeout)
+        except HTTPError as error:
+            raise AssertionError(f'{path}: expected a stream, got {error.code}: {error.read().decode()}') from None
+        with response:
+            self.last_read_references=json.loads(response.headers.get('X-OpenETRM-Read-References','{}'))
+            self.read_references.update(self.last_read_references)
+            if response.headers.get_content_type() != 'application/x-ndjson':
+                raise AssertionError(f'{path}: expected NDJSON, got {response.headers.get_content_type()}')
+            for line in response:
+                frame=json.loads(line)
+                if isinstance(frame,dict) and isinstance(frame.get("readReferences"),dict):self.read_references.update(frame["readReferences"])
+                self.remember_inputs(frame)
+                yield frame
+
+    def bootstrap(self):
+        boot = self.call('bootstrap')
+        self.token = boot['csrfToken']
+        return boot
+
+    def select_inputs(self,context):
+        """Explicitly select supplied coordinates under this client's own authority."""
+        selected=self.call('date-schedules/context',dict(effectiveOn=context['effectiveOn'],knownAt=context['knownAt'],mode='at'))['context']
+        assert selected==context,'The explicitly selected input coordinates changed'
+        return selected

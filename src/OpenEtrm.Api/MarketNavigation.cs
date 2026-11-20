@@ -1,0 +1,106 @@
+using System.Collections.Immutable;
+using Npgsql;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.CustomCurves;
+
+namespace OpenEtrm.Api;
+
+// A curve's commodity in the directory: its code, its name and the icon its reference data declares (D425).
+public sealed record NavigationCategory(string Code,string Name,string Icon);
+// A position names its commodity by code and name only.
+public sealed record PositionCommodity(string Code,string Name);
+// A commodity curve names its commodity. An interest-rate curve has none; its market type identifies it.
+public sealed record NavigationCurve(string Code,string Name,string MarketType,NavigationCategory? Category,string Kind)
+{
+    public CatalogueSource? Source{get;init;}
+}
+// Every listed curve has an honest authoring destination. Native terms without an
+// admitted definition are inspectable; this metadata never admits a financial rewrite.
+public sealed record CurveConfiguration(string Curve,Guid? Id,int? Version,string Kind,bool CanEdit,string? Reason);
+public sealed record NavigationFrame(Guid Id,string Name,DateTimeOffset At,DateOnly BusinessDate,Guid? OriginCloseId=null,FrameClose? Close=null);
+public sealed record NavigationRead(DefinitionRevision DefinitionRevision,ReferenceRevision ReferenceRevision,
+    ImmutableArray<NavigationCurve> Curves,ImmutableArray<CurveName> CurveNames,ReferenceDisplayData? ReferenceDisplay=null)
+{
+    internal ImmutableArray<CurveConfiguration> Configurations{get;init;}=[];
+}
+public sealed record MarketNavigation(string Profile,ScheduleContext? Context,DefinitionRevision DefinitionRevision,
+    ReferenceRevision ReferenceRevision,string FuturesConvention,PreviewExample? Example,ImmutableArray<Guid> InitialFrameIds,
+    ImmutableArray<NavigationFrame> Frames,ImmutableArray<CurveName> CurveNames,ImmutableArray<NavigationCurve> Curves,ReferenceDisplayData? ReferenceDisplay=null)
+{
+    [System.Text.Json.Serialization.JsonIgnore(Condition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? RestoreKey {get;init;}
+    public string Kind=>"market_navigation";
+    public string KindsVersion=>CurveKinds.Version;
+    public FrameCatalogInfo? FrameCatalog{get;init;}
+    public object? Live{get;init;}
+    // Read-only entries retain their destination and explain why authoring is unavailable.
+    public ImmutableArray<CurveConfiguration> CurveConfigurations{get;init;}=[];
+
+    // Interval curves are listed by the interval-curve screen, and futures-option settlement curves by their options,
+    // not here. A curve that mixes option contracts with others has no classification and fails the read.
+    internal static async Task<ImmutableArray<NavigationCurve>> ReadCurves(NpgsqlConnection connection,PreviewManifest manifest,CancellationToken ct)
+    {
+        var curves=ImmutableArray.CreateBuilder<NavigationCurve>();
+        // Read each exact-bundle source through RLS once. Otherwise a nested-loop
+        // plan can repeat revision-wide visibility checks for every membership.
+        await using(var command=ScheduleStore.Command(connection,"""
+            WITH visible_contracts AS MATERIALIZED(
+                SELECT id,kind FROM market_data.contracts WHERE catalog_id=$1 AND revision_id=$2),
+            visible_intervals AS MATERIALIZED(
+                SELECT contract_id FROM market_data.contract_intervals WHERE catalog_id=$1 AND revision_id=$2),
+            members AS(
+                SELECT m.curve_code,count(*) total,count(k.id) matched,
+                    count(*) FILTER(WHERE k.kind='future') futures,count(*) FILTER(WHERE k.kind='forward') forwards,
+                    count(*) FILTER(WHERE k.kind='future_option') options,count(i.contract_id) intervals
+                FROM market_data.curve_members m LEFT JOIN visible_contracts k ON k.id=m.contract_id
+                LEFT JOIN visible_intervals i ON i.contract_id=m.contract_id
+                WHERE m.catalog_id=$1 AND m.revision_id=$2 GROUP BY m.curve_code)
+            SELECT c.code,c.name,c.commodity_code,r.name,coalesce(m.total,0),coalesce(m.matched,0),
+                coalesce(m.futures,0),coalesce(m.forwards,0),c.rule,c.direct_role,r.icon_code
+            FROM market_data.curves c LEFT JOIN members m ON m.curve_code=c.code
+                LEFT JOIN ref_data.commodities r ON(r.catalog_id,r.revision_id,r.code)=($3,$4,c.commodity_code)
+            WHERE c.catalog_id=$1 AND c.revision_id=$2 AND coalesce(m.intervals,0)=0 AND(coalesce(m.options,0)=0 OR m.options<>m.total) ORDER BY c.code
+            """,manifest.CatalogId,manifest.RevisionId,manifest.ReferenceCatalogId,manifest.ReferenceRevisionId))
+        await using(var reader=await command.ExecuteReaderAsync(ct))
+        {
+            while(await reader.ReadAsync(ct))
+            {
+                var total=reader.GetInt64(4);var futures=reader.GetInt64(6);var forwards=reader.GetInt64(7);
+                if(reader.IsDBNull(3)||total==0||reader.GetInt64(5)!=total||futures+forwards!=total)
+                    throw Invalid();
+                var kind=futures==total?"futures":forwards==total?"forwards":"mixed";
+                curves.Add(new(reader.GetString(0),reader.GetString(1),kind,new(reader.GetString(2),reader.GetString(3),reader.GetString(10)),PreviewData.CurveKind(reader.GetString(8),reader.IsDBNull(9)?null:reader.GetString(9))));
+            }
+        }
+        await using(var command=ScheduleStore.Command(connection,"SELECT code,name FROM market_data.rate_curves WHERE catalog_id=$1 AND revision_id=$2 ORDER BY code",manifest.CatalogId,manifest.RevisionId))
+        await using(var reader=await command.ExecuteReaderAsync(ct))
+            while(await reader.ReadAsync(ct))curves.Add(new(reader.GetString(0),reader.GetString(1),"rates",null,CurveKinds.InterestRate));
+        if(curves.Any(c=>string.IsNullOrWhiteSpace(c.Name)||c.Category is {} category&&string.IsNullOrWhiteSpace(category.Name))||curves.Select(c=>c.Code).Distinct().Count()!=curves.Count)
+            throw Invalid();
+        return curves.ToImmutable();
+    }
+
+    // A curve is configured by a definition only once one is admitted: interest-rate curves (D359) and contract curves (D362).
+    internal static async Task<ImmutableArray<CurveConfiguration>> ReadConfigurations(NpgsqlConnection connection,PreviewManifest manifest,
+        ImmutableArray<NavigationCurve> listed,bool historical,bool mayWrite,CancellationToken ct)
+    {
+        var configurations=ImmutableArray.CreateBuilder<CurveConfiguration>();
+        await using var command=ScheduleStore.Command(connection,"SELECT code,definition_id,definition_version FROM market_data.rate_curves WHERE catalog_id=$1 AND revision_id=$2 UNION ALL SELECT code,definition_id,definition_version FROM market_data.curves WHERE catalog_id=$1 AND revision_id=$2 ORDER BY code",manifest.CatalogId,manifest.RevisionId);
+        await using var reader=await command.ExecuteReaderAsync(ct);
+        var codes=listed.Select(c=>c.Code).ToHashSet(StringComparer.Ordinal);
+        while(await reader.ReadAsync(ct))
+        {
+            var code=reader.GetString(0);if(!codes.Contains(code))continue;
+            Guid? id=reader.IsDBNull(1)?null:reader.GetGuid(1);int? version=reader.IsDBNull(2)?null:reader.GetInt32(2);
+            if((id is null)!=(version is null))throw Invalid();
+            var reason=historical?"Historical view is read-only. Return to current knowledge to edit.":!mayWrite?
+                "Editing requires market-definition authoring permission.":id is null?
+                "This curve belongs to an immutable market definition revision and has no saved curve definition. Inspect its terms or create a separate derived curve.":null;
+            configurations.Add(new(code,id,version,id is null?"native":"definition",reason is null,reason));
+        }
+        if(configurations.Count!=codes.Count||configurations.Select(c=>c.Curve).Distinct().Count()!=codes.Count)throw Invalid();
+        return configurations.ToImmutable();
+    }
+
+    static MarketDataException Invalid()=>new("market_navigation","The selected curve directory has missing or conflicting classifications.");
+}

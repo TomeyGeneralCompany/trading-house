@@ -1,0 +1,236 @@
+using System.Collections.Immutable;
+
+namespace OpenEtrm.MarketData;
+
+[System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
+public readonly record struct ReferenceRevision(Guid CatalogId, Guid RevisionId);
+[System.Text.Json.Serialization.JsonUnmappedMemberHandling(System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow)]
+public readonly record struct ReferenceKey(ReferenceRevision Revision, string Code);
+public readonly record struct DefinitionRevision(Guid CatalogId, Guid RevisionId);
+public readonly record struct ContractKey(DefinitionRevision Revision, Guid Id);
+public readonly record struct CurveKey(DefinitionRevision Revision, string Code);
+public readonly record struct SeriesKey(DefinitionRevision Revision, Guid Id);
+public readonly record struct ObservationKey(Guid CatalogId, Guid Id);
+
+public enum ContractKind { Future = 1, Forward, FutureOption }
+public enum QuoteKind { Outright = 1, Basis }
+public enum CurveRule { Direct = 1, Add, ScaleAdd }
+public enum InputSlot { Base = 1, Spread }
+public enum SourceExpiryRule { RequireLive = 1, FreezeFinalFuture }
+public enum ConstituentExpiryRule { RequireLive = 1, FreezeFinalSettlement }
+public enum ObservationRole { TraderMark = 1, DailySettlement, FinalContractSettlement, Parameter, IndexFixing }
+public enum PublicationState { Preliminary = 1, Final }
+public enum InputUse { Variable = 1, FrozenFact }
+public enum InputSelectionPolicy { ExactPinnedFinalObservationsNoAgeFiltering = 1 }
+public enum SettlementKind { FutureSeries = 1, Index, IndexDifference }
+public enum LotBasis { FixedTotal = 1, PerDeliveryDay, PerDeliveryHour }
+
+public sealed record QuantitySpecification(
+    ReferenceKey Key, ReferenceKey Commodity, ReferenceKey MeasurementBasis,
+    ReferenceKey Unit, ReferenceKey Dimension);
+
+public sealed record QuoteSpecification(
+    ReferenceKey Key, QuoteKind Kind, ReferenceKey Currency,
+    ReferenceKey Quantity, ExactDecimal Multiplier, ExactDecimal TradingTick,
+    ExactDecimal ClearingIncrement, ExactDecimal Minimum, ExactDecimal Maximum);
+
+public sealed record SettlementTarget(
+    SettlementKind Kind, ReferenceKey? IndexA, ReferenceKey? IndexB);
+
+// An exact UTC delivery interval with the market clock's operating date and local labels;
+// Occurrence tells the two copies of a repeated local hour apart.
+public sealed record DeliveryInterval(DateTimeOffset Start, DateTimeOffset End, DateOnly OperatingDate,
+    int HourBeginning, int Minute, int Occurrence);
+
+// FuturesSeries is the contract's exact listed series: a futures series for a
+// future, the option series for a futures option.
+public sealed record MarketContract(
+    ContractKey Key, ContractKind Kind, DateOnly DeliveryFrom, DateOnly DeliveryTo,
+    DateTimeOffset Expiry, ReferenceKey? FuturesSeries, DeliveryInterval? Interval = null);
+
+// Resolved from the exact dated series/product/milestone reference links. This
+// preserves the authoritative specification when constructing an in-memory model.
+public sealed record FuturesLotResolution(Quantity Quantity,ExactDecimal Factor,string Implementation);
+public sealed record FuturesBasisSettlement(ReferenceKey Index,ReferenceKey BenchmarkSeries,string Implementation);
+public sealed record FuturesSeriesSpecification(
+    ReferenceKey Key, ReferenceKey QuoteQuantity, ReferenceKey Currency,
+    ExactDecimal Multiplier, ExactDecimal TradingTick, ReferenceKey Location,
+    ReferenceKey DeliveryProfile, DateOnly DeliveryFrom, DateOnly DeliveryTo,
+    DateTimeOffset LastTradingAt, ReferenceKey LotQuantity,
+    ExactDecimal ContractSize, LotBasis LotBasis, DateTimeOffset? FirstTradingAt, string SettlementMethod,FuturesLotResolution? LotResolution=null,FuturesBasisSettlement? BasisSettlement=null);
+
+// A listed option on an exact futures series; the series key is its identity.
+// Multiplier converts one unit of the option price into currency per contract,
+// and LotQuantity is the quantity specification of one option contract. Whether
+// contrary instructions are accepted is the product's; an instruction cutoff is
+// present only where a source states its instant.
+public sealed record FuturesOptionSeriesSpecification(
+    ReferenceKey Key, ReferenceKey Product, ReferenceKey UnderlyingSeries, Options.FuturesOptionTerms Terms,
+    ExactDecimal Multiplier, ReferenceKey Currency, ReferenceKey LotQuantity, ExactDecimal ClearingIncrement,
+    string AutomaticExerciseRule, bool ContraryInstructionsAllowed, DateTimeOffset? InstructionCutoffAt, string PremiumStyle);
+
+// Identity mapping is the first supported delivery mapping. Explicitly named
+// pairs are required even where source and target delivery periods are equal.
+public sealed record ConstituentMapping(ContractKey Target, ContractKey Source);
+public sealed record CurveInput(
+    InputSlot Slot, CurveKey Source, SourceExpiryRule ExpiryRule,
+    ImmutableArray<ConstituentMapping> Mappings);
+
+public enum NumericKind { QuantityRatio = 1, Dimensionless }
+public sealed record ValueSpecification(
+    ReferenceKey Key, NumericKind Kind, ReferenceKey? NumeratorQuantity,
+    ReferenceKey? DenominatorQuantity, ExactDecimal Minimum, ExactDecimal Maximum)
+{
+    internal void Validate()
+    {
+        Money.RequireKey(Key);
+        if (!Enum.IsDefined(Kind)) throw new MarketDataException("unsupported_kind", "Unsupported numeric kind.");
+        if (Minimum.CompareTo(Maximum) > 0 ||
+            Kind == NumericKind.Dimensionless && (NumeratorQuantity is not null || DenominatorQuantity is not null) ||
+            Kind == NumericKind.QuantityRatio && (NumeratorQuantity is null || DenominatorQuantity is null))
+            throw new MarketDataException("value_specification", "Numeric domain and explicit numerator/denominator must match the selected kind.");
+        foreach (var key in new[] { NumeratorQuantity, DenominatorQuantity }.OfType<ReferenceKey>())
+        {
+            Money.RequireKey(key);
+            if (key.Revision != Key.Revision)
+                throw new MarketDataException("value_specification", "Numeric specification and quantity references must share the exact revision.");
+        }
+    }
+}
+public sealed record MarketSeries(
+    SeriesKey Key, ContractKey? Contract, ReferenceKey? Quote, ReferenceKey? ValueSpecification);
+// Exactly one of a dated series or an explicitly typed constant.
+public sealed record NumericInput(
+    SeriesKey? Series, ReferenceKey? ConstantSpecification, ExactDecimal? Constant,
+    ObservationRole? Role, ReferenceKey? Source);
+
+public sealed record Curve(
+    CurveKey Key, ReferenceKey Quote, ReferenceKey Location,
+    ReferenceKey DeliveryProfile, SettlementTarget Settlement,
+    CurveRule Rule, ImmutableArray<ContractKey> Constituents,
+    ImmutableArray<CurveInput> Inputs, ObservationRole? DirectRole,
+    ReferenceKey? DirectSource, NumericInput? Multiplier)
+{
+    // Existing curve definitions retain their live-only contract; freezing is opt-in.
+    public ConstituentExpiryRule ConstituentExpiry { get; init; } = ConstituentExpiryRule.RequireLive;
+}
+
+public sealed record MarketObservation(
+    ObservationKey Key, SeriesKey Series,
+    ReferenceKey Source, ObservationRole Role, PublicationState State,
+    DateTimeOffset ObservedAt, ExactDecimal Value);
+
+public readonly record struct InputKey(SeriesKey Series, InputUse Use);
+public sealed record SelectedObservation(InputKey Input, MarketObservation Observation);
+
+// A certified knowledge selection is separate from the quote observation cutoff.
+// Exact quote pins keep their original meaning when corrected quantities are read.
+public sealed record MarketKnowledge
+{
+    public Guid ContextId { get; }
+    public DateTimeOffset KnownAt { get; }
+    public MarketKnowledge(Guid contextId,DateTimeOffset knownAt)
+    {
+        if(contextId==Guid.Empty||!Trading.TradingInstant.IsSupported(knownAt))
+            throw new MarketDataException("market_knowledge_context","Supply a resolved knowledge identity and exact UTC cutoff.");
+        ContextId=contextId;KnownAt=knownAt;
+    }
+}
+
+// These are explicitly selected inputs, not a "latest" or wall-clock historical
+// resolver. Snapshot identities supplied here have no authorization meaning.
+public sealed record MarketSnapshot(
+    Guid Id, DefinitionRevision Definitions, DateTimeOffset ValuationAt,
+    DateTimeOffset MarketCutoff, InputSelectionPolicy SelectionPolicy,
+    ImmutableArray<SelectedObservation> Selections)
+{
+    [System.Text.Json.Serialization.JsonInclude]
+    public MarketKnowledge? Knowledge { get; private init; }
+    public MarketSnapshot WithKnowledge(Guid contextId,DateTimeOffset knownAt)=>this with{Knowledge=new(contextId,knownAt)};
+    public bool HasCoherentSelections() => !Selections.IsDefault &&
+        Selections.All(s => s is not null && s.Observation is not null) &&
+        Selections.Select(s => s.Input).Distinct().Count() == Selections.Length &&
+        Selections.GroupBy(s => s.Observation.Key).All(g => g.Select(s => s.Observation).Distinct().Count() == 1);
+
+    public bool HasSameInputs(MarketSnapshot? other) => other is not null &&
+        Id == other.Id && Definitions == other.Definitions && ValuationAt == other.ValuationAt && MarketCutoff == other.MarketCutoff &&
+        SelectionPolicy == other.SelectionPolicy && Knowledge==other.Knowledge && !Selections.IsDefault && !other.Selections.IsDefault &&
+        Selections.Length == other.Selections.Length && (ReferenceEquals(this, other) || Selections.ToHashSet().SetEquals(other.Selections));
+}
+
+public readonly record struct CurveRequest(CurveKey Curve, ContractKey Contract);
+public sealed record BuiltValue
+{
+    public CurveRequest Request { get; }
+    public ReferenceKey Quote { get; }
+    public UnitPrice Price { get; }
+    public ImmutableHashSet<ObservationKey> Lineage { get; }
+    public BuiltValue(CurveRequest request, QuoteSpecification quote, UnitPrice price, ImmutableHashSet<ObservationKey> lineage)
+    {
+        price.RequireQuote(quote);
+        Request = request; Quote = quote.Key; Price = price; Lineage = lineage;
+    }
+}
+public sealed record CurveEvaluationInput(InputSlot Slot, CurveRequest Source, InputUse Use);
+public sealed record CurveEvaluation(BuiltValue Result, InputUse Use,
+    ImmutableArray<CurveEvaluationInput> Inputs, NumericValue? Multiplier, ObservationKey? MultiplierObservation);
+public sealed record CurveBuild
+{
+    internal CurveModel Model { get; }
+    internal ImmutableDictionary<InputKey, SelectedObservation> SelectedInputs { get; }
+    public MarketSnapshot Snapshot { get; }
+    public Guid SnapshotId => Snapshot.Id;
+    public DefinitionRevision Definitions => Snapshot.Definitions;
+    public string NumericalPolicy { get; }
+    public ImmutableArray<BuiltValue> Values { get; }
+    public int EvaluatedConstituents { get; }
+    public ImmutableArray<CurveEvaluation> Evaluations { get; }
+    public int ReusedConstituents { get; }
+    public Risk.QuoteShock? Shock { get; }
+    public Risk.QuoteScenario Scenario { get; }
+    public Calculation.ConnectedScenario Graph { get; }
+    internal Calculation.ConnectedCurveExport Compiled { get; }
+    internal ImmutableArray<CurveRequest> Requests { get; }
+    private readonly Lazy<Calculation.ConnectedValuation> valuation;
+    private readonly Lazy<ImmutableDictionary<CurveRequest,Calculation.CurvePointKey>> pricingBindings;
+    private readonly Lazy<Trading.PreparedValuationEnvironment> pricing;
+    internal Trading.PreparedValuationEnvironment Pricing=>pricing.Value;
+    internal Calculation.ConnectedValuation Connected=>valuation.Value;
+    internal ImmutableDictionary<CurveRequest,Calculation.CurvePointKey> PricingBindings=>pricingBindings.Value;
+    // Native interval consumers see prices from the same shared graph as ordinary
+    // sides. No quote overlay is reconstructed and no new market inputs are read.
+    internal CurveBuild BindConnected(Calculation.ConnectedValuation connected,
+        ImmutableDictionary<CurveRequest,Calculation.CurvePointKey> bindings,CancellationToken cancellation)
+    {
+        var graph=connected.Scenario;
+        if(!Snapshot.HasSameInputs(connected.Snapshot))throw new MarketDataException("ppa_context","Connected interval prices require the same pinned snapshot.");
+        var values=Values.Where(value=>bindings.ContainsKey(value.Request)).Select(value=>
+        {
+            cancellation.ThrowIfCancellationRequested();
+            if(!bindings.TryGetValue(value.Request,out var point))
+                throw new MarketDataException("risk_dependency","Every interval price dependency requires its exact connected binding.");
+            var price=graph.Price(point,cancellation).ToUnitPriceExact();
+            if(price.Unit!=value.Price.Unit)throw new MarketDataException("ppa_context","Connected interval prices must retain their exact native units.");
+            return price==value.Price?value:new BuiltValue(value.Request,Model.QuoteFor(value.Request),price,value.Lineage);
+        }).ToImmutableArray();
+        var byRequest=values.ToDictionary(v=>v.Request);
+        var evaluations=Evaluations.Where(e=>byRequest.ContainsKey(e.Result.Request)).Select(e=>e with{Result=byRequest[e.Result.Request]}).ToImmutableArray();
+        return new(Model,Snapshot,NumericalPolicy,values,SelectedInputs,0,evaluations,graph,Compiled,[..values.Select(v=>v.Request)],null,connected:connected,connectedBindings:bindings);
+    }
+
+    internal CurveBuild(CurveModel model,MarketSnapshot snapshot,string numericalPolicy,ImmutableArray<BuiltValue> values,
+        ImmutableDictionary<InputKey, SelectedObservation> selectedInputs,int evaluatedConstituents,ImmutableArray<CurveEvaluation> evaluations,
+        Calculation.ConnectedScenario graph,Calculation.ConnectedCurveExport compiled,ImmutableArray<CurveRequest> requests,CurveBuild? parent,
+        int reusedConstituents=0,Risk.QuoteShock? shock=null,
+        Risk.QuoteScenario? scenario=null,Calculation.ConnectedValuation? connected=null,ImmutableDictionary<CurveRequest,Calculation.CurvePointKey>? connectedBindings=null)
+    {
+        Model=model; Snapshot=snapshot; NumericalPolicy=numericalPolicy; Values=values; SelectedInputs=selectedInputs;
+        EvaluatedConstituents=evaluatedConstituents; Evaluations=evaluations;
+        ReusedConstituents=reusedConstituents; Shock=shock; Scenario=scenario??Risk.QuoteScenario.Base(snapshot);
+        Graph=graph;Compiled=compiled;Requests=requests;
+        valuation=new(()=>connected??(parent is null?Calculation.ConnectedValuation.Prepare(Graph,Snapshot):parent.valuation.Value.WithScenario(Graph)));
+        pricingBindings=new(()=>parent?.PricingBindings??connectedBindings??requests.ToImmutableDictionary(r=>r,r=>compiled.Points[(r,InputUse.Variable)]));
+        pricing=new(()=>parent is null?valuation.Value.Market(PricingBindings,this,default,this):
+            Calculation.ConnectedValuation.WithScenario(parent.Pricing,valuation.Value,this));
+    }
+}

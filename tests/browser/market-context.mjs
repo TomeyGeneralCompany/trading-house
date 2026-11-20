@@ -1,0 +1,66 @@
+export async function run({command,evaluate,wait,click,set,submit,persona,check,shot,idle,fitsWidth,errors,url}){
+  await command('Runtime.enable');await command('Page.enable');await command('Emulation.setDeviceMetricsOverride',{width:1440,height:1050,deviceScaleFactor:1,mobile:false});
+  await command('Page.navigate',{url:url+'/'});await wait("document.querySelectorAll('.curve-button').length>0&&"+idle);
+  await evaluate(`window.__requests=[];window.__responses=[];window.__originalFetch=window.fetch;window.fetch=async(...args)=>{const path=String(args[0]),body=args[1]?.body?JSON.parse(args[1].body):null;window.__requests.push({path,body});const response=await window.__originalFetch(...args);window.__responses.push({path,status:response.status,data:await response.clone().json()});return response;};window.__api=async(path,body)=>{const boot=await(await window.workspaceFetch('/api/bootstrap',undefined,window.__originalFetch)).json();const r=await window.workspaceFetch('/api/'+path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-Preview-CSRF':boot.csrfToken},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,data:await r.json()};};`);
+  const catalogContext="window.__responses.flatMap(r=>r.path.split('?')[0]==='/api/workspace/catalog'?[r.data]:r.data.workspace?[r.data.workspace]:[]).at(-1)?.context";
+  await check('historical time controls share the header with one effective-date coordinate',"document.querySelector('header #date-context')&&document.querySelectorAll('#date-context-on').length===1&&document.querySelector('header #snapshot')");
+
+  await click('#example');
+  await check('curve chart uses the shared interactive renderer with explicit delivery axis',"document.querySelector('#curve-chart canvas')&&document.querySelector('#curve-chart').dataset.chartAxis==='delivery'&&document.querySelector('#curve-chart .chart-toolbar').textContent.includes('Reset zoom')");
+  await click('[data-view=inputs]');
+  await check('dependent curve prices retain their connected source diagram',"document.querySelector('#source-flow svg .flow-edge')&&document.querySelector('#source-flow .flow-legend')");
+  await click('#source-all');await check('dependent curves retain their connected all-contract workbook',"document.querySelector('#source-flow .workbook-wires .sheet-connection')&&document.querySelectorAll('#source-flow .workbook-table').length>1");await click('#source-all');
+  await evaluate("[...document.querySelectorAll('.curve-button')].find(button=>button.querySelector('span').textContent==='Gas futures').click()");await wait(idle);
+  await check('supplied curve prices show every contract immediately without a surrounding graph box',"(()=>{const response=window.__responses.filter(r=>r.path==='/api/evaluate').at(-1).data,rows=[...document.querySelectorAll('#source-flow .workbook-table tbody tr')],host=document.querySelector('#source-flow .workbook-view');return response.points.length>1&&rows.length===response.points.length&&response.points.every(p=>rows.some(row=>row.querySelectorAll('td')[1].textContent===p.value))&&host&&getComputedStyle(host).borderTopWidth==='0px'&&!document.querySelector('#source-flow svg')&&!document.querySelector('#source-flow .workbook-canvas')&&!document.querySelector('#source-flow .flow-summary')&&!document.querySelector('#source-flow .workbook-table button');})()");
+  await check('supplied source controls and observation scope cover all contracts',"(()=>{const response=window.__responses.filter(r=>r.path==='/api/evaluate').at(-1).data;return document.querySelector('#source-contract').closest('.pricing-toolbar').hidden&&document.querySelectorAll('#inputs tbody tr').length===new Set(response.points.flatMap(p=>p.lineage)).size;})()");
+  await click('#inputs tbody tr:last-child button');await check('a later supplied contract can open its source versions without selecting a contract',"!document.querySelector('#revision-card').hidden&&document.querySelectorAll('#revisions tbody tr').length>0");
+  await shot('price-source-all');await command('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});await check('plain source tables stay within a narrow screen',fitsWidth);await evaluate("document.querySelector('#source-flow').closest('.card').scrollIntoView({block:'start'})");await shot('price-source-mobile');await command('Emulation.setDeviceMetricsOverride',{width:1440,height:1050,deviceScaleFactor:1,mobile:false});await click('[data-view=prices]');await click('#example');await check('returning to a dependent curve restores contract inspection controls',"!document.querySelector('#source-contract').closest('.pricing-toolbar').hidden&&document.querySelector('#source-flow svg .flow-edge')");
+  await click('#contracts tbody tr:first-child');
+  await check('a contract row opens its history in the panel: the time chart over the closes and a value row for each',"!document.querySelector('#contract-panel').hidden&&document.querySelector('#history-chart .time-chart-canvas canvas')&&document.querySelector('#history-values tbody').children.length===4");
+  await click('#contract-panel-close');
+  await click('#nav-schedules');
+  await check('viewer schedules remain read-only while the shared date library is discoverable',"(()=>{const library=window.__responses.filter(r=>r.path.split('?')[0]==='/api/date-schedules').at(-1).data;return !document.querySelector('#schedules-page').hidden&&document.querySelector('#dates-editor').hidden&&document.querySelector('#schedule-inspector').hidden&&!document.querySelector('#nav-schedules').hidden&&!!document.querySelector('#nav-date-rules')&&!document.querySelector('#date-expression-form').hidden&&library.canEdit===false&&library.canPublish===false;})()");
+  await click('#nav-schedules');await click('#nav-date-rules');
+  await check('viewer contract-date library disables authoring and publication controls',"!document.querySelector('#curve-date-editor').hidden&&document.querySelector('#curve-dates-fields').disabled&&document.querySelector('#curve-dates-new').hidden&&document.querySelector('#curve-dates-keep').hidden&&document.querySelector('#curve-dates-publish').hidden&&document.querySelector('#error').hidden");
+  await click('#nav-market');
+  await persona('editor');await click('#nav-schedules');
+  await check('editor drafts schedules against reference calendars only',"!document.querySelector('#dates-editor').hidden&&[...document.querySelectorAll('#dates-calendar option')].some(o=>o.value.endsWith('|test_business'))&&!document.querySelector('#dates-closures')&&document.querySelector('#dates-publish').hidden");
+  await click('#nav-market');await click('#example');
+  await set('#date-context-on','2020-12-17');await wait(idle);await click('#date-context-latest');await click('#apply-view-context');
+  await check('explicit context apply displays historical read-only mode',"document.querySelector('#environment-context-note').textContent.includes('Historical view')&&document.querySelector('#error').hidden");
+  const first=await evaluate("window.__responses.filter(r=>r.path==='/api/market/context').at(-1).data");
+  await check('workspace receives exactly the applied temporal context',`JSON.stringify(${catalogContext})===${JSON.stringify(JSON.stringify(first.context))}`);
+
+  await evaluate(`(()=>{const s=document.querySelector('#snapshot');s.value=[...s.options].find(o=>o.textContent.includes('Dec 17')).value;s.dispatchEvent(new Event('change',{bubbles:true}));})()`);await wait(idle);
+  const before=await evaluate("(({workspace,...prices})=>prices)(window.__responses.filter(r=>r.path==='/api/evaluate').at(-1).data)");
+  await check('commodity valuation carries same effective and known context',`JSON.stringify(window.__responses.filter(r=>r.path==='/api/evaluate').at(-1).data.context)===${JSON.stringify(JSON.stringify(first.context))}`);
+  await evaluate("[...document.querySelectorAll('.curve-button')].find(o=>o.querySelector('span').textContent==='Interest rates').click()");await wait(idle);
+  await check('rate curve uses same context and renders discount factors',`JSON.stringify(window.__responses.filter(r=>r.path==='/api/evaluate').at(-1).data.context)===${JSON.stringify(JSON.stringify(first.context))}&&document.querySelector('#contracts').textContent.includes('Discount factor')&&document.querySelector('#error').hidden`);
+  await click('#reference-area-curves');await click('#nav-table-currencies');await check('reference view survives historical context with rows',"document.querySelector('#reference').textContent.length>0&&document.querySelector('#error').hidden");
+  await click('#nav-schedules');await click('#nav-market');
+  await check('navigation retains exact context, no implicit current reload',`JSON.stringify(${catalogContext})===${JSON.stringify(JSON.stringify(first.context))}`);
+  await click('#current-view-context');await wait(idle);
+  const future=await evaluate(`(async()=>{const w=(await __api('workspace')).data;let f=w.frames.filter(f=>f.at.startsWith('2020-12-17')&&!f.contextId).at(-1);let o=w.observations.find(o=>f.observationIds.includes(o.id)&&o.series_id.endsWith('000000000001'));while(w.observations.some(n=>n.corrects_id===o.id))o=w.observations.find(n=>n.corrects_id===o.id);if(!f.observationIds.includes(o.id))f=(await __api('select-observation',{snapshotId:f.id,observationId:o.id})).data.frame;return await __api('corrections',{snapshotId:f.id,observationId:o.id,value:(Number(o.value)+0.137).toFixed(3)});})()`);
+  await check('editor can create a synthetic current-input correction',JSON.stringify(future.status===200));
+  await click('#back-view-context');await wait(idle);
+  const earlierReads=await evaluate("window.__responses.filter(r=>r.path==='/api/evaluate').length");
+  await evaluate("[...document.querySelectorAll('.curve-button')].find(o=>o.querySelector('span').textContent==='Local power forwards').click()");await wait(idle);
+  await check('later correction cannot change a retained exact historical result',`document.querySelector('#error').hidden&&window.__responses.filter(r=>r.path==='/api/evaluate').length>${earlierReads}&&JSON.stringify((({workspace,...prices})=>prices)(window.__responses.filter(r=>r.path==='/api/evaluate').at(-1).data))===${JSON.stringify(JSON.stringify(before))}`);
+  const mismatch=await evaluate(`__api('evaluate',{snapshotId:${JSON.stringify(future.data.frame.id)},curve:'local_power'})`);
+  await check('unbound future-correction frame is rejected, no fallback',JSON.stringify(mismatch.status===422));
+  await click('#date-context-latest');await click('#apply-view-context');
+  await evaluate(`(()=>{const s=document.querySelector('#snapshot');s.value=[...s.options].find(o=>o.textContent.includes('Dec 17')).value;s.dispatchEvent(new Event('change',{bubbles:true}));})()`);await wait(idle);
+  // A recorded close stays exact (D172, D334): the unrecorded correction does not reach it under current knowledge either.
+  await check('explicit current knowledge reads the recorded close exactly',`window.__responses.filter(r=>r.path==='/api/evaluate').at(-1).data.points[0].value===${JSON.stringify(before.points[0].value)}&&document.querySelector('#error').hidden`);
+  await set('#date-context-on','2020-12-16');await wait(idle);
+  await check('unapplied date edit immediately hides old prices and reference rows',"document.querySelector('#contracts').children.length===0&&document.querySelector('#reference').children.length===0");
+  await click('#date-context-latest');await click('#reference-area-curves');await click('#nav-table-currencies');await check('navigation applies changed context instead of stale reference rows',"window.__responses.filter(r=>r.path.split('?')[0]==='/api/workspace/navigation').at(-1).data.context.effectiveOn==='2020-12-16'&&document.querySelector('#reference').textContent.length>0");
+  await set('#date-context-view','2099-01-01T00:00');await click('#apply-view-context');
+  await check('future knowledge cutoff errors visibly with no stale row fallback',"!document.querySelector('#error').hidden&&document.querySelector('#contracts').children.length===0&&document.querySelector('#reference').children.length===0");
+  await click('#current-view-context');await check('explicit return restores current pins and populated controls',"document.querySelector('#date-context-on').value!==''&&document.querySelector('#date-context-view').value!==''&&document.querySelector('#workspace-mode-label').textContent.includes('current knowledge')&&window.__responses.filter(r=>r.path.split('?')[0]==='/api/workspace/navigation').at(-1).data.context===null");
+  await click('#nav-market');await click('#example');await evaluate('window.scrollTo(0,0)');await shot('market-desktop');
+  await command('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});await evaluate('window.scrollTo(0,0)');
+  await check('mobile 390px view has no page-wide horizontal overflow',fitsWidth);await shot('market-mobile');
+  await check('visible user screens contain no internal GUIDs',"!/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(document.body.innerText)");
+  await check('no uncaught JavaScript exceptions',JSON.stringify(errors.length===0));
+}

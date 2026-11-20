@@ -1,0 +1,619 @@
+using System.Collections.Immutable;
+using System.Globalization;
+using System.Text.Json;
+using Microsoft.AspNetCore.Builder;
+using Npgsql;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.CustomCurves;
+using OpenEtrm.MarketData.Calculation;
+using OpenEtrm.MarketData.Curves;
+using OpenEtrm.MarketData.Publications;
+using OpenEtrm.MarketData.Risk;
+using OpenEtrm.Shared.Temporal;
+
+namespace OpenEtrm.Api;
+
+public delegate Task<IResult> CustomCurveOperation(HttpContext context,string permission,Guid? snapshotId,
+    Func<NpgsqlConnection,PinnedContext,CancellationToken,Task<IResult>> work,
+    Func<NpgsqlConnection,CancellationToken,Task<IResult?>>? replay=null);
+
+public static partial class CustomCurves
+{
+    static MarketDataException Invalid(string message)=>new("custom_curve_definition",message);
+    public static void MapCustomCurves(this RouteGroupBuilder api,PreviewDatabase database,CustomCurveOperation operation)
+    {
+        var store=new CustomCurvesStore(database);
+        var activations=new CurveActivations(database.Manifest.CatalogId);
+        api.MapPost("/power-location-bindings",(HttpContext c,PowerLocationBindingRequest body)=>operation(c,"SealMarketDefinitions",null,async(connection,pin,ct)=>
+            Results.Ok(await PowerLocationGraphs.Publish(connection,database.Manifest.CatalogId,body,ct))));
+        api.MapPost("/power-location-bindings/history",(HttpContext c,PowerLocationHistoryRequest body)=>operation(c,"SealMarketDefinitions",null,async(connection,pin,ct)=>
+            Results.Ok(await PowerLocationGraphs.PublishHistory(connection,database.Manifest.CatalogId,body,ct))));
+        api.MapPost("/custom-curves/compose",(HttpContext c,CustomCurveCompositionRequest body)=>operation(c,"ReadMarketData",body.SnapshotId,async(connection,pin,ct)=>
+        {
+            var definition=RecipeComposition.Build(body.Composition);Validate(definition);
+            var revision=await CurveVersionInputs.NewGraph(database,connection,definition,pin.Frame?.Time.Date,ct);
+            var data=await database.Read(connection,ct,selectedRevision:revision,observationIds:[],includeCalendarDays:false);
+            _=await store.References(connection,definition,data,ct);
+            var versions=(await store.Read(connection,ct)).ToDictionary(v=>(v.Id,v.Version));
+            return Results.Ok(new{definition,description=DescribeComposition(body.Composition,versions)});
+        }));
+        api.MapGet("/custom-curves/activation",(HttpContext c,Guid curveId)=>operation(c,"ReadMarketData",null,async(connection,pin,ct)=>
+            Results.Ok(new{plan=await activations.Read(connection,curveId,ct)})));
+        api.MapPost("/custom-curves/activation",(HttpContext c,CurveActivationRequest body)=>operation(c,"SealMarketDefinitions",null,async(connection,pin,ct)=>
+            Results.Ok(await activations.Publish(connection,body,ct))));
+        api.MapPost("/custom-curves/effective-preview",(HttpContext c,EffectiveCurveRequest body)=>operation(c,"ReadMarketData",body.SnapshotId,async(connection,pin,ct)=>
+        {
+            pin=await SelectedClose.Pin(connection,database,pin,ct);
+            var frame=pin.RequireFrame();var context=pin.Context!;
+            var plan=await activations.Read(connection,body.CurveId,ct);
+            var segment=CurveActivations.Resolve(plan,DateWorkspace.Date(context.EffectiveOn),body.Policy);
+            var versions=await store.Read(connection,ct);
+            var saved=versions.SingleOrDefault(v=>v.Id==body.CurveId&&v.Version==segment.Version&&v.Definition.Output==segment.OutputNode)
+                ??throw Invalid("The activated exact published output is unavailable in this context.");
+            var revision=await CurveVersionInputs.Resolve(database,connection,saved.MarketRevisionId,ct);
+
+            var data=await database.Read(connection,ct,selectedRevision:revision,observationIds:[],includeCalendarDays:false);
+            await store.RequirePublishedSource(connection,new(data.DefinitionRevision.CatalogId,saved.Id,saved.Version,saved.Definition.Output),data.DefinitionRevision.RevisionId,ct);
+            if(RecipeEngine.PowerIntervalOutput(saved.Definition) is not null)
+                return Results.Ok(new{activation=plan,interval=segment,recipe=saved,
+                    preview=(await PreviewRead(connection,database,pin,new(saved.Definition,frame.Id,saved.Id,saved.Version),ct)).Value});
+            var calculated=await EvaluateDefinition(connection,database,saved.Definition,data,frame,saved.Sources,saved.Calendars,saved.Schedules,context,ct,versions:versions);
+            return Results.Ok(new{activation=plan,interval=segment,recipe=saved,preview=Result(calculated,data,pin,saved.Definition,saved.Id,saved.Version)});
+        }));
+        api.MapGet("/custom-curves",(Func<HttpContext,Task<IResult>>)((HttpContext c)=>operation(c,"ReadMarketData",ContextVersions.CatalogueSnapshot(c.Request.Query),async(connection,pin,ct)=>
+        {
+            return Results.Ok((await CatalogRead(connection,database,pin,ct)).Value);
+        })));
+        api.MapPost("/custom-curves/compile",(HttpContext c,CustomCurveCompileRequest body)=>operation(c,"ReadMarketData",body.SnapshotId,async(connection,pin,ct)=>
+        {
+            var definition=RecipeFormula.Compile(body.Formula,body.Code,body.Name);Validate(definition);
+            var revision=await CurveVersionInputs.NewGraph(database,connection,definition,pin.Frame?.Time.Date,ct);
+            var data=await database.Read(connection,ct,selectedRevision:revision,observationIds:[],includeCalendarDays:false);
+            _=await store.References(connection,definition,data,ct);
+            return Results.Ok(new{definition});
+        }));
+        api.MapPost("/custom-curves/format",(HttpContext c,CustomCurveFormatRequest body)=>operation(c,"ReadMarketData",null,(connection,pin,ct)=>
+        {
+            Validate(body.Definition);return Task.FromResult<IResult>(Results.Ok(new{formula=RecipeFormula.Format(body.Definition)}));
+        }));
+        api.MapPost("/custom-curves/save",(HttpContext c,CustomCurveSaveRequest body)=>operation(c,"WriteMarketDefinitions",body.SnapshotId,async(connection,pin,ct)=>
+        {
+            CustomCurvesStore.RequireSaveCoordinates(body);
+            var retained=body.Id is {} id?await store.RequireVersion(connection,id,body.Version,ct):null;
+            var revision=retained is null?await CurveVersionInputs.NewGraph(database,connection,body.Definition,pin.Frame?.Time.Date,ct):await CurveVersionInputs.Resolve(database,connection,retained.MarketRevisionId,ct);
+            var data=await database.Read(connection,ct,selectedRevision:revision,observationIds:[],includeCalendarDays:false);
+            return Results.Ok(await store.Save(connection,body,data,CurveDraftSaver.Person,ct));
+        },async(connection,ct)=>
+        {
+            await store.Lock(connection,ct);
+            return await store.ReplaySave(connection,body,CurveDraftSaver.Person,ct) is {} saved?Results.Ok(saved):null;
+        }));
+        api.MapPost("/custom-curves/publish",(HttpContext c,CustomCurvePublishRequest body)=>operation(c,"SealMarketDefinitions",null,async(connection,pin,ct)=>
+            Results.Ok(await store.Publish(connection,body,ct))));
+        api.MapPost("/custom-curves/component-history",(HttpContext c,ComponentHistoryRequest body)=>operation(c,"ReadMarketData",body.SnapshotId,async(connection,pin,ct)=>
+        {
+            pin=await SelectedClose.Pin(connection,database,pin,ct);
+            return Results.Ok((await PreviewRead(connection,database,pin,new(body.Definition,body.SnapshotId,body.Id,body.Version),ct,body)).Value);
+        }));
+        api.MapPost("/custom-curves/preview",(HttpContext c,CustomCurvePreviewRequest body)=>operation(c,"ReadMarketData",body.SnapshotId,async(connection,pin,ct)=>
+        {
+            pin=await SelectedClose.Pin(connection,database,pin,ct);
+            return Results.Ok((await PreviewRead(connection,database,pin,body,ct)).Value);
+        }));
+    }
+    static bool Equivalent(RecipeDefinition left,RecipeDefinition right)
+    {
+        if(left.Code!=right.Code||left.Name!=right.Name||left.Output!=right.Output||left.Nodes.Length!=right.Nodes.Length)return false;
+        return left.Nodes.All(node=>right.Nodes.Any(other=>node.Id==other.Id&&node.Kind==other.Kind&&node.PublishedSource==other.PublishedSource&&JsonSerializer.Serialize(node.ContractTerms,RiskJobs.Json)==JsonSerializer.Serialize(other.ContractTerms,RiskJobs.Json)&&node.Parameters.Count==other.Parameters.Count&&node.Parameters.All(p=>other.Parameters.GetValueOrDefault(p.Key)==p.Value)&&Weights(node).SequenceEqual(Weights(other))&&PanelWeights(node).SequenceEqual(PanelWeights(other))&&ObservationTerms(node).SequenceEqual(ObservationTerms(other))&&node.Inputs.Count==other.Inputs.Count&&node.Inputs.All(p=>other.Inputs.GetValueOrDefault(p.Key)==p.Value)));
+    }
+    static IEnumerable<RecipeContractWeight> Weights(RecipeNode node)=>(node.ContractWeights.IsDefault?[]:node.ContractWeights).OrderBy(w=>w.OutputPosition).ThenBy(w=>w.SourcePort,StringComparer.Ordinal).ThenBy(w=>w.ContractId);
+    static IEnumerable<RecipePanelWeight> PanelWeights(RecipeNode node)=>(node.PanelWeights.IsDefault?[]:node.PanelWeights).OrderBy(w=>w.SourcePort,StringComparer.Ordinal);
+    static IEnumerable<RecipeObservationTerm> ObservationTerms(RecipeNode node)=>(node.ObservationTerms.IsDefault?[]:node.ObservationTerms).OrderBy(t=>t.Ordinal);
+    public static void Validate(RecipeDefinition definition)
+    {
+        RecipeEngine.Validate(definition);
+        if(!System.Text.RegularExpressions.Regex.IsMatch(definition.Code,@"\A[a-z][a-z0-9_]{0,31}\z")||definition.Name.Length>80||definition.Nodes.Length>32||definition.Nodes.Any(n=>!System.Text.RegularExpressions.Regex.IsMatch(n.Id,@"\A[a-z][a-z0-9_]{0,31}\z")))throw Invalid("Use stable lowercase codes, at most 32 nodes and an 80-character name.");
+        foreach(var node in definition.Nodes)
+        {
+            var allowed=node.Kind switch{"source"=>new[]{"curve"},"published_source"=>new[]{"selection"},"select" when node.Parameters["mode"]=="positions"=>new[]{"mode","binding","first","count"},"select"=>new[]{"mode","binding"},"mean"=>new[]{"axis"},"weighted_contracts"=>new[]{"aggregation"},"weighted_panels"=>new[]{"aggregation","alignment"},"splice"=>new[]{"from","cutover","to","implementation"},"lookup"=>new[]{"axis","method","maxGapDays","leftBoundary","rightBoundary","implementation","output"},RecipeEngine.PowerIntervals=>RecipeEngine.PowerIntervalParameters.ToArray(),RecipeEngine.ContractObservations=>RecipeEngine.ObservationParametersOf(node).ToArray(),"dates"=>node.Parameters.Keys.ToArray(),_=>Array.Empty<string>()};
+            if(node.Parameters.Keys.Any(key=>!allowed.Contains(key)))throw Invalid("A node contains unsupported settings for its selected operator.");
+        }
+        if(definition.Nodes.Any(n=>n.Kind==RecipeEngine.ContractObservations&&n.Parameters.GetValueOrDefault("days")==RecipeEngine.BusinessDays&&!n.Parameters.ContainsKey("calendar")))
+            throw Invalid("Business-day windows require an exact reference calendar.");
+        foreach(var node in definition.Nodes.Where(n=>n.Kind=="dates"))
+        {
+            if(!node.Parameters.TryGetValue("mode",out var mode)||mode is not("context" or "prior_calendar" or "prior_business" or "balance_month" or "schedule" or "delivery_range"))throw Invalid("Choose an explicit date-sequence mode.");
+            if(node.Parameters.GetValueOrDefault("sampling")!="context_utc_time"||node.Parameters.GetValueOrDefault("corrections")!="exact_context_frame_history_latest_visible")throw Invalid("Choose the exact UTC sampling-time and visible-correction policy.");
+            var allowed=new HashSet<string>(["mode","sampling","corrections"]);
+            if(mode is "prior_calendar" or "prior_business")
+            {
+                allowed.UnionWith(["count","includeContext"]);
+                if(!int.TryParse(node.Parameters.GetValueOrDefault("count"),NumberStyles.None,CultureInfo.InvariantCulture,out var count)||count is <1 or >366||node.Parameters.GetValueOrDefault("includeContext") is not("true" or "false"))throw Invalid("Choose one to 366 dates and explicitly include or exclude the context date.");
+                if(mode=="prior_business")allowed.Add("calendar");
+            }
+            if(mode=="delivery_range"){allowed.UnionWith(["from","to"]);_=RecipeEngine.DeliveryDates(node);}
+            if(mode=="schedule")allowed.UnionWith(["schedule","first","count"]);
+            if(node.Parameters.Keys.Any(p=>!allowed.Contains(p)))throw Invalid("A date sequence contains unsupported or conflicting settings.");
+            if(mode=="prior_business"&&!node.Parameters.ContainsKey("calendar"))throw Invalid("Business-day windows require an exact reference calendar.");
+            if(mode=="schedule"&&(!node.Parameters.ContainsKey("schedule")||!int.TryParse(node.Parameters.GetValueOrDefault("first"),out var first)||first<0||!int.TryParse(node.Parameters.GetValueOrDefault("count"),out var n)||n is <1 or >366))throw Invalid("Choose an exact published schedule and its explicit occurrence range.");
+        }
+    }
+    static RecipeNode Node(string id,string kind,Dictionary<string,string>? parameters=null,Dictionary<string,string>? inputs=null)=>new(id,kind,(parameters??[]).ToImmutableDictionary(),(inputs??[]).ToImmutableDictionary());
+    static ImmutableDictionary<string,CurveNodePosition> Layout(params string[] nodes)=>nodes.Select((id,i)=>(id,new CurveNodePosition(30+i*280,i==2?180:40))).ToImmutableDictionary(p=>p.id,p=>p.Item2);
+    public static object[] Templates(PreviewData data)
+    {
+        var future=data.Definitions["curves"].FirstOrDefault(c=>c.Text("code")=="ng_monthly");
+        if(future.ValueKind==JsonValueKind.Undefined)future=data.Definitions["curves"].FirstOrDefault(c=>c.Text("code")=="future");
+        var futureCode=future.ValueKind==JsonValueKind.Undefined?"":future.Text("code");
+        var daily=data.Definitions["curves"].FirstOrDefault(c=>c.Text("code")=="ng_daily");
+        var dailyCode=daily.ValueKind==JsonValueKind.Undefined?"":daily.Text("code");
+        RecipeNode Dates(string mode)=>Node("dates","dates",new(){["mode"]=mode,["sampling"]="context_utc_time",["corrections"]="exact_context_frame_history_latest_visible"});
+        object Template(string code,string name,bool average,bool balmo)
+        {
+            var date=Dates(balmo?"balance_month":average?"prior_calendar":"context");
+            if(average)date=date with{Parameters=date.Parameters.Add("count","20").Add("includeContext","false")};
+            var nodes=ImmutableArray.Create(Node("source","source",new(){["curve"]=balmo?dailyCode:futureCode}),
+                Node("select","select",new(){["mode"]=balmo?"daily_delivery":"positions",["first"]="1",["count"]=average?"12":"1",["binding"]=balmo?"context":"each_sample"},new(){["source"]="source"}),date,
+                Node("sample","sample",inputs:new(){["selection"]="select",["dates"]="dates"}));
+            if(balmo)nodes=nodes.SetItem(1,nodes[1] with{Parameters=nodes[1].Parameters.Remove("first").Remove("count")});
+            if(average||balmo)nodes=nodes.Add(Node("mean","mean",new(){["axis"]=balmo?"contracts":"dates"},new(){["values"]="sample"}));
+            nodes=nodes.Add(Node("output","output",inputs:new(){["values"]=average||balmo?"mean":"sample"}));
+            return new{code,name,definition=new RecipeDefinition(code,name,nodes,"output"),layout=Layout(nodes.Select(n=>n.Id).ToArray()),available=!balmo||dailyCode!="",unavailableReason=balmo&&dailyCode==""?"Choose a source with exact daily forward delivery periods.":null};
+        }
+        return [Template("ng_prompt","NG prompt",false,false),Template("ng_balmo","NG balance of month",false,true),Template("ng_average","NG1–NG12 · prior 20 calendar-day closes",true,false)];
+    }
+    static object[] Operators()
+    {
+        object Option(string value,string label)=>new{value,label};
+        object Field(string key,string label,string type,object[]? options=null,object? when=null,bool required=true)=>new{key,label,type,required,options=options??[],when};
+        object When(params string[] modes)=>new{key="mode",values=modes};
+        object Port(string name,string type)=>new{name,label=name,type,required=true};
+        object Operator(string kind,string label,string output,object[] fields,params object[] ports)=>new{kind,label,outputType=output,fields,inputPorts=ports};
+        return [Operator(RecipeEngine.PowerIntervals,"Compose power intervals","power_intervals",[
+                Field("implementation","Forward policy","select",[Option("flat_forward_only_v1","Flat forwards · whole undelivered contracts"),Option(RecipeEngine.DailyThenMonthlyForward,"Daily futures then monthly futures · flat products"),Option(RecipeEngine.SavedProductForwards,"Lookup from saved peak/off-peak product curves")]),
+                Field("product","Published TOU product","power_product"),Field("productVersion","Exact TOU version","integer"),Field("profile","Output delivery profile","power_profile"),
+                Field("profileMapping","Source grid alignment","select",[Option("exact_native_grid_terms_v1","Match every native grid term")]),
+                Field("market","Output market","select",[Option("DA","Day ahead"),Option("RT","Real time")]),
+                Field("from","Delivery from (YYYY-MM-DD)","text"),Field("cutover","Monthly section starts (YYYY-MM-DD)","text",when:new{key="implementation",values=new[]{RecipeEngine.DailyThenMonthlyForward}}),Field("to","Delivery to exclusive (YYYY-MM-DD)","text"),
+                Field("shapePolicy","Hourly price construction","select",[Option(RecipeEngine.DailyAdditiveShape,"Additive shape on daily 16/8 blocks; monthly remains flat")],required:false),
+                Field("shapeSeries","Hourly price shape","power_shape",when:new{key="shapePolicy",values=new[]{RecipeEngine.DailyAdditiveShape}}),
+                Field("settlementPolicy","Physical settlement","select",[Option(PowerIntervalSettlement.Captured,"Captured LMPs · corrections as known · required for ended hours"),Option(PowerIntervalSettlement.PjmDayAheadReplay,"PJM DA replay · normal D−1 13:30 EPT availability · corrections as known")],required:false),
+                Field("settlementPublication","Settlement publication","power_publication",when:new{key="settlementPolicy",values=new[]{PowerIntervalSettlement.Captured,PowerIntervalSettlement.PjmDayAheadReplay}}),
+                Field("settlementVersion","Exact publication version","integer",when:new{key="settlementPolicy",values=new[]{PowerIntervalSettlement.Captured,PowerIntervalSettlement.PjmDayAheadReplay}}),
+                Field("settlementIndex","Settlement index","power_settlement_index",when:new{key="settlementPolicy",values=new[]{PowerIntervalSettlement.Captured,PowerIntervalSettlement.PjmDayAheadReplay}}),
+                Field("settlementSource","Captured hourly source","power_source",when:new{key="settlementPolicy",values=new[]{PowerIntervalSettlement.Captured,PowerIntervalSettlement.PjmDayAheadReplay}}),
+                Field("projectionPolicy","Unfixed hours","select",[Option(OpenEtrm.MarketData.Power.FlatIntervalCurve.ReplaceActuals,"Keep native futures + basis forecast · refuse expired unfixed anchors")],when:new{key="settlementPolicy",values=new[]{PowerIntervalSettlement.Captured,PowerIntervalSettlement.PjmDayAheadReplay}})
+                ],Port("peak","curve|panel"),Port("offPeak","curve|panel"),new{name="dailyPeak",label="Daily HE08–23",type="curve",required=false},new{name="dailyOffPeak",label="Daily HE01–07,24",type="curve",required=false}),
+            Operator("source","Source curve","curve",[Field("curve","Curve","curve")]),
+            Operator("published_source","Published custom curve","panel",[Field("publishedSource","Published version/output","published_source"),Field("selection","Output selection","select",[Option("all_output_points_v1","All points under the selected context")])]),
+            Operator("select","Select contracts","selection",[Field("mode","Contract selection","select",[Option("positions","Relative positions"),Option("daily_delivery","Daily delivery periods")]),Field("first","First position","integer",when:When("positions")),Field("count","Number of positions","integer",when:When("positions")),Field("binding","Resolve contracts","select",[Option("each_sample","At each sampling instant"),Option("context","Once at context instant")])],Port("source","curve")),
+            Operator("dates","Date sequence","dates",[Field("mode","Date sequence","select",[Option("context","Context date"),Option("prior_calendar","Prior calendar dates"),Option("prior_business","Prior publication business dates"),Option("balance_month","Context date through month-end"),Option("schedule","Published date schedule"),Option("delivery_range","Explicit daily delivery range")]),Field("from","Delivery from (YYYY-MM-DD)","text",when:When("delivery_range")),Field("to","Delivery to exclusive (YYYY-MM-DD)","text",when:When("delivery_range")),Field("count","Date count","integer",when:When("prior_calendar","prior_business","schedule")),Field("includeContext","Include context date","boolean",when:When("prior_calendar","prior_business")),Field("calendar","Calendar","calendar",when:When("prior_business")),Field("schedule","Published schedule","schedule",when:When("schedule")),Field("first","First schedule occurrence","integer",when:When("schedule")),Field("sampling","Sampling time","select",[Option("context_utc_time","Exact context UTC time on each sampling date")]),Field("corrections","Corrections","select",[Option("exact_context_frame_history_latest_visible","Exact selected context inputs; latest visible historical corrections")])]),
+            Operator("sample","Sample prices","panel",[],Port("selection","selection"),Port("dates","dates")),
+            Operator(RecipeEngine.ContractObservations,"Contract observations","panel",[
+                Field("implementation","Observation terms version","select",[Option(RecipeEngine.ObservationTermsVersion,"Contract observation terms v1")]),
+                Field("targetFrom","First target month (YYYY-MM-01)","text"),Field("targetCount","Number of target months","integer"),
+                Field("days","Observation days","select",[Option(RecipeEngine.CalendarDays,"Every calendar day"),Option(RecipeEngine.BusinessDays,"Business days of a calendar")]),
+                Field("calendar","Calendar","calendar",when:new{key="days",values=new[]{RecipeEngine.BusinessDays}}),
+                Field("roll","Contract roll","select",[Option(ContractRollRule.ExpiryImplementation,"At each contract's recorded expiry")]),
+                Field("sampling","Sampling time","select",[Option("context_utc_time","Exact context UTC time on each observation day")]),
+                Field("corrections","Corrections","select",[Option("exact_context_frame_history_latest_visible","Exact selected context inputs; latest visible historical corrections")]),
+                Field("observationTerms","Observation terms","observation_terms",[Option(RecipeEngine.CalendarMonthPeriod,"Calendar month of delivery"),Option(RecipeEngine.TradeMonthPeriod,"Trade month of the delivery contract")])],
+                Port("source","curve")),
+            Operator("splice","Splice delivery ranges","panel",[
+                Field("from","Delivery from (YYYY-MM-DD)","text"),Field("cutover","Switch source on (YYYY-MM-DD)","text"),
+                Field("to","Delivery to exclusive (YYYY-MM-DD)","text"),
+                Field("implementation","Selection policy","select",[Option(RecipeEngine.WholeDeliverySplice,"Whole delivery intervals · reject gaps and overlaps")])],Port("before","panel"),Port("after","panel")),
+            Operator("lookup","Curve lookup","panel",[
+                Field("axis","Point date axis","select",[Option("delivery_start","Delivery start"),Option("delivery_end","Delivery end")]),
+                Field("method","Lookup method","select",[Option("exact","Exact point date"),Option("containing_delivery","Containing delivery period"),Option("previous","Previous point"),Option("next","Next point"),Option("linear_price_actual_days_v1","Linear price · actual days")]),
+                Field("maxGapDays","Maximum bracket span (days)","integer"),
+                Field("leftBoundary","Before coverage","select",[Option("reject","Reject")]),Field("rightBoundary","After coverage","select",[Option("reject","Reject")]),
+                Field("implementation","Lookup implementation","select",[Option("asset_curve_lookup_v1","Asset lookup v1")]),
+                Field("output","Output semantics","select",[Option("daily_delivery_v1","Daily delivery prices")])],Port("values","panel"),Port("dates","dates")),
+            Operator("mean","Arithmetic mean","panel",[Field("axis","Average over","select",[Option("dates","Historical dates · retain tenors"),Option("contracts","Delivery contracts · one index")])],Port("values","panel")),
+            new{kind="weighted_contracts",label="Weighted contract mapping",outputType="selection",
+                fields=new[]{Field("aggregation","Aggregation","select",[Option(RecipeEngine.SignedSum,"Signed weighted sum"),Option(RecipeEngine.WeightedMean,"Normalized weighted mean")]),Field("contractWeights","Contract weights","contract_weights")},
+                inputPorts=Array.Empty<object>(),dynamicInputs=new{type="curve",label="Source",prefix="source_"}},
+            new{kind="weighted_panels",label="Combine curves",outputType="panel",
+                fields=new[]{Field("aggregation","How to combine","select",[Option(RecipeEngine.SignedSum,"Add weighted prices (negative weights subtract)"),Option(RecipeEngine.WeightedMean,"Weighted average (divide by total weight)")]),
+                    Field("alignment","Match delivery periods","select",[Option(RecipeEngine.ExactDeliveryAlignment,"Exact periods · one value per period in every curve")]),Field("panelWeights","Curve weights","panel_weights")},
+                inputPorts=Array.Empty<object>(),dynamicInputs=new{type="panel",label="Curve",prefix="source_"}},
+            Operator("output","Curve output","curve_result",[],Port("values","panel|power_intervals"))];
+    }
+    internal static async Task<RecipeResult> EvaluateDefinition(NpgsqlConnection connection,PreviewDatabase database,RecipeDefinition definition,
+        PreviewData data,InputFrame frame,ImmutableDictionary<string,CurveSourceReference> sources,
+        ImmutableDictionary<string,CalendarReference> calendars,ImmutableDictionary<string,CurveScheduleReference> schedules,
+        ScheduleContext context,CancellationToken ct,bool retainedObservations=false,InputFrame? sourceFrame=null,
+        Dictionary<CalendarReference,ReferenceCalendar>? calendarReads=null,ImmutableArray<CustomCurveVersion> versions=default)
+    {
+        var prepared=await PrepareDefinition(connection,database,definition,data,frame,sources,calendars,schedules,context,ct,retainedObservations,sourceFrame,calendarReads,versions);
+        return EvaluateGraph(prepared.Graph,prepared.Context,database,ct);
+    }
+    static async Task<(ConnectedRecipeGraph Graph,ResolvedCalculationContext Context)> PrepareDefinition(NpgsqlConnection connection,PreviewDatabase database,RecipeDefinition definition,
+        PreviewData data,InputFrame frame,ImmutableDictionary<string,CurveSourceReference> sources,
+        ImmutableDictionary<string,CalendarReference> calendars,ImmutableDictionary<string,CurveScheduleReference> schedules,
+        ScheduleContext context,CancellationToken ct,bool retainedObservations=false,InputFrame? sourceFrame=null,
+        Dictionary<CalendarReference,ReferenceCalendar>? calendarReads=null,ImmutableArray<CustomCurveVersion> versions=default)
+    {
+        var exact=PinnedContext.Exact(context);
+        frame=await MarketInputSelection.FrameFor(database,connection,data,frame,ct);
+        RequireFrameContext(frame,exact);
+        if(sourceFrame is not null&&(!retainedObservations||sourceFrame.Id!=frame.Id||sourceFrame.At!=frame.At||sourceFrame.ContextId!=frame.ContextId))
+            throw Invalid("Projected source pins must belong to this exact retained calculation frame.");
+        var identity=new ConnectedRecipeIdentity(data.DefinitionRevision.CatalogId,
+            StablePreviewId(definition),1,RecipeEngine.Version);
+        var resolved=CalculationContext(frame,data.DefinitionRevision,exact);
+        if(versions.IsDefault)versions=await new CustomCurvesStore(database).Read(connection,ct);
+        var preparation=new RecipePreparation(connection,database,data,frame,exact,resolved,versions,retainedObservations:retainedObservations,sourceFrame:sourceFrame,calendarReads:calendarReads??[],previewBudget:database.RecipePreviewBudget);
+        if(!retainedObservations)
+            preparation.UsePreviewHistory(definition,sources,calendars,schedules);
+        var graph=await preparation.Definition(definition,identity,sources,calendars,schedules,ct);
+        return (graph,resolved);
+    }
+    internal static void RequireFrameContext(InputFrame frame,ScheduleContext context)
+    {
+        var exact=PinnedContext.Exact(context);
+        if(frame.ContextId!=exact.ContextId||PreviewSession.BusinessDay(frame)!=DateWorkspace.Date(exact.EffectiveOn))
+            throw Invalid("The recipe frame must belong to its exact resolved knowledge context and effective date.");
+    }
+    static RecipeResult EvaluateGraph(ConnectedRecipeGraph graph,ResolvedCalculationContext resolved,PreviewDatabase database,CancellationToken ct)
+    {
+        var plan=ConnectedCurves.Compile(graph.Definitions,graph.Outputs.Select(o=>o.Point).ToImmutableArray(),resolved,
+            new PreparedBindings(graph.Definitions.Select(d=>d.Key).ToHashSet(),resolved),ct);
+        return graph.Result(ConnectedScenario.Base(plan,database.Calculations,ct),ct);
+    }
+    private static Guid StablePreviewId(RecipeDefinition definition)=>new(System.Security.Cryptography.SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(definition,RiskJobs.Json)).AsSpan(0,16));
+    private static ResolvedCalculationContext CalculationContext(InputFrame frame,DefinitionRevision revision,ScheduleContext context)
+    {
+        var manifest=Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new{revision,frame.Id,frame.At,context,frame.ObservationIds,FrozenObservationIds=frame.FrozenObservationIds.IsDefault?ImmutableArray<Guid>.Empty:frame.FrozenObservationIds,policy=ConnectedCurves.NumericalPolicy,engine=RecipeEngine.Version},RiskJobs.Json)));
+        return new(context.ContextId!.Value,manifest,frame.At,SchedulePreview.ParseAt(context.KnownAt),frame.At,frame.At);
+    }
+    // A source contract is eligible from its futures execution policy, or for a forward from the definition's period.
+    // A futures option's settlement is no custom-curve source.
+    internal static DateTimeOffset SourceEligibleFrom(PreviewData data,string curve,MarketContract contract)=>contract.Kind switch
+    {
+        ContractKind.Future=>FuturesStore.Binding(data,curve,contract.Key.Id,contract.Key.Id,data.FuturesConvention).EligibleFrom,
+        ContractKind.Forward=>new DateTimeOffset(DateWorkspace.Date(data.Definitions["revision_periods"].Single().Text("effective_from")).ToDateTime(TimeOnly.MinValue,DateTimeKind.Utc)),
+        _=>throw new MarketDataException("custom_curve_source",$"Curve {curve} observes futures-option settlements, which are not a custom-curve source."),
+    };
+    private sealed record RecipeMaterialization(RecipeInputs Values,ImmutableArray<ConnectedRecipeSample> Samples,ConnectedRecipeReferencePins References,
+        RecipeOutputDemand? Demand);
+    static async Task<RecipeMaterialization> Inputs(NpgsqlConnection connection,PreviewDatabase database,RecipeDefinition definition,
+        PreviewData data,InputFrame frame,ImmutableDictionary<string,CurveSourceReference> sourceReferences,
+        ImmutableDictionary<string,CalendarReference> calendarReferences,ImmutableDictionary<string,CurveScheduleReference> scheduleReferences,
+        ScheduleContext? context,CancellationToken ct,ImmutableHashSet<RecipeDelivery>? deliveries=null,RecipeTopology? topology=null,bool topologyOnly=false,bool retainedObservations=false,
+        Action<InputFrame,ImmutableArray<CurveRequest>,bool,IReadOnlyDictionary<CurveRequest,ContractPriceTermsBinding>>? collectObservations=null,InputFrame? sourceFrame=null,
+        Dictionary<CalendarReference,ReferenceCalendar>? calendarReads=null,PreviewHistory? history=null)
+    {
+        if(sourceReferences.Values.Any(source=>source.CatalogId!=data.DefinitionRevision.CatalogId||source.RevisionId!=data.DefinitionRevision.RevisionId))
+            throw Invalid("Every native source must use the selected exact market revision.");
+        var publications=definition.Nodes.Any(n=>n.ContractTerms is not null)?await new PricePublicationStore(database).Read(connection,ct):ImmutableArray<PricePublicationDefinition>.Empty;
+        var day=DateOnly.FromDateTime(frame.At.UtcDateTime);
+        var dates=ImmutableDictionary.CreateBuilder<string,ImmutableArray<DateOnly>>();
+        var calendarPins=ImmutableArray.CreateBuilder<ConnectedRecipeCalendarPin>();
+        var schedulePins=ImmutableArray.CreateBuilder<ConnectedRecipeSchedulePin>();
+        ConnectedRecipeCalendarPin CalendarPin(string node,ReferenceCalendar calendar)=>new(node,
+            new(new(calendar.Reference.CatalogId,calendar.Reference.RevisionId),calendar.Reference.Code),DateWorkspace.Calendar(calendar));
+        var scheduleStore=new ScheduleStore(database.Manifest.CatalogId,data.ReferenceRevision.CatalogId,data.ReferenceRevision.RevisionId);
+        async Task<DateSet> PinnedCalendar(string node)
+        {
+            if(!calendarReferences.TryGetValue(node,out var reference))throw Invalid("Choose the exact publication calendar.");
+            if(calendarReads is null||!calendarReads.TryGetValue(reference,out var calendar))
+            {
+                calendar=await scheduleStore.Calendar(connection,reference,ct);
+                calendarReads?.Add(reference,calendar);
+            }
+            var sequence=DateWorkspace.Calendar(calendar);
+            calendarPins.Add(CalendarPin(node,calendar));
+            return sequence;
+        }
+        foreach(var node in definition.Nodes.Where(n=>n.Kind=="dates"))
+        {
+            ct.ThrowIfCancellationRequested();
+            var mode=node.Parameters["mode"];
+            switch(mode)
+            {
+                case "context":dates[node.Id]=[day];break;
+                case "delivery_range":dates[node.Id]=RecipeEngine.DeliveryDates(node);break;
+                case "balance_month":
+                    var end=day.AddDays(DateTime.DaysInMonth(day.Year,day.Month)-day.Day);
+                    dates[node.Id]=[..Enumerable.Range(0,end.DayNumber-day.DayNumber+1).Select(day.AddDays)];break;
+                case "prior_calendar":
+                case "prior_business":
+                    var count=int.Parse(node.Parameters["count"],CultureInfo.InvariantCulture);
+                    var last=bool.Parse(node.Parameters["includeContext"])?day:day.AddDays(-1);
+                    if(mode=="prior_calendar")dates[node.Id]=[..Enumerable.Range(0,count).Select(i=>last.AddDays(i-count+1))];
+                    else dates[node.Id]=RecipeEngine.PriorBusinessDates(await PinnedCalendar(node.Id),day,count,bool.Parse(node.Parameters["includeContext"]));
+                    break;
+                case "schedule":
+                    if(!scheduleReferences.TryGetValue(node.Id,out var schedule))throw Invalid("Choose an exact published schedule.");
+                    var exactSchedule=await scheduleStore.ReadPublishedAt(connection,schedule.Id,schedule.Version,
+                        context??throw Invalid("An exact schedule requires its resolved historical context."),ct);
+                    var retained=exactSchedule.Version;
+                    var compiled=PublishedSchedules.Compile(retained);
+                    var first=int.Parse(node.Parameters["first"],CultureInfo.InvariantCulture);var length=int.Parse(node.Parameters["count"],CultureInfo.InvariantCulture);
+                    dates[node.Id]=RecipeEngine.ScheduleDates([..compiled.Dates],retained.Selection,day,first,length,out var origin);
+                    schedulePins.Add(new(node.Id,schedule.CatalogId,schedule.Id,schedule.Version,retained.EngineVersion,
+                        exactSchedule.KnownFrom,retained.PublicationOrder!.Value,retained.Selection,origin,first,length,
+                        [..compiled.Dates],retained.ResolvedCalendar is {} scheduleCalendar?CalendarPin(node.Id,scheduleCalendar):null));
+                    break;
+                default:throw Invalid("Choose a supported explicit date sequence.");
+            }
+        }
+        var allDates=dates.Values.SelectMany(value=>value).Append(day).Distinct().Order().ToArray();
+        if(allDates.Length>367)throw Invalid("A preview can sample at most 366 historical dates and its context date.");
+        if(allDates.Any(date=>date>day))
+        {
+            // Delivery dates may be future dates; historical positions may not read future publications.
+            var samplingNodes=definition.Nodes.Where(n=>n.Kind=="sample");
+            foreach(var sample in samplingNodes)
+            {
+                var selector=definition.Nodes.Single(n=>n.Id==sample.Inputs["selection"]);
+                if((selector.Kind=="weighted_contracts"||selector.Parameters["mode"]=="positions")&&dates[sample.Inputs["dates"]].Any(date=>date>day))throw Invalid("Historical price sampling cannot read observations after the context date.");
+            }
+        }
+        var observed=await ContractObservations(definition,data,sourceReferences,frame.At,PinnedCalendar);
+        var historyDates=definition.Nodes.Where(n=>n.Kind=="sample").Where(n=>definition.Nodes.Single(s=>s.Id==n.Inputs["selection"]) is var selector&&(selector.Kind=="weighted_contracts"||selector.Parameters["mode"]=="positions"))
+            .SelectMany(n=>dates[n.Inputs["dates"]]).Concat(observed.Samples.Select(s=>s.Date)).Append(day).Distinct().Order().ToArray();
+        var period=data.Definitions["revision_periods"].Single();
+        var periodFrom=DateWorkspace.Date(period.Text("effective_from"));var periodTo=DateWorkspace.Date(period.Text("effective_to"));
+        if(historyDates.Any(sampleDay=>sampleDay<periodFrom||sampleDay>=periodTo))throw Invalid("Every historical sample must fall within the exact source definition's retained effective period.");
+        var frames=new Dictionary<DateOnly,InputFrame>();
+        foreach(var sampleDay in historyDates)
+        {
+            if(sampleDay==day){frames.Add(sampleDay,frame);continue;}
+            var at=new DateTimeOffset(sampleDay.ToDateTime(TimeOnly.FromDateTime(frame.At.UtcDateTime),DateTimeKind.Utc));
+            frames.Add(sampleDay,new(Guid.NewGuid(),"Exact historical sampling inputs",at,sampleDay,[],frame.CurveContracts,frame.ContextId));
+        }
+        var sources=ImmutableDictionary.CreateBuilder<string,RecipeSource>();
+        var connected=ImmutableArray.CreateBuilder<ConnectedRecipeSample>();
+        var admitted=topology?.NativeInputs(deliveries);
+        foreach(var sourceNode in definition.Nodes.Where(n=>n.Kind=="source"))
+        {
+            ct.ThrowIfCancellationRequested();
+            var reference=sourceReferences[sourceNode.Id];
+            var source=NativeSource(data,reference);var contracts=source.Contracts;
+            sources.Add(sourceNode.Id,source);
+            if(topologyOnly)continue;
+            var selectors=definition.Nodes.Where(n=>n.Kind is "select" or "weighted_contracts"&&n.Inputs.Values.Contains(sourceNode.Id)).ToArray();
+            var required=new Dictionary<DateOnly,HashSet<ContractKey>>();
+            foreach(var selector in selectors)
+            {
+                var sampling=definition.Nodes.Where(n=>n.Kind=="sample"&&n.Inputs["selection"]==selector.Id);
+                foreach(var sample in sampling)
+                foreach(var sampleDate in dates[sample.Inputs["dates"]])
+                {
+                    var weighted=selector.Kind=="weighted_contracts";var mode=weighted?"exact_contracts":selector.Parameters["mode"];
+                    var observationDate=mode=="daily_delivery"?day:sampleDate;
+                    var resolutionAt=mode=="daily_delivery"||!weighted&&selector.Parameters["binding"]=="context"?frame.At:frames[observationDate].At;
+                    var first=mode=="positions"?int.Parse(selector.Parameters["first"],CultureInfo.InvariantCulture):1;
+                    var count=mode=="positions"?int.Parse(selector.Parameters["count"],CultureInfo.InvariantCulture):1;
+                    var selected=weighted?selector.ContractWeights.Where(w=>selector.Inputs[w.SourcePort]==sourceNode.Id).Select(w=>
+                        contracts.SingleOrDefault(k=>k.Contract.Key.Id==w.ContractId)??throw Invalid("A weighted contract must be a member of its exact source curve.")).Distinct().ToImmutableArray():
+                        RecipeEngine.ResolveContracts(contracts,mode,first,count,resolutionAt,sampleDate,requireLive:deliveries is null);
+                    if(admitted is not null)selected=selected.Where(k=>admitted.Contains(new(new(data.DefinitionRevision,reference.Code),observationDate,k.Contract.Key))).ToImmutableArray();
+                    else if(deliveries is not null)selected=selected.Where(k=>deliveries.Contains(new(k.Contract.DeliveryFrom,k.Contract.DeliveryTo))).ToImmutableArray();
+                    if(selected.Any(k=>k.EligibleFrom>resolutionAt||k.Contract.Expiry<=resolutionAt&&sourceNode.ContractTerms is null))throw Invalid("Every mapped contract must be live at its exact sampling instant.");
+                    if(selected.IsEmpty)continue;
+                    if(!required.TryGetValue(observationDate,out var selectedContracts))required.Add(observationDate,selectedContracts=[]);
+                    selectedContracts.UnionWith(selected.Select(c=>c.Contract.Key));
+                }
+            }
+            // The context day's observations are frozen samples read from the same context frame as the live ones.
+            var frozenContracts=new HashSet<ContractKey>();
+            foreach(var (_,observationDate,contract,freezeObservation) in observed.Samples.Where(s=>s.Source==sourceNode.Id&&(admitted is null||admitted.Contains(new(source.Key,s.Date,s.Contract,s.FreezeObservation)))))
+            {
+                if(!required.TryGetValue(observationDate,out var selectedContracts))required.Add(observationDate,selectedContracts=[]);
+                if(freezeObservation)frozenContracts.Add(contract);else selectedContracts.Add(contract);
+            }
+            if(required.Values.Sum(s=>s.Count)+frozenContracts.Count>16384)throw Invalid("The preview exceeds its explicit 16,384 contract-sample bound.");
+            foreach(var (sampleDay,requiredContracts) in required.OrderBy(p=>p.Key))
+            {
+                ct.ThrowIfCancellationRequested();
+                var sampleFrame=frames[sampleDay];
+                var selected=(sampleDay==day?requiredContracts.Union(frozenContracts):requiredContracts).Select(target=>new{Target=target,Source=sourceNode.ContractTerms?.SourceFor(target)??target}).ToArray();
+                var requests=selected.Select(p=>new CurveRequest(new(data.DefinitionRevision,reference.Code),p.Source)).Distinct().ToImmutableArray();
+                var terms=new Dictionary<CurveRequest,ContractPriceTermsBinding>();
+                if(sourceNode.ContractTerms is {} set)
+                foreach(var pair in selected)
+                {
+                    var binding=ContractPriceTermsStore.Binding(data,reference.Code,set.For(pair.Target),data.Contracts.Single(c=>c.Key==pair.Source),publications);
+                    var request=new CurveRequest(new(data.DefinitionRevision,reference.Code),pair.Source);
+                    if(terms.TryGetValue(request,out var prior)&&JsonSerializer.Serialize(prior,RiskJobs.Json)!=JsonSerializer.Serialize(binding,RiskJobs.Json))throw Invalid("One source contract cannot carry conflicting settlement terms.");
+                    terms[request]=binding;
+                }
+                if(terms.Values.Any(t=>t.Terms.Settlement==ContractPriceTerms.PublishedRelease))
+                    terms=await new ContractPriceTermsStore(database).PublicationPrices(connection,data,terms,sampleFrame.At,
+                        SchedulePreview.ParseAt((context??throw Invalid("Publication settlement requires an exact knowledge context.")).KnownAt),ct);
+                if(collectObservations is not null){collectObservations(sampleFrame,requests,sampleDay==day,terms);continue;}
+                var snapshot=await ObservedHistory(observed,sourceNode.Id,sampleDay,day,()=>ReadSourceSnapshot(connection,database,data,sampleFrame,requests,sampleDay==day,retainedObservations,ct,sourceFrame,terms,history));
+                if(sampleDay!=day)snapshot=snapshot with {Id=StableSampleId(snapshot)};
+                foreach(var pair in selected)
+                {
+                    var key=new CurveKey(data.DefinitionRevision,reference.Code);var request=new CurveRequest(key,pair.Source);
+                    var sample=new ConnectedRecipeSample(key,sampleDay,pair.Target,data.Model,snapshot,sampleDay!=day){PriceTerms=terms.GetValueOrDefault(request),MappedContract=sourceNode.ContractTerms is null?null:pair.Source};
+                    if(requiredContracts.Contains(pair.Target))connected.Add(sample);
+                    if(sampleDay==day&&frozenContracts.Contains(pair.Target))connected.Add(sample with{FreezeObservation=true});
+                }
+            }
+        }
+        return new(new(day,frame.At,sources.ToImmutable(),dates.ToImmutable()){Windows=observed.Windows},connected.ToImmutable(),new(calendarPins.ToImmutable(),schedulePins.ToImmutable()),
+            deliveries is null?null:new(deliveries,frames.ToImmutableDictionary(f=>f.Key,f=>f.Value.At)));
+    }
+    static RecipeSource NativeSource(PreviewData data,CurveSourceReference reference)
+    {
+        var curve=data.DefinitionRows("curves","code",reference.Code).Single();
+        var quote=data.QuoteRows(curve.Text("quote_code")).Single();
+        var members=data.DefinitionRows("curve_members","curve_code",reference.Code).OrderBy(r=>r.GetProperty("ordinal").GetInt32()).Select(r=>data.ContractRows(r.Id("contract_id")).Single());
+        return new(new(data.DefinitionRevision,reference.Code),PriceUnit.FromQuote(quote),[..members.Select(contract=>new RecipeContract(contract,SourceEligibleFrom(data,reference.Code,contract)))]);
+    }
+    private sealed record SourceLeaf(SeriesKey Series,ReferenceKey Source,ObservationRole Role,InputUse Use,DateTimeOffset? FinalFrom,ObservationKey? ExactObservation=null);
+    // Select the exact leaves of requested members, rather than every maturity
+    // in their curves. The managed curve model remains the pricing authority.
+    static ImmutableArray<SourceLeaf> SourceLeaves(PreviewData data,InputFrame frame,ImmutableArray<CurveRequest> requests,CancellationToken ct,
+        IReadOnlyDictionary<CurveRequest,ContractPriceTermsBinding>? priceTerms=null)
+    {
+        var leaves=new Dictionary<InputKey,SourceLeaf>();var visited=new HashSet<(CurveRequest,InputUse)>();
+        ReferenceKey Reference(string code)=>new(data.ReferenceRevision,code);
+        void Add(SourceLeaf leaf)
+        {
+            var key=new InputKey(leaf.Series,leaf.Use);
+            if(leaves.TryGetValue(key,out var previous)&&previous!=leaf)
+                throw new MarketDataException("custom_curve_observation_ambiguity","One market input has conflicting source or role requirements.");
+            leaves[key]=leaf;
+        }
+        void Visit(CurveRequest request,InputUse use)
+        {
+            ct.ThrowIfCancellationRequested();if(!visited.Add((request,use)))return;
+            var curve=data.DefinitionRows("curves","code",request.Curve.Code).Single();
+            var contract=data.ContractRows(request.Contract.Id).Single();
+            if(priceTerms?.TryGetValue(request,out var binding)==true)
+            {
+                if(binding.Terms.Settlement==ContractPriceTerms.PublishedRelease)
+                {
+                    var prices=binding.PublicationPrices??throw new MarketDataException("publication_schedule_missing","The selected publication needs an exact occurrence for this contract period.");
+                    var status=PublicationPriceResolution.Inspect(contract,binding,frame.At,frame.At,prices.KnownAt);
+                    if(status.Final is {} final)
+                    {var target=binding.Fixing!;Add(new(target.Series,target.Source,ObservationRole.IndexFixing,InputUse.FrozenFact,prices.Releases.Min(r=>r.Release.PublishedAt),final.Observation));return;}
+                    if(status.State==PublicationPriceStatus.Awaiting)throw new MarketDataException("awaiting_publication",$"Contract {contract.Key.Id} ({contract.DeliveryFrom:yyyy-MM-dd} to {contract.DeliveryTo:yyyy-MM-dd}) has expired and awaits final index {binding.Fixing!.Index.Code}; require-final does not estimate a price.");
+                }
+                else if(binding.Fixing is {} fixing&&frame.At>=fixing.FixingAt)
+                {Add(new(fixing.Series,fixing.Source,ObservationRole.IndexFixing,InputUse.FrozenFact,fixing.FixingAt));return;}
+                if(binding.Terms.Settlement==ContractPriceTerms.ExchangeFinal&&frame.At>=contract.Expiry)use=InputUse.FrozenFact;
+                else if(frame.At>=contract.Expiry&&binding.Terms.Settlement!=ContractPriceTerms.Derived)
+                    throw new MarketDataException("source_expired","The contract expired before its exact required publication; require-final does not carry a stale estimate.");
+            }
+            if(curve.Text("rule")=="direct")
+            {
+                var series=data.QuotedSeries(request.Contract.Id,curve.Text("quote_code")).Single();
+                Add(new(new(data.DefinitionRevision,series.Id("id")),Reference(curve.Text("direct_source_code")),
+                    use==InputUse.FrozenFact?ObservationRole.FinalContractSettlement:PreviewData.ParseRole(curve.Text("direct_role")),use,
+                    use==InputUse.FrozenFact?contract.Expiry:null));
+                return;
+            }
+            foreach(var input in data.DefinitionRows("curve_inputs","curve_code",request.Curve.Code))
+            {
+                if(input.OptionalId("source_series_id") is {} series)
+                    Add(new(new(data.DefinitionRevision,series),Reference(input.Text("numeric_source_code")),PreviewData.ParseRole(input.Text("numeric_role")),InputUse.Variable,null));
+                if(input.OptionalText("source_curve_code") is not {} source)continue;
+                var slot=input.Text("slot") switch {"base"=>InputSlot.Base,"spread"=>InputSlot.Spread,_=>throw Invalid("Unsupported native curve mapping slot.")};
+                var member=data.ContractRows(data.Model.MappedSource(request,slot).Id).Single();
+                var sourceUse=frame.At<member.Expiry?InputUse.Variable:input.Text("expiry_rule")=="freeze_final_future"?InputUse.FrozenFact:
+                    throw new MarketDataException("source_expired","Source expired and its policy requires a live value.");
+                Visit(new(new(data.DefinitionRevision,source),member.Key),sourceUse);
+            }
+        }
+        foreach(var request in requests)Visit(request,InputUse.Variable);
+        return [..leaves.Values];
+    }
+    static async Task<MarketSnapshot> ReadSourceSnapshot(NpgsqlConnection connection,PreviewDatabase database,PreviewData metadata,
+        InputFrame frame,ImmutableArray<CurveRequest> requests,bool exactFrame,bool retainedObservations,CancellationToken ct,InputFrame? sourceFrame=null,
+        IReadOnlyDictionary<CurveRequest,ContractPriceTermsBinding>? priceTerms=null,PreviewHistory? history=null)
+    {
+        var leaves=SourceLeaves(metadata,frame,requests,ct,priceTerms);
+        var publicationPins=leaves.Where(leaf=>leaf.ExactObservation is not null).Select(leaf=>leaf.ExactObservation!.Value.Id).Distinct().ToImmutableArray();
+        var sampleFrame=exactFrame&&sourceFrame is not null?sourceFrame:frame;
+        // This opted-in settlement contract selects its publication fact under
+        // the same certified context. It adds a local frozen dependency without
+        // changing the recorded forward close or any legacy fixing selection.
+        if(!publicationPins.IsEmpty)sampleFrame=sampleFrame with{FrozenObservationIds=
+            [..(sampleFrame.FrozenObservationIds.IsDefault?[]:sampleFrame.FrozenObservationIds).Concat(publicationPins).Distinct()]};
+        if(retainedObservations)
+        {
+            // A bounded planner may retain only publication facts when this
+            // sample has no ordinary close-price dependencies.
+            if(exactFrame)sampleFrame=metadata.HistoryFrame(sampleFrame);
+            return SourceSnapshot(metadata,sampleFrame,leaves,exactFrame,ct);
+        }
+        var windows=exactFrame?ImmutableArray<ObservationWindow>.Empty:HistoryWindows(frame,leaves).ToImmutableArray();
+        var pins=exactFrame?sampleFrame.ObservationIds.Concat(sampleFrame.FrozenObservationIds.IsDefault?[]:sampleFrame.FrozenObservationIds).Distinct().ToImmutableArray():publicationPins;
+        var prefetched=history is not null&&!exactFrame&&pins.IsEmpty?await history.Find(windows,ct):null;
+        var selected=prefetched??await database.ReadObservationWindows(connection,metadata,windows,ct,pins);
+        return SourceSnapshot(selected,sampleFrame,leaves,exactFrame,ct);
+    }
+    static MarketSnapshot SourceSnapshot(PreviewData data,InputFrame frame,ImmutableArray<SourceLeaf> leaves,bool exactFrame,CancellationToken ct)
+    {
+        var available=exactFrame?frame.ObservationIds.Concat(frame.FrozenObservationIds.IsDefault?[]:frame.FrozenObservationIds).Distinct().Select(data.Observation).ToLookup(row=>row.Id("series_id")):null;
+        var selections=ImmutableArray.CreateBuilder<SelectedObservation>();
+        foreach(var leaf in leaves)
+        {
+            var key=new InputKey(leaf.Series,leaf.Use);
+            ct.ThrowIfCancellationRequested();
+            var candidates=(exactFrame?available![leaf.Series.Id]:data.SeriesObservations(leaf.Series.Id)).Where(row=>(leaf.ExactObservation is null||row.Id("id")==leaf.ExactObservation.Value.Id)&&row.Text("source_code")==leaf.Source.Code&&
+                PreviewData.ParseRole(row.Text("role"))==leaf.Role&&row.Text("publication_state")=="final"&&
+                (leaf.FinalFrom is {} expiry?row.Instant("observed_at")>=expiry&&row.Instant("observed_at")<=frame.At:
+                    exactFrame?row.Instant("observed_at")<=frame.At:row.Instant("observed_at")==frame.At)).ToArray();
+            if(!exactFrame)
+            {
+                // A freeze edge names a final contract settlement, not the most
+                // recent ordinary mark. Multiple final events remain ambiguous.
+                var superseded=candidates.Select(row=>row.OptionalId("corrects_id")).OfType<Guid>().ToHashSet();
+                candidates=candidates.Where(row=>!superseded.Contains(row.Id("id"))).ToArray();
+            }
+            if(candidates.Length==0)throw new MarketDataException("missing_observation","An exact required live or final-settlement observation is absent from the selected inputs.");
+            if(candidates.Length!=1)throw new MarketDataException("custom_curve_observation_ambiguity","A required market input has multiple visible observations or final settlement events.");
+            var row=candidates[0];
+            selections.Add(new(key,new(new(data.DefinitionRevision.CatalogId,row.Id("id")),leaf.Series,leaf.Source,leaf.Role,PublicationState.Final,row.Instant("observed_at"),row.Number("value"))));
+        }
+        return new(frame.Id,data.DefinitionRevision,frame.At,frame.At,InputSelectionPolicy.ExactPinnedFinalObservationsNoAgeFiltering,selections.ToImmutable());
+    }
+    static object Result(RecipeResult result,PreviewData data,PinnedContext pin,RecipeDefinition definition,Guid? id,int? version,bool history=false)
+    {
+        var format=new AmountFormat(6,CashTieRule.ToEven,true,true);
+        string Unit(PriceUnit unit)
+        {
+            var currency=data.References["currencies"].Single(r=>r.Text("code")==unit.Currency.Code).Text("display_code");
+            var quantity=data.References["quantity_specifications"].Single(r=>r.Text("code")==unit.Quantity.Code);
+            var denominator=data.References["units"].Single(r=>r.Text("code")==quantity.Text("unit_code")).Text("symbol");
+            return currency+"/"+denominator+(unit.Multiplier==ExactDecimal.Parse("1")?"":" × "+unit.Multiplier);
+        }
+        bool NativeProductSplice()
+        {
+            if(history||result.Points.Any(p=>p.Contracts.Length!=1))return false;
+            var output=definition.Nodes.Single(n=>n.Id==definition.Output);
+            var splice=output.Inputs.TryGetValue("values",out var source)?definition.Nodes.SingleOrDefault(n=>n.Id==source&&n.Kind=="splice"):null;
+            if(splice is null)return false;
+            try{_=RecipeEngine.PowerProductSplice(definition,DateWorkspace.Date(splice.Parameters["from"]),DateWorkspace.Date(splice.Parameters["to"]));return true;}
+            catch(MarketDataException error)when(error.Code=="recipe_definition"){return false;} // Generic splices retain their generic presentation.
+        }
+        var deliverySplice=NativeProductSplice();
+        MarketContract Delivery(RecipePoint point)=>data.ContractRows(point.Contracts.Single().Id).Single();
+        string Day(DateOnly day)=>day.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture);
+        string Tenor(MarketContract c)=>c.DeliveryTo==c.DeliveryFrom.AddDays(1)?"Daily":c.DeliveryFrom.Day==1&&c.DeliveryTo==c.DeliveryFrom.AddMonths(1)?"Monthly":"Period";
+        object Chart()
+        {
+            var unit=result.Points.Length>0?Unit(result.Points[0].Price.Unit):"";
+            if(result.Points.All(p=>p.Dates.Length==1)&&(history||result.Points.GroupBy(p=>p.Position).Any(group=>group.Count()>1)))
+                return new{title="Custom curve history",axis="observation",axisName="Sampling date",unit,
+                    series=result.Points.GroupBy(p=>p.Position).OrderBy(group=>group.Key).Select(group=>new
+                    {
+                        name="Position "+group.Key.ToString(CultureInfo.InvariantCulture),
+                        points=group.OrderBy(p=>p.Dates[0]).Select(p=>new{x=p.Dates[0].ToString("yyyy-MM-dd",CultureInfo.InvariantCulture),y=p.Price.Format(format),label=p.Dates[0].ToString("yyyy-MM-dd",CultureInfo.InvariantCulture),text="Contracts: "+string.Join(", ",p.Contracts.Select(c=>data.ContractRows(c.Id).Single().DeliveryFrom.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture)))})
+                    })};
+            if(deliverySplice)return new{title=definition.Name,axis="observation",axisName="Delivery date",unit,
+                series=new[]{new{name="Price",points=result.Points.Select(p=>{var c=Delivery(p);return new{x=Day(c.DeliveryFrom),y=p.Price.Format(format),label=Day(c.DeliveryFrom)+" · "+Tenor(c),text="Delivery to exclusive: "+Day(c.DeliveryTo)};})}}};
+            return new{title="Custom curve",axis="category",axisName="Curve point",unit,
+                series=new[]{new{name="Price",points=result.Points.Select(p=>new{x=p.Label,y=p.Price.Format(format),label=p.Label})}}};
+        }
+        object Summary()
+        {
+            var units=result.Points.Select(p=>Unit(p.Price.Unit)).Distinct().ToArray();
+            if(units.Length>1)throw new MarketDataException("custom_curve_mixed_units","The preview mixes output units, so no single unit describes it.");
+            var periods=result.Points.SelectMany(p=>p.Contracts).Select(c=>data.ContractRows(c.Id).Single()).Select(c=>(c.DeliveryFrom,c.DeliveryTo)).OrderBy(p=>p.DeliveryFrom).ThenBy(p=>p.DeliveryTo).ToArray();
+            object? Period((DateOnly From,DateOnly To)? period)=>period is {} p?new{from=p.From.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture),to=p.To.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture)}:null;
+            return new{points=result.Points.Length,unavailablePoints=0,
+                firstPeriod=Period(periods.Length>0?periods[0]:null),lastPeriod=Period(periods.Length>0?periods[^1]:null),
+                unit=units.SingleOrDefault()??""};
+        }
+        return new{id,version,context=pin.Context,summary=Summary(),snapshotId=pin.RequireFrame().Id,at=pin.RequireFrame().At,engineVersion=RecipeEngine.Version,
+            columns=deliverySplice?new[]{"Delivery from","Delivery to","Price","Unit","Tenor"}:new[]{"Point","Price","Unit","Samples","Dates","Contracts"},
+            rows=deliverySplice?result.Points.Select(p=>{var c=Delivery(p);return new[]{Day(c.DeliveryFrom),Day(c.DeliveryTo),p.Price.Format(format),Unit(p.Price.Unit),Tenor(c)};}):result.Points.Select(p=>new[]{p.Label,p.Price.Format(format),Unit(p.Price.Unit),p.SampleCount.ToString(CultureInfo.InvariantCulture),string.Join(", ",p.Dates.Select(d=>d.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture))),string.Join(", ",p.Contracts.Select(c=>data.ContractRows(c.Id).Single().DeliveryFrom.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture)))}),
+            chart=Chart(),
+            points=result.Points,
+            inputs=result.Inputs.Select(s=>new{date=s.Date,at=s.At,contract=s.Contract,price=s.Price,observations=s.Observations,fixedValue=s.Fixed}),
+            dependencies=result.Factors.Select(f=>new{series=f.Input.Series,quote=f.Quote,unit=f.Unit,contract=f.Contract,observation=f.Observation,source=f.Source,role=f.Role.ToString()}),
+            trace=new{inputCount=result.Inputs.Length,factorCount=result.Factors.Length,recipe=definition,numericalPolicy=ConnectedCurves.NumericalPolicy,
+                definitionRevision=data.DefinitionRevision,referenceRevision=data.ReferenceRevision,
+                finalSettlementSelection="one_visible_final_event_at_or_after_expiry"}};
+    }
+}

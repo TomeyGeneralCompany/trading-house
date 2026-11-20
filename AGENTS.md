@@ -1,0 +1,147 @@
+# Project instructions
+
+This is the standalone OpenETRM repository. Run commands with this repository as
+the explicit working directory. Do not substitute a similarly named application
+or attach its runtime to this preview. Local preview uses this tree's API and an
+isolated, unmodified PostgreSQL database.
+
+Read `docs/architecture.md` and `docs/plan.md` before changing the application.
+The architecture distinguishes agreed requirements from proposed implementation
+choices. Update the decision record when a decision changes.
+
+## Public repository
+
+- Write original implementation and use neutral, explicitly synthetic examples.
+- Include only material authorized for public distribution. Preserve dependency
+  licenses and required attribution.
+- Keep credentials, local configuration, operational logs and generated artifacts
+  out of the repository.
+- Do not publish conversation transcripts, session exports, internal reasoning or
+  local review logs. Public documentation records technical contracts and verified results.
+- Do not include customer/company names, competing business-product names or
+  comparisons in source, documentation, fixtures or commit messages. Retain the
+  exact technical identifiers and attribution required by dependencies/licenses.
+- As an exception (D150), the model-provider vendor names Anthropic, OpenAI,
+  Google, xAI and Meta and their public API identifiers may appear in source,
+  documentation, fixtures and commit messages. Ship no real token prices.
+- Public market, exchange and market-operator names are permitted. Use synthetic
+  observations; external datasets require verified distribution rights.
+- Inspect the complete staged diff, generated files and commit identity before
+  publishing. Never publish local settings, secrets or test accounts.
+- Preserve copyright and required license notices.
+- Keep architecture drafts and implementation changes local until the user
+  explicitly approves publication. Do not push unapproved changes.
+
+## Architecture
+
+- TypeScript is presentation only. Keep pricing, schedules, TOU evaluation,
+  settlement aggregation, units and other business rules in the managed backend.
+
+- Use TDD for new behavior and bug fixes: write a meaningful failing behavior
+  check first, implement the smallest correct change, then refactor with checks
+  green. Keep tests independent of the implementation's algorithm.
+- Follow DRY and favor simple, elegant code: clear names, small responsibilities
+  and explicit contracts. Share proven common code in `src/OpenEtrm.Shared`;
+  do not create speculative frameworks or a miscellaneous dumping ground.
+- For physical delivery and cash extensions, read `docs/physical-lifecycle-design.md`
+  and `docs/physical-lifecycle-extension-guide.md`. Reuse Instrument/Side and
+  booked physical delivery/lifecycle behavior through explicit composition. Keep
+  economic Side terms immutable and give each booked physical membership its own
+  DeliverySchedule; share behavior rather than assuming shared physical Side
+  instances. When a supported facility flow spans trades, use a shared facility
+  quantity ledger with schedule/constraint views and explicit allocations to
+  their owned Side schedules. Financial hedges do not create physical flows;
+  valid measured breaches remain facts. Other independent operational-resource
+  scopes need their own supported consumer. Those documents
+  distinguish proposed object names from implemented APIs and do not select
+  missing financial policies or authorize unused commodity frameworks. Read
+  `docs/facility-quantity-ledger.md` for the implemented relational operations;
+  reuse its exact source/target relationships and immutable receipts rather than
+  introducing a parallel persistence or event framework.
+  Read `docs/delivery-workbench.md` when adding an operating delivery consumer.
+  Reuse the typed behavior and shared UI contracts; keep interval flows,
+  discrete transfers and stock balances distinct. New molecules or movement
+  methods require explicit supported policies and independent examples, not
+  another commodity switch or inferred measurement/conversion defaults.
+- Only check in work the author would be proud to say they wrote. Review the
+  result for correctness, readability and restraint; remove temporary scaffolding,
+  dead code and needless duplication. Passing tests alone is not that review.
+
+- Add a table, configuration value or dependency only with a named current
+  consumer or a concrete executable baseline use case. A seed row or viewer alone
+  does not establish use. Keep future extensions in the plan until justified.
+- Keep the current units, day-count and compounding implementation small and
+  project-owned. Add broader conventions only for a supported consumer with
+  independent numerical tests. Persist the selected convention and implementation
+  version; no blanket financial-library dependency or imported master catalog.
+
+- NEVER ASSUME user intent. NEVER SILENTLY GO TO DEFAULTS. Financial behavior,
+  mark interpretation, dependencies and fallback policies must be explicit in
+  the selected versioned contract/context; missing, ambiguous or conflicting
+  behavior raises a structured error. UI, imports and agents obey the same rule.
+- All-in marks have no inferred upstream curve exposure. Spread marks consume
+  only explicitly declared dependencies. Never infer a spread from an outright
+  mark, switch pricing modes or allocate exposure from mark levels/correlation.
+- Risk results come from deterministic base/up/down PV evaluations under shared
+  factor scenarios. Identical pinned inputs, models and numerical policy give
+  identical outputs; dependencies identify affected work, not exposure amounts.
+- Use an unmodified database and public, reproducible dependencies.
+- Retain independent, reusable sides and explicit instrument memberships.
+- Every financial instrument derives from `Instrument`. Only `FuturesContract`
+  and exchange-traded `FuturesOptionInstrument` may be leaf instruments without
+  Sides. Every other instrument composes one or more concrete subclasses of the
+  abstract `Side`, including retained-program, cash and physical-claim instruments.
+  Each Side owns its immutable whole-term parameters, schedule generation or
+  exact retained schedule, declared inputs and inherited PV contract. An
+  instrument combines explicit signed memberships; Trade applies its external
+  typed quantity once. Fixed/floating pricing mechanics are reusable economics,
+  not a substitute for concrete asset-specific Side behavior. Retained executable
+  programs must execute through a concrete Side implementation, never bypass
+  Side with an instrument-level program loop. A shared operating plan produces
+  typed quantities/state only; it contains no peer Sides or instrument PV.
+  Follow `docs/instrument-contracts.md` and its composition acceptance gates.
+- Apply shocks to immutable market scenarios, never to individual trades.
+- Treat pricers as black boxes with declared dependencies and explicit inputs.
+- This valuation boundary is non-negotiable: Instruments and Sides resolve their
+  prices from the supplied scenario context and implement their inherited PV
+  contracts. Risk applies generic market shocks, invokes those contracts and
+  buckets the resulting PV differences by the shocked factor/tenor. Never add
+  commodity-specific shock handling or assign exposure outside that repricing.
+- Quantity scaling is a declared capability, separate from market linearity.
+- Futures are baseline products; preserve variation-margin state and outstanding
+  exposure separately. A forward valuation alone does not implement futures.
+- Core reference relationships use exact-version foreign keys, not free-text
+  names or arbitrary JSON relationships. Keep public catalogs synthetic and
+  placeholders non-executable; real data has separate usage/redistribution rights.
+- UI and agent entry points use the same authorized business operations.
+- Model/provider-specific types must not enter domain or calculation contracts.
+- Numerical policy, units, model versions and snapshot identity are calculation
+  inputs. Missing information must not become a successful default result.
+- Historical context carries business/effective time and a resolved knowledge
+  cutoff through every business read, join, calculation and agent operation.
+  Never silently substitute current data or historical permissions.
+  D375 supersedes the former D334 close exception: select the close known in
+  force for its session and business day at the explicit cutoff. A later close
+  or price must not enter an earlier knowledge view. Current authority still
+  applies, and replacing a close does not rewrite retained results.
+- Make every write idempotent (D238). Recording a fact that already exists
+  (the same business key, value and effective time) is a no-op that returns
+  the existing record, never a second row; this covers imports, scrapes,
+  collection jobs, closes and retried commands. A retried command carries its
+  request id and receives its first outcome. A different value for the same
+  business key is a new revision with its own knowledge time, never an
+  overwrite. Reads resolve revisions by knowledge time under an explicit
+  policy, never by row or insertion order.
+
+## Verification and review
+
+- Use isolated disposable resources and synthetic data. Do not operate on
+  existing applications or production when testing.
+- Run relevant correctness and integration checks before publishing changes.
+- Obtain independent adversarial review for changes involving authorization,
+  temporal behavior, async execution, numerical correctness, scenario reuse or
+  release/deployment boundaries. Resolve findings before publication.
+- Benchmarks must identify workload, unique contracts, scenarios, evaluated work,
+  memory and environment. Do not infer performance from trade count alone.
+- Document actual capability and remaining work; a design is not evidence that a
+  feature is implemented or qualified for production.

@@ -1,0 +1,119 @@
+using System.Text.RegularExpressions;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace OpenEtrm.MarketData.Power;
+
+// Captures installed rules once for an unsaved preview. Durable publication and
+// historical rule selection must retain this payload, not resolve its name again.
+public sealed partial class PowerClock
+{
+    private TimeZoneInfo? Zone { get; }
+    public string Id => captured?.Id??Zone!.Id;
+    public string Rules { get; }
+    public string Fingerprint { get; }
+    private PowerClock(TimeZoneInfo zone)
+    {
+        Zone=zone; Rules=zone.ToSerializedString();
+        Fingerprint=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Rules))).ToLowerInvariant();
+    }
+    public DateTimeOffset StartOfDay(DateOnly date) => AtLocal(date,TimeOnly.MinValue);
+    public DateOnly OperatingDate(DateTimeOffset instant)=>DateOnly.FromDateTime(LocalAt(instant).DateTime);
+    public DateTimeOffset AtLocal(DateOnly date,TimeOnly time)
+    {
+        var local=date.ToDateTime(time,DateTimeKind.Unspecified);
+        if(captured is not null)
+        {
+            var candidates=LocalCandidates(local);
+            if(candidates.Length!=1)throw CapturedError();
+            return candidates[0];
+        }
+        if(Zone!.IsInvalidTime(local)||Zone.IsAmbiguousTime(local))
+            throw new MarketDataException("clock_rule","The selected local time must exist and be unambiguous in the pinned clock.");
+        return new(local,Zone.GetUtcOffset(local));
+    }
+    public static PowerClock Capture(TimeZoneInfo zone) => new(zone ?? throw new ArgumentNullException(nameof(zone)));
+    // A reference clock rule: an exact fixed offset .NET can represent, or an installed IANA
+    // zone file whose tzdb release equals the declared one before and after loading it.
+    public static PowerClock FromRule(ClockRule rule,TimeZoneSource source)
+    {
+        switch(rule.Kind)
+        {
+            case "fixed_offset" when rule.FixedOffsetSeconds is int seconds && seconds%60==0 && Math.Abs(seconds)<=14*3600 && rule.IanaZone is null && rule.TzdbVersion is null:
+                return Capture(TimeZoneInfo.CreateCustomTimeZone(rule.Code,TimeSpan.FromSeconds(seconds),rule.Code,rule.Code));
+            case "iana" when rule.FixedOffsetSeconds is null && rule.IanaZone is {} zone && !string.IsNullOrWhiteSpace(rule.TzdbVersion):
+                if(!Regex.IsMatch(zone,@"\A[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+)*\z",RegexOptions.CultureInvariant) || !source.HasZoneFile(zone))
+                    throw new MarketDataException("clock_rule",$"Clock rule {rule.Code} does not name an installed IANA zone.");
+                var before=source.Version();
+                if(before!=rule.TzdbVersion)
+                    throw new MarketDataException("clock_tzdb",$"Clock rule {rule.Code} declares tzdb {rule.TzdbVersion}; the installed rules are {before}.");
+                // Drop cached zones so the loaded rules come from the release just verified.
+                TimeZoneInfo.ClearCachedData();
+                PowerClock clock;
+                try { clock=Capture(TimeZoneInfo.FindSystemTimeZoneById(zone)); }
+                catch(Exception e) when(e is TimeZoneNotFoundException or InvalidTimeZoneException) { throw new MarketDataException("clock_rule",$"Clock rule {rule.Code} names an unreadable IANA zone."); }
+                if(source.Version()!=before)
+                    throw new MarketDataException("clock_tzdb","The installed time-zone database changed while loading the clock; try again.");
+                return clock;
+            default:
+                throw new MarketDataException("clock_rule",$"Clock rule {rule.Code} is not a complete fixed-offset or IANA rule.");
+        }
+    }
+}
+
+public sealed record ClockRule(string Code,string Kind,int? FixedOffsetSeconds,string? IanaZone,string? TzdbVersion);
+
+public sealed record PowerInterval(DateTimeOffset Start, DateTimeOffset End, DateOnly OperatingDate,
+    int HourBeginning, int HourEnding, int Minute, int OffsetMinutes, int Occurrence, bool Holiday)
+{
+    public DeliveryInterval Delivery => new(Start, End, OperatingDate, HourBeginning, Minute, Occurrence);
+}
+
+public static class PowerHours
+{
+    public static PowerInterval[] Compile(DateOnly from,DateOnly to,PowerClock clock,TimeOfUse mask,
+        DateOnly[] holidays,int intervalMinutes)
+    {
+        if(to<=from || to.DayNumber-from.DayNumber>366 || from.Year<2000 || to.Year>2100)
+            throw new MarketDataException("power_period","Choose a period of 1–366 days within 2000–2099.");
+        if(intervalMinutes is not (5 or 15 or 30 or 60) || mask.Minutes%intervalMinutes!=0)
+            throw new MarketDataException("tou_resolution","The interval must divide each mask cell exactly.");
+        if(holidays is null || holidays.Length>366 || holidays.Distinct().Count()!=holidays.Length)
+            throw new MarketDataException("power_holidays","Supply an explicit list of distinct holiday dates.");
+        DateTimeOffset Midnight(DateOnly day)=>clock.StartOfDay(day).ToUniversalTime();
+        var start=Midnight(from); var end=Midnight(to); var step=TimeSpan.FromMinutes(intervalMinutes);
+        if((end-start).Ticks%step.Ticks!=0)
+            throw new MarketDataException("power_clock","Clock transitions must align with the selected intervals.");
+        var grid=OpenEtrm.Shared.Temporal.UtcGrid.Uniform(start,end,step,int.MaxValue-1);
+        var selection=mask.Select(grid,clock,holidays);
+        var closed=holidays.ToHashSet(); var intervals=new List<PowerInterval>();
+        var occurrences=new Dictionary<(DateOnly,int,int),int>();
+        for(int slot=0;slot<grid.Count;slot++)
+        {
+            var at=grid.Start(slot);
+            var local=clock.LocalAt(at);
+            var day=DateOnly.FromDateTime(local.DateTime);
+            var key=(day,local.Hour,local.Minute);
+            var occurrence=occurrences.GetValueOrDefault(key)+1;occurrences[key]=occurrence;
+            var holiday=closed.Contains(day);
+            if(selection.Contains(slot))
+                intervals.Add(new(at,at+step,day,local.Hour,local.Hour+1,local.Minute,(int)local.Offset.TotalMinutes,occurrence,holiday));
+        }
+        return intervals.ToArray();
+    }
+
+    // A cell starts on a whole local minute that is a multiple of its length and lies inside one
+    // UTC offset. A clock transition cutting through it makes it no cell: a local label is never stretched.
+    internal static bool IsCell(PowerClock clock,DateTimeOffset start,TimeSpan step)
+    {
+        var local=clock.LocalAt(start);
+        var last=clock.LocalAt(start+step-TimeSpan.FromTicks(1));
+        return clock.ConstantOffset(start,start+step) && local.Offset==last.Offset && local.Minute%(int)step.TotalMinutes==0 && local.TimeOfDay.Ticks%TimeSpan.TicksPerMinute==0;
+    }
+
+    public static string Label(PowerInterval interval,bool hourEnding) =>
+        $"{interval.OperatingDate.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture)} · {(hourEnding?"HE":"HB")}{(hourEnding?interval.HourEnding:interval.HourBeginning):D2}"+
+        (interval.Minute==0?"":$" +{interval.Minute:D2}m")+
+        (interval.Occurrence>1?" · repeat":"");
+}

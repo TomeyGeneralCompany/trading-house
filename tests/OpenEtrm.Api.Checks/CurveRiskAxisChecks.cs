@@ -1,0 +1,201 @@
+using System.Collections.Immutable;
+using System.Globalization;
+using OpenEtrm.Api;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.Calculation;
+using OpenEtrm.MarketData.CustomCurves;
+using OpenEtrm.MarketData.Risk;
+using OpenEtrm.MarketData.Trading;
+using OpenEtrm.Rates;
+
+internal static class CurveRiskAxisChecks
+{
+    public static void Run(PreviewData data,InputFrame frame)
+    {
+        var snapshot=data.Snapshot(frame);var factor=data.Model.QuoteFactors(snapshot).First();
+        foreach(var (from,to,expected) in new[]{((2026,11,1),(2026,12,1),"Nov 2026"),((2026,11,1),(2027,2,1),"Nov 2026 – Jan 2027"),((2021,1,1),(2021,1,2),"Jan 1, 2021"),((2021,1,1),(2021,1,15),"Jan 1, 2021 to Jan 15, 2021, exclusive")})
+        {
+            var label=CurveRiskAxes.PeriodLabel(new(from.Item1,from.Item2,from.Item3),new(to.Item1,to.Item2,to.Item3));
+            if(label!=expected)throw new Exception($"A factor's delivery period reads as calendar dates: expected {expected}, got {label}.");
+        }
+        var request=new CurveRequest(factor.Curves[0],factor.Contract);
+        var previousCulture=CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture=CultureInfo.GetCultureInfo("th-TH");
+            var bucket=new DeliveryBucketCurveTarget(request.Curve,new(2020,12,1),new(2021,1,1),DeliveryBucketCurveTarget.WholeDelivery);
+            var wire=CurveRiskAxes.Request(bucket);
+            if(wire.From!="2020-12-01"||wire.To!="2021-01-01"||CurveRiskAxes.Target(wire)!=bucket)
+                throw new Exception("Curve target dates must round-trip as invariant Gregorian ISO dates.");
+        }
+        finally{CultureInfo.CurrentCulture=previousCulture;}
+
+        var context=new ResolvedCalculationContext(snapshot.Id,"synthetic-catalog-history",snapshot.ValuationAt,
+            snapshot.ValuationAt,snapshot.ValuationAt,snapshot.MarketCutoff);
+        var current=data.Model.Compile(snapshot,[request],false,context);
+        var original=snapshot.Selections.Single(s=>s.Input==factor.Input).Observation;
+        var earlier=snapshot with{Id=Guid.NewGuid(),ValuationAt=snapshot.ValuationAt.AddDays(-1),MarketCutoff=snapshot.MarketCutoff.AddDays(-1),
+            Selections=[new(factor.Input,original with{Key=new(original.Key.CatalogId,Guid.NewGuid()),ObservedAt=snapshot.MarketCutoff.AddDays(-1)})]};
+        var history=data.Model.Compile(earlier,[request],true,context);
+        var live=current.Points[(request,InputUse.Variable)];var frozen=history.Points[(request,InputUse.Variable)];
+        var contract=current.Definitions.SelectMany(d=>d.Points).Single(p=>p.Key==live).Contract!;
+        var output=new CurvePointKey(new(snapshot.Definitions,"synthetic_history_mean"),Guid.NewGuid());
+        var definition=new ConnectedCurveDefinition(output.Curve,[new(output,contract.DeliveryFrom,contract.DeliveryTo,factor.Unit,
+            new ConnectedWeightedMean([new(CurvePointReference.Exact(live),ExactDecimal.Parse("1")),new(CurvePointReference.Exact(frozen),ExactDecimal.Parse("1"))]))]);
+        var plan=ConnectedCurves.Compile(ConnectedCurves.MergeDefinitions(current.Definitions.Concat(history.Definitions).Append(definition)),
+            [output],context,new Visible());
+        var scenario=ConnectedScenario.Base(plan);var dependency=new CurveRequest(output.Curve,factor.Contract);
+        // One holding of one unit of an instrument, as the portfolio adapter materializes it.
+        ValuationPortfolio Holding(Instrument held)=>new([held],[new(Guid.NewGuid(),Guid.NewGuid(),Guid.NewGuid(),held.Id,
+            held.UnitQuantity,new(new Money(default,held.Currency),held.UnitQuantity.Specification),new(default,held.Currency))],
+            new(ValuationMeasure.PresentValue,ImmutableDictionary<Guid,FuturesMarketBinding>.Empty,null));
+        var instrument=new MeanInstrument(dependency,factor.Unit);
+        var portfolio=Holding(instrument);
+        var prepared=RiskEngine.PrepareConnected(ConnectedValuation.Prepare(scenario,snapshot,[earlier]),
+            ImmutableDictionary<CurveRequest,CurvePointKey>.Empty.Add(dependency,output),[portfolio]);
+        var market=new PortfolioValuation.MarketPartition(data,frame,snapshot,prepared,[PortfolioValuation.SwapMeasure],
+            new(snapshot.Definitions.RevisionId,plan.ManifestId,FuturesMarketBinding.Implementation,[],[]),new(2,2));
+        var policy=new PortfolioValuationPolicy(CurveModel.NumericalPolicy,RiskEngine.ExactNumericalPolicy,FuturesRisk.Implementation,
+            SwapStore.Convention,ZeroRateCurve.Policy,DiscountInterpolation.Policy,QuoteBump.Convention,"trading_tick",1);
+        var operation=new PortfolioValuation.Prepared(snapshot.Id,new(snapshot.ValuationAt.ToString("yyyy-MM-dd"),null,
+            snapshot.ValuationAt.ToString("O"),snapshot.Id),policy,[market],[],[],[]);
+        var catalog=CurveRiskAxes.Catalog(operation,default);
+        var quote=CurveRiskAxes.Quote(operation,factor,default);
+        if(!quote.Label.Contains("selected points",StringComparison.Ordinal))
+            throw new Exception("A primitive quote point target must not be labeled as a computed output.");
+        if(quote.Target is not PointCurveTarget||!quote.Points.SequenceEqual([live])||!catalog.Any(a=>a.Id==quote.Id)||
+            catalog.Any(a=>a.Coordinate==CurveShockCoordinate.MarketQuote&&a.Target is ParallelCurveTarget))
+            throw new Exception("A mixed live/frozen contract must expose its exact live quote coordinate without shocking history.");
+        var run=RiskEngine.CalculateExact(prepared,[new(quote.Coordinate,quote.Target,quote.Unit,factor.TradingTick,ConnectedRiskBump.Convention)],RiskEngine.ExactNumericalPolicy);
+        if(run.Groups.Single().Factors.Single().Totals.Single().Values.Delta.Value.ToMoney().Amount!=factor.Unit.Multiplier*ExactDecimal.Parse("0.5"))
+            throw new Exception("A current quote contributes one half of this explicit equal-weight historical mean.");
+        try{CurveRiskAxes.Resolve(market,CurveShockCoordinate.MarketQuote,new ContractCurveTarget(request.Curve,request.Contract),default);
+            throw new Exception("A whole-contract request silently skipped a frozen historical point.");}
+        catch(MarketDataException error)when(error.Code=="scenario_coordinate"){}
+        Console.WriteLine("PASS curve risk axes: live historical-mean factor selection, frozen target rejection and exact half sensitivity");
+
+        // What the presets Shock every held contract and Parallel shift shock. This held price is an equal-weight mean of a live and a
+        // historical point, which no scenario coordinate publishes: no target covers it, so it is named, and no broader or narrower
+        // target is shocked in its place.
+        var unpublished=CurveRiskAxes.Held(operation,catalog,default);
+        if(!unpublished.Contracts.IsEmpty||!unpublished.Curves.IsEmpty||
+            !unpublished.ContractsWithoutTarget.SequenceEqual([$"{output.Curve.Code} · {CurveRiskAxes.PeriodLabel(contract.DeliveryFrom,contract.DeliveryTo)}"])||
+            !unpublished.CurvesWithoutTarget.SequenceEqual([output.Curve.Code]))
+            throw new Exception("A held price that no scenario coordinate publishes must be named, and no other target shocked in its place.");
+        // A held price that is a whole live contract is shocked by its contract target, and its curve by its whole-curve target.
+        var directPlan=ConnectedCurves.Compile(current.Definitions,[live],context,new Visible());
+        var directPrepared=RiskEngine.PrepareConnected(ConnectedValuation.Prepare(ConnectedScenario.Base(directPlan),snapshot),
+            ImmutableDictionary<CurveRequest,CurvePointKey>.Empty.Add(request,live),[Holding(new MeanInstrument(request,factor.Unit))]);
+        var direct=operation with{Markets=[market with{Connected=directPrepared,
+            Evidence=new(snapshot.Definitions.RevisionId,directPlan.ManifestId,FuturesMarketBinding.Implementation,[],[])}]};
+        var whole=CurveRiskAxes.Held(direct,CurveRiskAxes.Catalog(direct,default),default);
+        var heldContract=CurveRiskAxes.Resolve(direct.Markets[0],CurveShockCoordinate.MarketQuote,new ContractCurveTarget(request.Curve,request.Contract),default);
+        var heldCurve=CurveRiskAxes.Resolve(direct.Markets[0],CurveShockCoordinate.MarketQuote,new ParallelCurveTarget(request.Curve),default);
+        if(!whole.Contracts.SequenceEqual([heldContract.Id])||!whole.Curves.SequenceEqual([heldCurve.Id])||
+            !whole.ContractsWithoutTarget.IsEmpty||!whole.CurvesWithoutTarget.IsEmpty)
+            throw new Exception("A held live contract must be shocked by its exact contract target, and its curve by its whole-curve target.");
+        Console.WriteLine("PASS curve risk axes: a held live contract has its contract and curve targets, and a held price no coordinate publishes is named instead");
+        var tolerance=new RiskToleranceRequest("0","0");
+        void RefuseJoint(PortfolioValuation.Prepared selected,PortfolioJointRiskRequest input)
+        {
+            try{PortfolioJointRisk.Resolve(selected,input,default);}
+            catch(MarketDataException error)when(error.Code=="risk_joint_contract"){return;}
+            throw new Exception("Joint admission accepted overlapping targets that would fail only after queueing.");
+        }
+        RefuseJoint(direct,new(PortfolioJointRiskRequest.Version1,new("overlap","1",ConnectedRiskScenarioSet.Independent,
+            [new("one","Overlapping curve and contract",[new(heldCurve.Request,"1",CurveShift.ParentAdditive),new(heldContract.Request,"1",CurveShift.ParentAdditive)])]),null));
+        var originalPoint=current.Definitions.SelectMany(d=>d.Points).Single(p=>p.Key==live);
+        var aliasCurve=new CurveKey(live.Curve.Revision,"synthetic_source_alias");
+        var sourceAlias=originalPoint with{Key=new(aliasCurve,Guid.NewGuid()),Expression=((ConnectedSource)originalPoint.Expression) with{Request=request with{Curve=aliasCurve}}};
+        var aliasPlan=ConnectedCurves.Compile(current.Definitions.Add(new(aliasCurve,[sourceAlias])),[live,sourceAlias.Key],context,new Visible());
+        var aliasPrepared=RiskEngine.PrepareConnected(ConnectedValuation.Prepare(ConnectedScenario.Base(aliasPlan),snapshot),
+            ImmutableDictionary<CurveRequest,CurvePointKey>.Empty.Add(request,live),[Holding(new MeanInstrument(request,factor.Unit))]);
+        var aliasOperation=operation with{Markets=[market with{Connected=aliasPrepared}]};
+        var firstAliasAxis=CurveRiskAxes.Resolve(aliasOperation.Markets[0],CurveShockCoordinate.MarketQuote,new PointCurveTarget(live.Curve,[live.PointId]),default);
+        var secondAliasAxis=CurveRiskAxes.Resolve(aliasOperation.Markets[0],CurveShockCoordinate.MarketQuote,new PointCurveTarget(aliasCurve,[sourceAlias.Key.PointId]),default);
+        RefuseJoint(aliasOperation,new(PortfolioJointRiskRequest.Version1,null,new(ConnectedFiniteDifferenceRequest.HalfNominalDouble,
+            [new("first",new(firstAliasAxis.Request,"1",ConnectedRiskBump.Convention),tolerance,tolerance),
+             new("alias",new(secondAliasAxis.Request,"1",ConnectedRiskBump.Convention),tolerance,tolerance)],
+            [new("pair","first","alias",tolerance)])));
+        RefuseJoint(aliasOperation,new(PortfolioJointRiskRequest.Version1,new("aliases","1",ConnectedRiskScenarioSet.Independent,
+            [new("one","Aliased shared input",[new(firstAliasAxis.Request,"1",CurveShift.ParentAdditive),new(secondAliasAxis.Request,"1",CurveShift.ParentAdditive)])]),null));
+        Console.WriteLine("PASS joint admission: overlapping curve/contract targets and source aliases refuse before pricing or queueing");
+        RecipeNode Node(string id,string kind,ImmutableDictionary<string,string>? parameters=null,ImmutableDictionary<string,string>? inputs=null)=>
+            new(id,kind,parameters??ImmutableDictionary<string,string>.Empty,inputs??ImmutableDictionary<string,string>.Empty);
+        var recipe=new RecipeDefinition("synthetic_output_labels","Synthetic mapped curve",[
+            Node("source","source",ImmutableDictionary<string,string>.Empty.Add("curve",request.Curve.Code)),
+            new("select","weighted_contracts",ImmutableDictionary<string,string>.Empty.Add("aggregation",RecipeEngine.SignedSum),
+                ImmutableDictionary<string,string>.Empty.Add("source_a","source"),[new(1,"source_a",request.Contract.Id,"1"),new(2,"source_a",request.Contract.Id,"2")]),
+            Node("dates","dates",ImmutableDictionary<string,string>.Empty.Add("mode","context")),
+            Node("sample","sample",inputs:ImmutableDictionary<string,string>.Empty.Add("selection","select").Add("dates","dates")),
+            Node("out","output",inputs:ImmutableDictionary<string,string>.Empty.Add("values","sample"))],"out");
+        var date=DateOnly.FromDateTime(snapshot.ValuationAt.UtcDateTime);
+        var recipeInputs=new RecipeInputs(date,snapshot.ValuationAt,
+            ImmutableDictionary<string,RecipeSource>.Empty.Add("source",new(request.Curve,factor.Unit,[new(contract,snapshot.ValuationAt.AddYears(-1))])),
+            ImmutableDictionary<string,ImmutableArray<DateOnly>>.Empty.Add("dates",[date]));
+        var saved=RecipeEngine.Connect(recipe,recipeInputs,new(snapshot.Definitions.CatalogId,Guid.NewGuid(),7,RecipeEngine.Version),
+            [new(request.Curve,date,request.Contract,data.Model,snapshot,false)],context);
+        var savedPlan=ConnectedCurves.Compile(saved.Definitions,saved.Outputs.Select(o=>o.Point).ToImmutableArray(),context,new Visible());
+        var savedPrepared=RiskEngine.PrepareConnected(ConnectedValuation.Prepare(ConnectedScenario.Base(savedPlan),snapshot),
+            ImmutableDictionary<CurveRequest,CurvePointKey>.Empty.Add(dependency,saved.Outputs[0].Point),[portfolio]);
+        var savedMarket=market with{Connected=savedPrepared,Evidence=new(snapshot.Definitions.RevisionId,savedPlan.ManifestId,FuturesMarketBinding.Implementation,[],[])};
+        var labels=saved.Outputs.Select(o=>CurveRiskAxes.Resolve(savedMarket,CurveShockCoordinate.ComputedOutput,
+            new PointCurveTarget(saved.Curve,[o.Point.PointId]),default).Label).ToArray();
+        if(labels.Distinct().Count()!=2||!labels[0].Contains("version 7",StringComparison.Ordinal)||
+            !labels[0].Contains("output position 1",StringComparison.Ordinal)||!labels[1].Contains("output position 2",StringComparison.Ordinal))
+            throw new Exception("Saved outputs sharing one delivery period must retain version and distinct output-position labels.");
+        var selected=CurveRiskAxes.Resolve(savedMarket,CurveShockCoordinate.ComputedOutput,
+            new PointCurveTarget(saved.Curve,saved.Outputs.Reverse().Select(o=>o.Point.PointId).ToImmutableArray()),default).Label;
+        var parallel=CurveRiskAxes.Resolve(savedMarket,CurveShockCoordinate.ComputedOutput,new ParallelCurveTarget(saved.Curve),default);
+        if(!selected.Contains("output positions 1, 2",StringComparison.Ordinal)||!parallel.Label.Contains("version 7",StringComparison.Ordinal))
+            throw new Exception("A multi-output selection must list its stable positions and a broad target must retain the saved version.");
+        Console.WriteLine("PASS curve risk axes: saved versions and explicit output positions distinguish equal delivery periods");
+        // A custom curve's output is no contract: the contract preset names it by its output's label, and the curve preset shifts
+        // the whole output curve it is on.
+        var savedOperation=operation with{Markets=[savedMarket]};
+        var outputs=CurveRiskAxes.Held(savedOperation,CurveRiskAxes.Catalog(savedOperation,default),default);
+        if(!outputs.Contracts.IsEmpty||!outputs.Curves.SequenceEqual([parallel.Id])||!outputs.ContractsWithoutTarget.SequenceEqual([labels[0]])||
+            !outputs.CurvesWithoutTarget.IsEmpty)
+            throw new Exception("A held custom-curve output must be named for the contract preset, and its whole output curve shifted by the curve preset.");
+        Console.WriteLine("PASS curve risk axes: a held custom-curve output is named for the contract preset and shifted with its whole output curve");
+        var originalHolding=portfolio.Positions.Single();
+        var nativeOwners=new[]{new AccountingOwnerKey(AccountingOwnerKind.NativeHolding,originalHolding.TradeId),new AccountingOwnerKey(AccountingOwnerKind.NativeHolding,Guid.NewGuid())};
+        var ownedPositions=ImmutableArray.Create(originalHolding).AddRange(nativeOwners.Select(owner=>new RiskPosition(owner,originalHolding.BindingId,
+            originalHolding.BookId,originalHolding.ValuationId,originalHolding.Quantity,originalHolding.UnitBasis,originalHolding.FixedBasis)));
+        var ownedPortfolio=new ValuationPortfolio(portfolio.Instruments,ownedPositions,portfolio.Setup);
+        var ownedMarket=market with{Connected=RiskEngine.PrepareConnected(prepared.Valuation,
+            ImmutableDictionary<CurveRequest,CurvePointKey>.Empty.Add(dependency,output),[ownedPortfolio])};
+        var owned=operation with{Markets=[ownedMarket],Positions=[..ownedPositions.Select(p=>new PortfolioPositionEvidence(p.TradeId,1,p.BindingId,p.ValuationId,p.ValuationId,
+            p.BookId,PortfolioValuation.SwapMeasure,snapshot.Definitions.RevisionId,1,p.Quantity){Owner=p.Owner,TradeReference="Synthetic holding",InstrumentType="financial_swap"})]};
+        var ownedJoint=PortfolioJointRisk.Resolve(owned,new(PortfolioJointRiskRequest.Version1,null,new(ConnectedFiniteDifferenceRequest.HalfNominalDouble,
+            [new("quote",new(quote.Request,"1",ConnectedRiskBump.Convention),tolerance,tolerance)],[])),default);
+        var ownedRisk=PortfolioJointCalculation.Calculate(owned,ownedJoint,[],RiskDetail.Holdings,default);
+        if(ownedRisk.Derivatives.Any(d=>d.Positions.Length!=3||d.Positions.Select(p=>p.Position.Owner).Distinct().Count()!=3))
+            throw new Exception("Portfolio derivative aggregation lost distinct independent owners.");
+        var riskRequest=new PortfolioRiskRequest(new(frame.Id,null,"current"),[originalHolding.BookId],[],[],PortfolioRiskPreview.Convention,
+            RiskEngine.ExactNumericalPolicy,policy,Detail:"holdings",Stress:[]);
+        var books=ImmutableArray.Create(System.Text.Json.JsonSerializer.SerializeToElement(new{id=originalHolding.BookId,name="Synthetic book"}));
+        var shown=PortfolioRiskPreview.Calculate(new(riskRequest,RiskDetail.Holdings,[originalHolding.BookId],books,owned,[],[],[]){Joint=ownedJoint},default);
+        var json=System.Text.Json.JsonSerializer.SerializeToElement(shown,RiskJobs.Json);
+        if(json.GetProperty("joint").GetProperty("derivatives").EnumerateArray().Any(d=>d.GetProperty("positions").EnumerateArray()
+            .Select(p=>(p.GetProperty("owner").GetProperty("kind").GetInt32(),p.GetProperty("owner").GetProperty("id").GetGuid())).Distinct().Count()!=3))
+            throw new Exception("The portfolio presentation erased the typed ownership boundary.");
+        Console.WriteLine("PASS portfolio independent owners retain separate derivative rows and presentation across equal native/trade identifiers");
+    }
+    private sealed class Visible:ICurveBindingResolver
+    {
+        public CurveKey Resolve(LogicalCurveKey curve,ResolvedCalculationContext context)=>throw new NotSupportedException();
+        public void RequireVisible(CurveKey curve,ResolvedCalculationContext context){}
+    }
+    private sealed record MeanInstrument:ApiSidedProbe
+    {
+        public override bool SupportsQuantityScaling=>true;
+        private readonly CurveRequest dependency;
+        public override ReferenceKey Currency{get;}
+        public override Quantity UnitQuantity{get;}
+        public MeanInstrument(CurveRequest dependency,PriceUnit unit):base(Guid.NewGuid(),unit.Currency,unit.Quantity,[dependency],
+            context=>context.ExactPrice(dependency).ExactTimes(new(ExactDecimal.Parse("1"),unit.Quantity)),"synthetic_history_mean_pv_v1")
+        {this.dependency=dependency;Currency=unit.Currency;UnitQuantity=new(ExactDecimal.Parse("1"),unit.Quantity);}
+        public override UnitPricingContract Declare(UnitValuationContext context)=>new(Id,"synthetic_history_mean_pv_v1",[dependency],UnitQuantity.Specification,Currency) { Time = ValuationTimeDependency.Independent };
+    }
+}

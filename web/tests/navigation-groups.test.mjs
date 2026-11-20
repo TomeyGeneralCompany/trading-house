@@ -1,0 +1,182 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {navigationGroups,pageGroup,pageAvailable,firstPage} from '../dist/navigation-groups.js';
+import {consoleAreas} from '../dist/console-menu.js';
+
+const allPages=navigationGroups.flatMap(g=>g.pages);
+const listed=permissions=>allPages.filter(page=>pageAvailable(page,permissions));
+
+test('physical product workflows remain Trading pages while saved views provide personal sidebar entries',()=>{
+ for(const page of ['gas','crude']){assert.equal(pageGroup(page),'Trading');assert.equal(allPages.includes(page),false);assert.equal(pageAvailable(page,['ReadMarketData','ReadTrades']),true);}
+});
+
+test('every page belongs to exactly one group and Overview comes first',()=>{
+ const pages=navigationGroups.flatMap(g=>g.pages);
+ assert.equal(new Set(pages).size,pages.length);assert.equal(navigationGroups[0].label,'Overview');assert.equal(pageGroup('dashboard'),'Overview');
+ assert.equal(pageGroup('parties'),'Reference Data');assert.equal(pageGroup('admin'),'Administration');assert.equal(pageGroup('jobs'),'Administration');
+});
+test('the groups and their pages keep the sidebar order',()=>{
+ assert.deepEqual(navigationGroups.map(g=>[g.id,g.label,[...g.pages]]),[
+  ['overview','Overview',['dashboard']],
+  ['trading','Trading',['new-trade','futures','options']],
+  ['markets','Markets',['market','delivery','interval-series','vol-surfaces','interval-curves']],
+  ['risk','Risk',['risk','risk-pnl','risk-scenarios','risk-var','risk-runs']],
+  ['scheduling','Scheduling',['lifecycle','physical-operations','facilities','physical-power','rec-inventory']],
+  ['reference','Reference Data',['reference']],
+  ['administration','Administration',['jobs','admin','ai']]]);
+});
+test('PPA bookings is a Trading page the Blotter opens, not a sidebar entry',()=>{
+ assert.equal(pageGroup('ppa'),'Trading');assert.ok(!allPages.includes('ppa'));
+ assert.equal(pageAvailable('ppa',['ReadMarketData','ReadTrades']),true);assert.equal(pageAvailable('ppa',['ReadMarketData']),false);
+});
+test('native crude delivery evidence opens Facilities for ordinary trade readers',()=>{
+ assert.equal(pageAvailable('facilities',['ReadMarketData','ReadTrades']),true);
+ assert.equal(pageAvailable('facilities',['ReadMarketData','ReadTrades','ReadFacilityQuantities']),true);
+ for(const permissions of [[],['ReadMarketData'],['ReadTrades'],['ReadFacilityQuantities']])assert.equal(pageAvailable('facilities',permissions),false);
+});
+
+test('Transport capacity can be reached without physical-facility authority',()=>{
+ assert.equal(pageAvailable('facilities',['ReadMarketData','ReadTrades','ReadGasOperations']),true);
+ for(const permissions of [['ReadMarketData','ReadGasOperations'],['ReadTrades','ReadGasOperations']])assert.equal(pageAvailable('facilities',permissions),false);
+});
+test('Delivery setup sits in the console and Facilities in Scheduling without widening pool authority',()=>{
+ for(const page of ['gas-setup','crude-setup']){assert.equal(pageGroup(page),'Reference Data');assert.ok(!allPages.includes(page));}
+ assert.equal(pageGroup('facilities'),'Scheduling');assert.ok(allPages.includes('facilities'));
+ assert.throws(()=>pageAvailable('physical',['ReadMarketData']),/could not load/);
+ assert.equal(pageAvailable('gas-setup',['ReadMarketData']),true);
+ assert.equal(pageAvailable('crude-setup',['ReadMarketData']),true);
+ assert.equal(pageAvailable('facilities',['ReadMarketData']),false);
+});
+test('a page outside every group is refused instead of given a default heading',()=>{
+ assert.throws(()=>pageGroup('unknown'),/could not load/);
+});
+test('trade readers start on the Blotter; market readers on curves; others by permission',()=>{
+ assert.equal(firstPage(['ReadMarketData','ReadTrades']),'futures');
+ assert.equal(firstPage(['ReadMarketData']),'market');
+ assert.equal(firstPage(['ManageAccess','ManageIdentities']),'admin');
+ assert.equal(firstPage([]),null);
+});
+test('each first page needs every permission its navigation entry needs',()=>{
+ // The Blotter lists trades valued against market data, so trades alone do not open it.
+ assert.equal(firstPage(['ReadTrades']),null);
+ assert.equal(firstPage(['ManageAccess']),'admin');
+ assert.equal(pageAvailable('admin',['ManageAccess']),true,'access policy administration must not require identity administration');
+ assert.equal(firstPage(['ManageIdentities']),null);
+ assert.equal(firstPage(['ReadTradeParties','RunJobs']),null);
+});
+test('AI settings are the first page when the account holds any AI permission and nothing before it',()=>{
+ for(const permission of ['ReadModelUsage','ManageModelProviders','ManageAgents'])assert.equal(firstPage([permission]),'ai');
+ assert.equal(firstPage(['ManageAgents','ManageAccess','ManageIdentities']),'admin');
+});
+test('market data outranks administration and the Blotter outranks plain market reading',()=>{
+ assert.equal(firstPage(['ManageAccess','ManageIdentities','ReadMarketData']),'market');
+ assert.equal(firstPage(['ManageAgents','ReadMarketData','ReadTrades','ManageAccess','ManageIdentities']),'futures');
+});
+
+test('the sidebar lists each page for the permissions that open it',()=>{
+ const market=['dashboard','market','delivery','interval-series','interval-curves','reference'];
+ assert.deepEqual(listed(['ReadMarketData','RunJobs']).sort(),[...market,'jobs'].sort());
+ assert.deepEqual(listed(['ReadMarketData','ReadTrades','ReadTradeParties']).sort(),[...market,'jobs','lifecycle','physical-operations','facilities','new-trade','futures','options','vol-surfaces','rec-inventory'].sort());
+ assert.deepEqual(listed(['ReadMarketData','ReadTrades']).sort(),[...market,'jobs','lifecycle','physical-operations','facilities','new-trade','futures','options','vol-surfaces','rec-inventory'].sort());
+ assert.deepEqual(listed(['ReadMarketData','ReadTradeParties']).sort(),[...market,'jobs'].sort());
+ assert.deepEqual(listed(['ManageAccess','ManageIdentities']),['jobs','admin']);
+ assert.deepEqual(listed(['ManageAgents']),['jobs','ai']);
+ assert.deepEqual(listed([]),['jobs']);
+});
+test('dashboard is listed for ReadMarketData accounts only',()=>{
+ assert.equal(pageAvailable('dashboard',['ReadMarketData']),true);
+ for(const other of [[],['ReadTrades'],['ManageAccess','ManageIdentities'],['RunJobs','ReadTradeParties']])assert.equal(pageAvailable('dashboard',other),false);
+ assert.equal(firstPage(['ReadMarketData']),'market');
+});
+test('a page the sidebar does not know is refused instead of listed',()=>{
+ assert.throws(()=>pageAvailable('unknown',['ReadMarketData']),/could not load/);
+});
+
+const markup=readFileSync(new URL('../src/index.html',import.meta.url),'utf8');
+// Pages entered from the switch beside the contract prices of Curves & prices, not from a sidebar button.
+const switched=['interval-curves'];
+test('the sidebar markup lists each group and its pages in the navigationGroups order, but for the pages a switch enters',()=>{
+ const shown=[...markup.matchAll(/<details id="nav-group-([a-z]+)"[^>]*><summary>([^<]+)<\/summary>(.*?)<\/details>/gs)]
+  .map(([,id,label,body])=>({id,label,pages:[...body.matchAll(/<button id="nav-([a-z-]+)"|<div id="nav-(reference)"/g)].map(m=>m[1]??m[2]).filter(page=>page!=='configuration')}));
+ assert.deepEqual(shown,navigationGroups.map(({id,label,pages})=>({id,label,pages:pages.filter(page=>!switched.includes(page))})));
+ assert.doesNotMatch(markup,/id="(market|settings|trading)-menu"/);
+});
+test('the pages a switch enters have their entries in that switch, named as the navigation names them',()=>{
+ const [,switchMarkup]=markup.match(/<nav id="curve-price-navigation"[^>]*>(.*?)<\/nav>/s);
+ assert.deepEqual([...switchMarkup.matchAll(/<button id="(?:nav-|curve-price-)([a-z-]+)"/g)].map(m=>m[1]),['contracts','interval-curves']);
+ for(const page of switched)assert.ok(allPages.includes(page));
+});
+
+test('risk history needs scenario, trade and market authority',()=>{
+ assert.equal(pageAvailable('risk',['ReadMarketData','ReadTrades','RunScenario']),true);
+ for(const permissions of [[],['RunScenario'],['ReadMarketData','ReadTrades']])assert.equal(pageAvailable('risk',permissions),false);
+});
+
+test('Options is a Trading page for readers of both market data and trades',()=>{
+ assert.equal(pageGroup('options'),'Trading');
+ assert.equal(pageAvailable('options',['ReadMarketData','ReadTrades']),true);
+ for(const permissions of [[],['ReadMarketData'],['ReadTrades'],['ReadMarketData','PublishMarketData']])assert.equal(pageAvailable('options',permissions),false);
+});
+
+test('Vol surfaces is a Markets page for readers of both market data and trades',()=>{
+ assert.equal(pageGroup('vol-surfaces'),'Markets');
+ assert.equal(pageAvailable('vol-surfaces',['ReadMarketData','ReadTrades']),true);
+ for(const permissions of [[],['ReadMarketData'],['ReadTrades'],['ReadMarketData','PublishMarketData']])assert.equal(pageAvailable('vol-surfaces',permissions),false);
+});
+
+// The builder can fill the viewport; a switch below it is effectively absent.
+test('the curve workspace switch precedes every curve view',()=>{
+ const switchAt=markup.indexOf('<nav id="curve-price-navigation"');
+ for(const id of ['market-page','custom-curves-page','interval-curves-page'])
+  assert.ok(switchAt<markup.indexOf(`<section id="${id}"`),`workspace switch must precede ${id}`);
+});
+
+test('physical work has its own sidebar workspace under Scheduling',()=>{
+ assert.equal(pageGroup('physical-operations'),'Scheduling');
+ assert.equal(allPages.includes('physical-operations'),true);
+ assert.equal(pageAvailable('physical-operations',['ReadMarketData','ReadTrades']),true);
+ assert.equal(pageAvailable('physical-operations',['ReadMarketData']),false);
+
+});
+
+test('every setup page belongs to Reference Data',()=>{
+ for(const page of ['custom-curves','configuration','schedules','power','parties','gas-setup','crude-setup','curve-definitions'])assert.equal(pageGroup(page),'Reference Data');
+});
+test('console and sidebar pages expose only their authorized native readers',()=>{
+ const reach=permissions=>[...allPages,'custom-curves','configuration','schedules','power','parties','gas-setup','crude-setup','curve-definitions'].filter(page=>pageAvailable(page,permissions)).sort();
+ const market=['dashboard','market','delivery','interval-series','interval-curves','reference','jobs','custom-curves','configuration','schedules','power','gas-setup','crude-setup','curve-definitions'];
+ assert.deepEqual(reach(['ReadMarketData']),[...market].sort());
+ assert.deepEqual(reach(['ReadMarketData','ReadTrades']),[...market,'lifecycle','physical-operations','facilities','new-trade','futures','options','vol-surfaces','rec-inventory'].sort());
+ assert.deepEqual(reach(['ReadMarketData','ReadTradeParties']),[...market,'parties'].sort());
+ assert.deepEqual(reach(['ReadMarketData','ReadTrades','RunScenario']),[...market,'lifecycle','physical-operations','facilities','new-trade','futures','options','vol-surfaces','rec-inventory','risk','risk-pnl','risk-scenarios','risk-var','risk-runs'].sort());
+ assert.deepEqual(reach(['ReadMarketData','ReadTrades','ReadFacilityQuantities']),[...market,'lifecycle','physical-operations','facilities','new-trade','futures','options','vol-surfaces','rec-inventory'].sort());
+ assert.deepEqual(reach(['ManageAccess']),['admin','jobs'].sort());
+});
+
+test('Reference Data lists the areas of its console, in the console\'s order and by its names',()=>{
+ const [,body]=markup.match(/<div id="nav-reference"[^>]*>(.*?)<\/div>/s);
+ assert.deepEqual([...body.matchAll(/<button id="reference-area-([a-z]+)"[^>]*data-area="([a-z]+)"[^>]*title="([^"]+)"/g)].map(([,id,area,name])=>({id:area,name:name.replace('&amp;','&'),same:id===area})),
+  consoleAreas.map(a=>({...a,same:true})));
+});
+
+test('operating facilities reuse Scheduling with exact physical read permission',()=>{
+ assert.equal(pageGroup('physical-power'),'Scheduling');
+ assert.equal(navigationGroups.filter(group=>group.pages.includes('physical-power')).length,1);
+ assert.equal(navigationGroups.some(group=>group.id==='physical'),false);
+ assert.equal(pageAvailable('physical-power',['ReadMarketData','ReadPhysical']),true);
+ for(const permissions of [[],['ReadMarketData'],['ReadPhysical'],['ReadMarketData','ReadTrades']])assert.equal(pageAvailable('physical-power',permissions),false);
+});
+
+test('REC trade entry is Scheduling while inventory authority remains separate',()=>{
+ assert.equal(pageGroup('rec-inventory'),'Scheduling');
+ assert.equal(pageAvailable('rec-inventory',['ReadMarketData','ReadTrades','ReadRecInventory']),true);
+ for(const permissions of [[],['ReadMarketData'],['ReadRecInventory']])assert.equal(pageAvailable('rec-inventory',permissions),false);assert.equal(pageAvailable('rec-inventory',['ReadMarketData','ReadTrades']),true);
+});
+
+test('New trade is listed for the accounts the Blotter is listed for, which still open on the Blotter',()=>{
+ assert.equal(pageGroup('new-trade'),'Trading');
+ assert.equal(pageAvailable('new-trade',['ReadMarketData','ReadTrades']),true);
+ for(const permissions of [[],['ReadMarketData'],['ReadTrades']])assert.equal(pageAvailable('new-trade',permissions),false);
+ assert.equal(firstPage(['ReadMarketData','ReadTrades']),'futures');
+});

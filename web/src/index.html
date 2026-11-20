@@ -1,0 +1,754 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><title>LeanETRM · Market data</title><link rel="stylesheet" href="/vendor/tabulator.css"><link rel="stylesheet" href="/app.css"><script type="module" src="/app.js"></script></head>
+<body>
+<aside id="app-sidebar" class="sidebar" aria-label="Navigation">
+  <div class="brand-row"><a class="brand" href="/" aria-label="LeanETRM home"><span class="brand-icon" aria-hidden="true">L</span><span class="brand-name">LeanETRM</span></a><button id="sidebar-toggle" type="button" class="sidebar-toggle" aria-expanded="true" aria-controls="sidebar-menus" aria-label="Collapse navigation" title="Collapse navigation">‹</button></div>
+  <div id="sidebar-menus">
+    <details id="nav-group-overview" class="nav-group" open hidden><summary>Overview</summary><nav aria-label="Overview">
+      <button id="nav-dashboard" class="nav-item" aria-label="Dashboard" title="Dashboard" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></span><span class="nav-text">Dashboard</span></button>
+    </nav></details>
+    <details id="nav-group-trading" class="nav-group" open hidden><summary>Trading</summary><nav aria-label="Trading">
+      <button id="nav-new-trade" class="nav-item" aria-label="New trade" title="New trade" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M12 11v6M9 14h6"/></svg></span><span class="nav-text">New trade</span></button>
+      <button id="nav-futures" class="nav-item" aria-label="Blotter" title="Blotter" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></svg></span><span class="nav-text">Blotter</span></button>
+      <div id="nav-blotter-views" class="nav-views"></div>
+      <button id="nav-options" class="nav-item" aria-label="Options" title="Options" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 18h6l6-12h6"/><path d="M3 6h6"/><path d="M15 18h6"/></svg></span><span class="nav-text">Options</span></button>
+    </nav></details>
+    <details id="nav-group-markets" class="nav-group" open><summary>Markets</summary><nav aria-label="Markets">
+      <button id="nav-market" class="nav-item active" aria-label="Curves & prices" title="Curves & prices"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 17l5-5 4 4 8-9"/><path d="M15 7h5v5"/></svg></span><span class="nav-text">Curves &amp; prices</span></button>
+      <button id="nav-delivery" class="nav-item" aria-label="Delivery prices" title="Delivery prices"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M13 2L5 14h6l-1 8 8-12h-6z"/></svg></span><span class="nav-text">Delivery prices</span></button>
+      <button id="nav-interval-series" class="nav-item" aria-label="Interval data" title="Interval data"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 20v-6M9 20V8M14 20v-9M19 20V4"/></svg></span><span class="nav-text">Interval data</span></button>
+      <button id="nav-vol-surfaces" class="nav-item" aria-label="Vol surfaces" title="Vol surfaces" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 5c3 10 15 10 18 0"/><path d="M3 20h18"/><circle cx="12" cy="12.5" r="1.4"/></svg></span><span class="nav-text">Vol surfaces</span></button>
+    </nav></details>
+    <details id="nav-group-risk" class="nav-group" open hidden><summary>Risk</summary><nav aria-label="Risk">
+      <button id="nav-risk" class="nav-item" aria-label="Reports" title="Reports" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h7"/></svg></span><span class="nav-text">Reports</span></button>
+      <button id="nav-risk-pnl" class="nav-item" aria-label="P&amp;L explain" title="P&amp;L explain" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 19h18M5 14h3V9h3v6h3V5h3v5h3"/></svg></span><span class="nav-text">P&amp;L explain</span></button>
+      <button id="nav-risk-scenarios" class="nav-item" aria-label="Scenarios &amp; Greeks" title="Scenarios &amp; Greeks" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></span><span class="nav-text">Scenarios &amp; Greeks</span></button>
+      <button id="nav-risk-var" class="nav-item" aria-label="VaR / ES" title="VaR / ES" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M2 19c5 0 6-13 10-13s5 13 10 13"/><path d="M7 19v-5"/></svg></span><span class="nav-text">VaR / ES</span></button>
+      <button id="nav-risk-runs" class="nav-item" aria-label="Run history" title="Run history" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span><span class="nav-text">Run history</span></button>
+    </nav></details>
+    <details id="nav-group-scheduling" class="nav-group" open><summary>Scheduling</summary><nav aria-label="Scheduling">
+      <button id="nav-lifecycle" class="nav-item" aria-label="Lifecycle" title="Lifecycle" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 11-3-6.2M20 3v6h-6"/><path d="M12 7v5l3 2"/></svg></span><span class="nav-text">Lifecycle</span></button>
+      <button id="nav-physical-operations" class="nav-item" aria-label="Physical operations" title="Physical operations" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4M9 15l2 2 4-4"/></svg></span><span class="nav-text">Physical operations</span></button>
+      <button id="nav-facilities" class="nav-item" aria-label="Facilities" title="Facilities" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 21V10l6 4v-4l6 4V5h6v16z"/></svg></span><span class="nav-text">Facilities</span></button>
+      <button id="nav-physical-power" class="nav-item" aria-label="Operating facilities" title="Operating facilities" hidden><span class="nav-icon" aria-hidden="true">⌁</span><span class="nav-text">Operating facilities</span></button>
+      <button id="nav-rec-inventory" class="nav-item" aria-label="REC inventory" title="REC inventory" hidden><span class="nav-icon" aria-hidden="true">▧</span><span class="nav-text">REC inventory</span></button>
+    </nav></details>
+    <details id="nav-group-reference" class="nav-group" open><summary>Reference Data</summary><nav aria-label="Reference Data">
+      <div id="nav-reference">
+        <button id="reference-area-curves" class="nav-item" data-area="curves" aria-label="Curves" title="Curves" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 5v14h16"/><path d="M7 15c3 0 4-7 10-8"/></svg></span><span class="nav-text">Curves</span></button>
+        <button id="reference-area-pricing" class="nav-item" data-area="pricing" aria-label="Pricing" title="Pricing" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 7h7l9 9-5 5-9-9z"/><circle cx="8" cy="11" r="1.2"/></svg></span><span class="nav-text">Pricing</span></button>
+        <button id="reference-area-products" class="nav-item" data-area="products" aria-label="Exchanges & conventions" title="Exchanges & conventions" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></span><span class="nav-text">Exchanges &amp; conventions</span></button>
+        <button id="reference-area-time" class="nav-item" data-area="time" aria-label="Calendars" title="Calendars" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 3h12M6 21h12M7 3v3l5 6 5-6V3M7 21v-3l5-6 5 6v3"/></svg></span><span class="nav-text">Calendars</span></button>
+        <button id="reference-area-units" class="nav-item" data-area="units" aria-label="Commodities & units" title="Commodities & units" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="8" rx="1.5"/><path d="M7 8v3M11 8v4M15 8v3"/></svg></span><span class="nav-text">Commodities &amp; units</span></button>
+        <button id="reference-area-physical" class="nav-item" data-area="physical" aria-label="Locations & delivery" title="Locations & delivery" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 21s7-6.2 7-11a7 7 0 10-14 0c0 4.8 7 11 7 11z"/><circle cx="12" cy="10" r="2.5"/></svg></span><span class="nav-text">Locations &amp; delivery</span></button>
+        <button id="reference-area-entities" class="nav-item" data-area="entities" aria-label="Legal entities" title="Legal entities" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 21V5a1 1 0 011-1h9a1 1 0 011 1v16M15 10h4a1 1 0 011 1v10M3 21h18M8 8h3M8 12h3M8 16h3"/></svg></span><span class="nav-text">Legal entities</span></button>
+      </div>
+    </nav></details>
+    <details id="nav-group-administration" class="nav-group" open><summary>Administration</summary><nav aria-label="Administration">
+      <button id="nav-jobs" class="nav-item" aria-label="Jobs" title="Jobs"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 11-2.6-5.9"/><path d="M20 4v5h-5"/></svg></span><span class="nav-text">Jobs</span></button>
+      <button id="nav-admin" class="nav-item" aria-label="Users & access" title="Users & access" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.8-3.6 3.4-5.5 6.5-5.5s5.7 1.9 6.5 5.5"/><path d="M16 4.5a3.5 3.5 0 010 7M18 14.8c1.8.7 3 2.4 3.5 5.2"/></svg></span><span class="nav-text">Users &amp; access</span></button>
+      <button id="nav-ai" class="nav-item" aria-label="AI" title="AI" hidden><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg></span><span class="nav-text">AI</span></button>
+    </nav></details>
+  </div>
+  <div class="side-note"><strong><span class="dot" aria-hidden="true"></span><span id="workspace-host-mode">Workspace</span></strong><p id="workspace-mode-description">Verifying workspace information.</p><div class="example-switch"><label for="example-dataset">Market example</label><select id="example-dataset" aria-label="Market example"></select></div></div>
+</aside>
+<main>
+  <header>
+    <div><div id="page-section" class="eyebrow">MARKETS</div><h1 id="page-title">Curves & prices</h1><div id="page-heading-slot" class="page-heading-slot" hidden></div></div>
+    <div class="header-actions">
+      <div id="context-toolbar" class="context-toolbar" role="group" aria-label="View context" hidden>
+        <div class="context-as-of">
+        <div id="market-close-controls" class="context-market" role="group" aria-label="Market close">
+          <div class="date-control"><label for="market-date-open" title="Choose the recorded prices and business date for this view">Market close</label><div id="market-date-calendar"></div><select id="snapshot" hidden aria-hidden="true" tabindex="-1"><option value="">Choose a date…</option></select>
+            <details id="close-history" class="close-history" hidden><summary>Earlier closes for this day</summary><ul id="close-history-list"></ul></details></div>
+        </div>
+        <div id="business-date-field" class="context-field" hidden><label for="date-context-on">Business date</label><input id="date-context-on" data-context-coordinate="Business date" type="hidden"></div>
+        <div class="as-of-widget">
+        <details id="as-of-context" class="as-of-context"><summary id="as-of-context-summary" aria-describedby="knowledge-context-help"><span id="as-of-close">As of details</span></summary><div class="as-of-panel">
+          <div id="close-session-control" class="date-control session-control"><label for="close-session">Close convention</label><select id="close-session" title="Choose the calendar and cutoff used for recorded closes" aria-describedby="close-session-help"><option value="">Choose a session…</option></select>
+            <span id="close-session-status" class="field-help" role="status" hidden>Your default close convention is no longer available. Choose a published convention to see prices.</span>
+            <span id="close-instant" class="field-help" role="status" hidden></span></div>
+          <div id="date-context" class="context-controls" hidden><div class="knowledge-panel"><span id="knowledge-summary" class="field-help">Current knowledge</span>            <div class="context-field context-knowledge"><label for="date-context-view">As known on · <span data-user-time-zone></span></label><input id="date-context-view" data-context-coordinate="As known on" type="datetime-local" step="1" required></div>
+            <p id="context-date-help" class="field-help"></p><p id="workspace-mode-label" role="status" class="field-help">Working data</p><p id="header-calculation-time" class="field-help context-read"></p><p id="environment-context-note" role="status" class="field-help">Current workspace · exact selected inputs</p>
+            <div class="schedule-actions"><button id="date-context-latest" type="button" class="text-button">Use current knowledge</button><button id="follow-live" type="button" class="text-button" title="Follow committed corrections to these selected facts. Effective date, market date, observation times and contracts stay fixed.">Follow live corrections</button></div>
+          </div></div>
+        </div></details></div>
+        </div>
+        <div id="context-actions" class="context-actions" hidden><button id="back-view-context" type="button" class="secondary" hidden>Back</button><button id="apply-view-context" type="button">Apply</button><button id="use-business-date-current" type="button" class="secondary" hidden>Use business date with current knowledge</button><button id="current-view-context" type="button" class="secondary" title="Return to working data">Working data</button></div>
+        <p id="close-window-note" class="field-help" role="status" hidden></p><span id="live-status" class="live-status" role="status" aria-live="polite" hidden></span><button id="live-retry" type="button" class="secondary" hidden>Retry refresh</button>
+        <details id="context-help" class="context-help"><summary aria-label="Explain view context" title="Explain view context">?</summary><div class="context-help-panel" role="note">
+          <p id="close-session-help"><strong>Close convention</strong> defines the calendar and cutoff for a recorded close. Choose a default in Profile, or override it for this view here. Selecting a convention does not run a close.</p>
+          <p><strong>Market close</strong> selects recorded prices and their business date. The close convention named beneath it sets the close's time of day, and As of details states the exact instant. Pages with a <strong>Business date</strong> use it to select effective records.</p>
+          <p id="knowledge-context-help"><strong>Knowledge</strong> sets the information cutoff. Current knowledge includes records available now; an earlier cutoff excludes later corrections.</p>
+          <p>A recorded close uses the close currently in force for its session and day, with its original price inputs. Other records respect the knowledge cutoff.</p>
+          <p>Times are shown in <span data-user-time-zone></span>. Changes to knowledge take effect when you choose <strong>Apply</strong>. <strong>Working data</strong> returns to current knowledge and the latest available close.</p>
+        </div></details>
+      </div>
+      <button id="profile-open" class="profile-button" aria-haspopup="dialog"><span id="profile-avatar" class="avatar" aria-hidden="true">U</span><span id="profile-label">Profile</span></button></div>
+  </header>
+  <nav id="reference-console" class="reference-console" aria-label="Reference Data" hidden>
+    <div id="reference-console-groups"></div>
+    <form id="reference-search-all" class="reference-search-all" role="search"><label for="reference-search-all-text" class="sr-only">Search reference data</label><input id="reference-search-all-text" type="search" required maxlength="160" autocomplete="off" placeholder="Search reference data"></form>
+  </nav>
+  <div id="error" role="alert" hidden></div><div id="notice" role="status" hidden></div>
+  <div id="blotter-window-question" class="blotter-window-question" tabindex="-1" aria-label="The Blotter’s window"><div id="blotter-window-question-prompt" class="side-panel-prompt" role="alertdialog" hidden></div></div>
+  <div class="status-bar sr-only"><span id="status" role="status" aria-live="polite">Loading market data…</span></div>
+  <section id="lifecycle-page" hidden aria-label="Lifecycle"></section>
+  <section id="rec-inventory-page" data-own-controls hidden aria-label="REC inventory"></section>
+  <section id="physical-power-page" data-own-controls hidden aria-label="Operating facilities"></section>
+  <section id="physical-operations-page" hidden aria-label="Physical operations"></section>
+  <nav id="physical-commodity" class="physical-commodity" aria-label="Delivery setup commodity" hidden><span>Commodity family</span><button id="nav-gas-setup" type="button">Natural gas</button><button id="nav-crude-setup" type="button">Crude oil</button></nav>
+    <section id="crude-setup-page" hidden aria-label="Crude delivery setup"></section>
+    <section id="gas-setup-page" hidden aria-label="Gas delivery setup"></section>
+    <section id="facilities-page" data-own-controls hidden>
+    <div class="card"><div class="card-heading"><div><h2>Quantities &amp; allocations</h2><p>Shared facility quantities and operating limits. Allocation currently uses booked gas deliveries.</p></div><button id="facility-refresh" type="button" class="secondary">Refresh</button></div>
+      <p id="facility-context" class="field-help"></p><label for="facility-ledger">Facility delivery day</label><select id="facility-ledger"><option value="">Choose a ledger…</option></select>
+      <p id="facility-empty" class="muted">Choose a ledger, or create one from a booked delivery below.</p></div>
+    <div id="facility-forms">
+      <div class="card"><label for="facility-effective">New records effective at · <span data-user-time-zone></span></label><input id="facility-effective" type="datetime-local" step="1" required>
+        <p class="field-help">Choose an explicit effective time on the business date above. Reports include records through the end of that UTC date.</p></div>
+      <details id="facility-create-card" class="card"><summary>Create or open a facility ledger</summary><form id="facility-create-form"><fieldset id="facility-create-fields">
+        <label for="facility-create-target">Booked delivery</label><select id="facility-create-target" required><option value="">Choose a booked delivery…</option></select>
+        <p class="field-help">The delivery point, native day, commodity, unit and legal entitlement define this ledger. Selecting an existing scope opens it.</p><button type="submit">Create or open ledger</button>
+      </fieldset></form></details>
+      <div id="facility-editor" hidden>
+        <div class="card"><h3 id="facility-title"></h3><p id="facility-period" class="field-help"></p><div id="facility-balance" class="facility-balance"></div>
+          <p id="facility-exception" class="mode-banner" role="status" hidden></p><p id="facility-reconcile" class="mode-banner" role="status" hidden>The reported source or a target changed. Review and replace the allocation plan to reconcile it.</p>
+          <p class="field-help">Allocations reference one reported quantity. These operational plans do not post billing or cash.</p></div>
+        <div class="facility-entry-grid">
+          <form id="facility-source-form" class="card"><h3>Reported quantity</h3><fieldset id="facility-source-fields">
+            <label for="facility-source-quantity">Native quantity · <span data-facility-unit></span></label><input id="facility-source-quantity" inputmode="decimal" required autocomplete="off">
+            <label for="facility-source-evidence">Source or correction reason</label><input id="facility-source-evidence" maxlength="500" required autocomplete="off">
+            <button type="submit">Record quantity</button><p class="field-help">Corrections retain earlier records and allocations. A quantity above an operating limit is recorded and flagged.</p>
+          </fieldset></form>
+          <form id="facility-limit-form" class="card"><h3>Operating limit</h3><fieldset id="facility-limit-fields">
+            <label for="facility-limit-quantity">Maximum native-period quantity · <span data-facility-unit></span></label><input id="facility-limit-quantity" inputmode="decimal" required autocomplete="off">
+            <label class="check"><input id="facility-limit-remove" type="checkbox">Remove the current limit</label>
+            <label for="facility-limit-evidence">Limit source or change reason</label><input id="facility-limit-evidence" maxlength="500" required autocomplete="off">
+            <button type="submit">Save operating limit</button><p class="field-help">This compares a whole native-period quantity, not a flow rate. Missing or removed limits remain unassessed.</p>
+          </fieldset></form>
+        </div>
+        <form id="facility-plan-form" class="card"><h3>Trade allocations</h3><p id="facility-trade-help" class="field-help" hidden></p><fieldset id="facility-plan-fields">
+          <label for="facility-targets">Allocation targets</label><select id="facility-targets" multiple></select><div id="facility-allocation-table" class="table-wrap"></div>
+          <label for="facility-plan-evidence">Allocation source or change reason</label><input id="facility-plan-evidence" maxlength="500" required autocomplete="off">
+          <p class="field-help">Enter each allocation explicitly. Saving replaces the complete plan; removing a target releases its allocation.</p>
+          <div class="actions"><button id="facility-preview" type="button" class="secondary">Check quantities</button><button id="facility-plan-save" type="submit">Save allocation plan</button></div><p id="facility-preview-result" role="status"></p>
+        </fieldset></form>
+        <form id="facility-adoption-form" class="card"><h3>Final quantity inputs</h3><p id="facility-adoption-state" role="status"></p><fieldset id="facility-adoption-fields">
+          <p class="field-help">Accept the saved allocations as final quantity inputs. Accepted quantities stay fixed until you accept a replacement plan or withdraw acceptance.</p>
+          <label for="facility-adoption-evidence">Acceptance or withdrawal evidence</label><input id="facility-adoption-evidence" maxlength="500" required autocomplete="off">
+          <div class="actions"><button id="facility-adopt" type="submit">Accept saved plan as final inputs</button><button id="facility-retract-adoption" type="button" class="secondary">Withdraw final acceptance</button></div>
+        </fieldset></form>
+        <details class="card"><summary>Revision history</summary><p class="field-help">Up to 100 visible revisions per record type. Use As known on in the shared header to inspect an earlier state.</p><h4>Reported quantities</h4><div id="facility-source-history" class="table-wrap"></div><h4>Allocation plans</h4><div id="facility-plan-history" class="table-wrap"></div><h4>Operating limits</h4><div id="facility-limit-history" class="table-wrap"></div></details>
+      </div>
+    </div>
+    <div id="facility-pending" class="card mode-banner" hidden><h3>Request outcome unconfirmed</h3><p id="facility-pending-description"></p><div class="actions"><button id="facility-status" type="button" class="secondary">Check status</button><button id="facility-retry" type="button">Retry original request</button><button id="facility-discard" type="button" class="secondary">Discard after checking</button></div></div>
+    <p id="facility-saved" role="status"></p>
+  </section>
+  <section id="crude-page" hidden aria-label="Physical crude bookings"></section>
+  <section id="lng-page" hidden aria-label="Physical LNG bookings"></section>
+  <section id="gas-page" hidden aria-label="Physical gas bookings"></section>
+  <section id="park-loan-page" hidden aria-label="Park and loan bookings"></section>
+  <section id="transport-page" hidden aria-label="Transport bookings"></section>
+  <section id="option-page" hidden aria-label="Futures option bookings"></section>
+  <section id="heat-rate-call-page" hidden aria-label="Heat-rate call option bookings"></section>
+  <section id="gas-storage-page" hidden aria-label="Gas storage contract bookings"></section>
+  <section id="ppa-page" hidden aria-label="PPA bookings"></section>
+  <nav id="curve-price-navigation" class="curve-price-navigation" aria-label="Curve workspace" hidden>
+    <button id="curve-price-contracts" type="button" class="secondary" aria-pressed="true">Contract prices</button>
+    <button id="nav-interval-curves" type="button" class="secondary" aria-pressed="false">Hourly / sub-hourly prices</button>
+  </nav>
+  <section id="curve-definitions-page" hidden aria-label="Curve definitions"><div id="curve-definition"></div></section>
+  <section id="custom-curves-page" hidden aria-label="Curve builder"></section>
+  <section id="price-setup-page" hidden><div id="price-setup-panel"><section id="contract-price-terms-editor" class="card"></section><section id="price-publications-editor" class="card" hidden></section></div></section>
+  <section id="options-page" hidden aria-label="Options"></section>
+  <section id="vol-surfaces-page" hidden aria-label="Volatility surfaces"></section>
+  <section id="delivery-page" hidden aria-label="Delivery prices">
+    <form id="delivery-price-form" class="delivery-filters" aria-label="Delivery prices to show">
+      <div class="delivery-filter-fields">
+        <label>Commodity<select id="delivery-price-commodity" required></select></label>
+        <label>Operator<select id="delivery-price-provider" required></select></label>
+        <label>Market<select id="delivery-price-market" required></select></label>
+        <label>Location<select id="delivery-price-location" required></select></label>
+        <label class="delivery-filter-source">Source<select id="delivery-price-source" required></select></label>
+        <div><label for="delivery-price-from-picker">Delivery date from</label><div id="delivery-price-from-calendar"></div><input id="delivery-price-from" type="hidden"></div>
+        <div><label for="delivery-price-through-picker">Delivery date to</label><div id="delivery-price-through-calendar"></div><input id="delivery-price-through" type="hidden"></div>
+        <div class="delivery-filter-cutoff"><label for="delivery-price-cutoff">Knowledge cutoff · <span data-user-time-zone></span></label><input id="delivery-price-cutoff" type="datetime-local" step="1" required></div>
+        <button type="submit">Show prices</button>
+      </div>
+      <div class="delivery-filter-foot"><p id="delivery-price-clock">Choose a source to see its market clock. Both delivery dates are included.</p><p id="delivery-price-known" role="status"></p></div>
+    </form>
+    <header id="delivery-price-head" class="curve-header delivery-head" hidden>
+      <div><div class="curve-crumbs"><span id="delivery-price-badge" class="close-badge"></span><span id="delivery-price-path" class="eyebrow"></span></div><h2 id="delivery-price-title"></h2><p id="delivery-price-range" class="delivery-range"></p></div>
+      <div class="curve-header-actions"><span id="delivery-price-unit" class="unit-pill"></span></div>
+    </header>
+    <div id="delivery-price-tiles" class="desk-tiles delivery-tiles" role="group" aria-label="Delivery price summary"></div>
+    <div id="delivery-price-tabs" class="side-panel-tabs page-tabs"></div>
+    <div id="delivery-price-view">
+      <section id="delivery-price-prices" class="card delivery-prices">
+        <div id="delivery-price-empty" class="market-board-empty delivery-empty" hidden><div class="market-board-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 17l5-5 4 4 8-9"/><path d="M15 7h5v5"/></svg></div><h3 id="delivery-price-empty-title"></h3><p id="delivery-price-empty-help"></p></div>
+        <div id="delivery-price-shown" hidden>
+          <details id="delivery-price-overlays" class="contract-overlays delivery-overlays"><summary>Overlays</summary><div id="delivery-price-overlay-menu"></div></details>
+          <div id="delivery-price-chart" class="delivery-chart"></div>
+          <h3 class="breakdown-heading">Intervals</h3>
+          <div id="delivery-price-results" class="table-wrap"></div>
+        </div>
+      </section>
+      <section id="delivery-price-collection" class="card" hidden><h3>Collection history</h3><p class="field-help">Each attempt to fetch and import delivery prices, including its delivery-date range and outcome. Failed attempts do not publish prices.</p><p id="delivery-price-jobs" class="delivery-jobs"></p><div id="delivery-price-attempts" class="table-wrap"></div></section>
+    </div>
+  </section>
+  <section id="interval-series-page" hidden aria-label="Interval data">
+    <div class="card"><div class="card-heading"><div><h2>Interval data</h2><p>Reusable factors, price offsets, forecasts and meter readings for hourly or sub-hourly intervals. TOUs and schedules select the intervals to use. Corrections retain their history through Known at.</p></div><button id="interval-series-refresh" type="button" class="secondary">Reload</button></div>
+      <label for="interval-series-select">Series</label><select id="interval-series-select"></select><p id="interval-series-summary" class="field-help"></p><p id="interval-series-defined" role="status"></p>
+      <details id="interval-series-define" class="advanced-settings" hidden><summary>Define a series</summary>
+        <form id="interval-series-define-form"><fieldset id="interval-series-define-fields"><div class="schedule-fields three"><div><label for="interval-series-code">Code · permanent identity</label><input id="interval-series-code" required autocomplete="off"></div><div><label for="interval-series-name">Name</label><input id="interval-series-name" required autocomplete="off"></div><div><label for="interval-series-kind">Kind</label><select id="interval-series-kind" required></select></div><div><label for="interval-series-specification">Specification</label><select id="interval-series-specification" required></select></div><div><label for="interval-series-clock">Market clock</label><select id="interval-series-clock" required></select></div><div><label for="interval-series-minutes">Resolution</label><select id="interval-series-minutes" required></select></div></div><p class="field-help">The kind, specification, clock and resolution cannot change after the series is defined.</p><button type="submit">Define series</button></fieldset></form>
+        <div id="interval-series-define-pending" class="mode-banner" hidden><p>The save outcome is unconfirmed. Retry the original request, or inspect the series list before discarding it.</p><button id="interval-series-define-retry" type="button">Retry original save</button><button id="interval-series-define-discard" type="button" class="secondary">Discard request after checking</button></div>
+      </details></div>
+    <div class="card"><h3>Values</h3>
+      <details class="floating-context"><summary>Context</summary><div class="header-context-panel"><form id="interval-series-form"><fieldset id="interval-series-window"><div class="schedule-fields three"><div><label for="interval-series-from">From · <span data-user-time-zone></span></label><input id="interval-series-from" type="datetime-local" step="60" required></div><div><label for="interval-series-to">To · <span data-user-time-zone></span></label><input id="interval-series-to" type="datetime-local" step="60" required></div><div><label for="interval-series-known">Knowledge cutoff · <span data-user-time-zone></span></label><input id="interval-series-known" data-context-coordinate="Knowledge cutoff" type="datetime-local" step="1" required></div></div><p class="field-help">From and To may not cut through a stored interval, and may span at most 35,136 intervals; the interval starting at To is not included. Known at shows the values as they were known at that time.</p><button type="submit">Show values</button></fieldset></form></div></details>
+      <p id="interval-series-values-note" class="muted" role="status"></p><div id="interval-series-chart" class="chart"></div><div id="interval-series-values" class="table-wrap"></div>
+      <div id="interval-series-selection" class="interval-series-selection" hidden><p id="interval-series-selected" role="status"></p><div class="schedule-actions"><button id="interval-series-correct" type="button">Correct</button><button id="interval-series-withdraw" type="button" class="secondary">Withdraw</button></div></div></div>
+    <div id="interval-series-revise-card" class="card" hidden><h3>Import or correct</h3>
+      <fieldset id="interval-series-revise-fields"><label for="interval-series-reason">Reason · recorded with every change</label><input id="interval-series-reason" required maxlength="500" autocomplete="off">
+        <form id="interval-series-import-form"><label for="interval-series-csv">Paste CSV</label><textarea id="interval-series-csv" rows="8" spellcheck="false" required></textarea><p class="field-help">Use the header start,value. Write each start as a UTC instant ending in Z, for example 2027-01-01T05:00:00Z, and each value as a plain decimal. Intervals that are not in the file stay as they are; to withdraw an interval, choose its row in the values and use Withdraw.</p><label for="interval-series-file">Or choose a CSV file</label><input id="interval-series-file" type="file" accept=".csv,text/csv"><div class="schedule-actions"><button type="submit">Import</button></div></form>
+        <form id="interval-series-change-form" hidden><h4 id="interval-series-change-title"></h4><div id="interval-series-change-field"><label for="interval-series-change-value">New value</label><input id="interval-series-change-value" inputmode="decimal" autocomplete="off"></div><div class="schedule-actions"><button id="interval-series-change-save" type="submit"></button><button id="interval-series-change-cancel" type="button" class="secondary">Cancel</button></div></form></fieldset>
+      <div id="interval-series-pending" class="mode-banner" hidden><p>The save outcome is unconfirmed. Retry the original request, or inspect the change log before discarding it.</p><button id="interval-series-retry" type="button">Retry original save</button><button id="interval-series-discard" type="button" class="secondary">Discard request after checking</button></div>
+      <p id="interval-series-saved" role="status"></p></div>
+    <div class="card"><h3>Change log</h3><p class="field-help">The revisions known at the chosen time that changed intervals in this window, and each interval they changed.</p><h4>Revisions</h4><div id="interval-series-revisions" class="table-wrap"></div><h4>Intervals</h4><div id="interval-series-changes" class="table-wrap"></div></div>
+  </section>
+  <section id="interval-curves-page" hidden aria-label="Hourly and sub-hourly prices">
+    <div class="card"><div class="card-heading"><div><h2>Hourly / sub-hourly prices</h2><p>Hourly and sub-hourly prices for the selected market date: marked directly, shaped from block marks, or resolved against collected actuals.</p></div></div>
+      <details class="floating-context"><summary>Context</summary><div class="header-context-panel"><form id="interval-curves-form"><fieldset id="interval-curves-window"><label for="interval-curves-select">Curve</label><select id="interval-curves-select" data-context-coordinate="Curve" required></select><p id="interval-curves-summary" class="field-help"></p>
+        <div class="schedule-fields three"><div><label for="interval-curves-from">From · <span data-user-time-zone></span></label><input id="interval-curves-from" type="datetime-local" step="60" required></div><div><label for="interval-curves-to">To · <span data-user-time-zone></span></label><input id="interval-curves-to" type="datetime-local" step="60" required></div><div><label for="interval-curves-known">Knowledge cutoff · <span data-user-time-zone></span></label><input id="interval-curves-known" data-context-coordinate="Knowledge cutoff" type="datetime-local" step="1" required></div></div>
+        <div class="schedule-fields"><label class="ai-none"><input id="interval-curves-resolve" type="checkbox"> Resolve delivered intervals to collected actuals</label><div><label for="interval-curves-aggregate">Aggregate</label><select id="interval-curves-aggregate"><option value="">Native intervals only</option><option value="hour">Each local hour</option><option value="day">Each operating day</option></select></div></div>
+        <p class="field-help">From and To are interval boundaries on the curve's clock, at most 35,136 intervals apart; the interval starting at To is not included. Known at applies to shapes and collected actuals; marks come from the selected market date.</p><button type="submit">Show prices</button></fieldset></form></div></details>
+      <p id="interval-curves-note" class="muted" role="status"></p><div id="interval-curves-chart" class="chart"></div><div id="interval-curves-values" class="table-wrap"></div>
+      <p id="interval-curves-lineage" role="status"></p><div id="interval-curves-aggregates" class="table-wrap"></div></div>
+  </section>
+  <section id="market-page" aria-label="Market data">
+    <div class="market-layout"><section id="curve-library" class="curve-library" aria-label="Choose a curve">
+      <div class="library-heading"><button id="library-toggle" type="button" aria-expanded="true" aria-controls="curves" aria-label="Collapse curve list" title="Collapse curve list"><span class="library-title">CURVES</span><span id="curve-count"></span><span class="library-chevron" aria-hidden="true">‹</span></button></div>
+      <div class="library-filters"><div class="filter-tabs" aria-label="Market type"><button data-type="all" class="active" aria-pressed="true">All</button><button data-type="futures" aria-pressed="false">Futures</button><button data-type="forwards" aria-pressed="false">Forwards</button><button data-type="rates" aria-pressed="false">Rates</button></div>
+        <div class="browse-controls"><div><label for="commodity">Market</label><select id="commodity"><option value="">All markets</option></select></div><div><label for="browse-by">Group by</label><select id="browse-by"><option value="commodity">Commodity</option><option value="marketType">Market type</option></select></div></div></div>
+      <div id="curves"></div></section>
+    <div class="market-content">
+      <section id="market-board" data-assistant-presentation-target class="market-board" aria-labelledby="market-board-title"><header class="market-board-head"><div><p class="eyebrow">Market board</p><h2 id="market-board-title">Every curve at this close</h2><p id="market-board-status" class="market-board-status"></p></div><div class="market-board-sample"><button id="example" type="button" class="secondary">Open sample prices</button><p id="example-help" class="fine-print"></p></div></header><div id="market-board-empty" class="market-board-empty"><div class="market-board-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 17l5-5 4 4 8-9"/><path d="M15 7h5v5"/></svg></div><h3 id="market-board-empty-title">Choose a market date</h3><p id="market-board-empty-help">Pick a close in As of above to see every curve at that close, or choose a curve from the list.</p></div><div id="market-board-groups"></div></section>
+      <section id="curve-detail" data-assistant-presentation-target hidden>
+        <div class="curve-header"><div><nav class="curve-crumbs" aria-label="Curves"><button id="curve-all-markets" type="button" class="text-button"><span aria-hidden="true">‹</span> All markets</button><span class="eyebrow" id="curve-kind"></span></nav><div class="curve-title-row"><span id="curve-kind-badge"></span><h2 id="curve-title"></h2></div></div><div class="curve-header-actions"><span id="unit" class="unit-pill"></span><button id="curve-power" type="button" class="secondary" hidden>Power hours &amp; settlements</button><button id="curve-definition-link" type="button" class="secondary" hidden>Curve definition</button></div></div>
+        <nav id="curve-closes" class="vol-closes" aria-label="Closes this curve can be priced at" hidden></nav>
+        <div id="curve-summary" class="desk-tiles curve-tiles" hidden></div>
+        <div id="curve-mode" class="mode-banner" role="note" hidden></div>
+        <div class="curve-stage"><div class="curve-views">
+        <div class="tabs" role="tablist" aria-label="Curve details"><button class="tab active" role="tab" aria-selected="true" data-view="prices">Prices</button><button class="tab" role="tab" aria-selected="false" data-view="inputs">Price sources</button><button class="tab" role="tab" aria-selected="false" data-view="dependencies">How it’s priced</button></div>
+        <section class="view" id="view-prices"><div class="card"><div class="card-heading"><div><h3 id="chart-title">Forward curve</h3><p id="price-date">Choose a market date to view prices.</p></div><span id="build-info" class="muted"></span></div><label class="contract-display-control"><input id="show-inactive-contracts" type="checkbox"> Show inactive contracts</label><div id="curve-chart" class="chart empty">Choose a market date above.</div><p id="contracts-help" class="field-help contracts-help">Choose a contract to see its history and how it’s priced.</p><div id="contracts" class="table-wrap"></div><div id="inactive-contracts" class="table-wrap contract-status-rows"></div></div>
+        </section>
+        <section class="view" id="view-inputs" hidden><div class="card"><div class="card-heading"><div><h3 id="source-title">Prices behind this curve</h3><p id="source-help">The prices and conversion factors used for the selected market date.</p></div><span id="input-count" class="muted"></span></div><div class="pricing-toolbar"><label for="source-contract">Contract</label><select id="source-contract"></select><button id="source-all" type="button" class="secondary" aria-pressed="false">Show all contracts</button></div><div id="source-flow" class="contract-flows"></div><h4 class="breakdown-heading">Source observations</h4><div id="inputs" class="table-wrap"></div></div>
+          <div class="card" id="revision-card" hidden><h3 id="changes-title">Price changes</h3><p id="correction-description" class="muted"></p><form id="correction-form"><div class="correction-row"><div><label for="correction-value">Corrected value</label><input id="correction-value" type="text" inputmode="decimal" required autocomplete="off"></div><button id="save" type="submit">Save correction</button></div><p id="edit-help" class="field-help">Earlier prices stay available. Saving adds a new version.</p></form><div id="revisions" class="table-wrap"></div></div>
+        </section>
+        <section class="view" id="view-dependencies" hidden><div class="card"><h3>How this curve is priced</h3><p class="muted">Follow the source contracts through each calculation to the final price.</p><div class="pricing-toolbar"><label for="pricing-contract">Contract</label><select id="pricing-contract"></select><button id="pricing-all" type="button" class="secondary" aria-pressed="false">Show all contracts</button></div><div id="dependencies" class="contract-flows"></div><h4 class="breakdown-heading">Calculation steps</h4><div id="mappings" class="table-wrap"></div></div></section>
+        </div>
+        <aside id="contract-panel" class="side-panel contract-panel" aria-label="Contract" tabindex="-1" hidden>
+          <div class="side-panel-frame">
+            <button id="contract-panel-close" type="button" class="icon-button side-panel-close" aria-label="Close the panel">×</button>
+            <div id="contract-panel-head" class="side-panel-head"></div>
+            <div id="contract-panel-tabs" class="side-panel-tabs"></div>
+            <div id="contract-panel-body" class="side-panel-body" tabindex="0">
+              <div id="contract-panel-view">
+                <section id="contract-history" class="contract-history">
+                  <div id="history-policy" class="revision-switch" role="group" aria-label="Revisions"></div>
+                  <p id="history-basis" class="contract-basis" role="status"></p>
+                  <details id="history-overlays" class="contract-overlays"><summary>Overlays</summary><div id="history-overlay-menu"></div></details>
+                  <div id="history-chart" class="contract-chart"></div>
+                  <h4 class="breakdown-heading">Values</h4>
+                  <div id="history-values" class="table-wrap"></div>
+                </section>
+                <section id="contract-pricing" class="contract-pricing contract-flows" hidden></section>
+              </div>
+              <div id="contract-panel-form" class="side-panel-form" hidden></div>
+            </div>
+          </div>
+        </aside>
+        </div>
+      </section>
+      <section id="point-trader-mark" class="card" data-own-controls aria-label="Record a market value"></section>
+    </div></div>
+  </section>
+  <section id="power-page" hidden>
+    <p id="power-historical" class="profile-note" role="status" hidden>Power TOUs requires working data. Choose Working data above to view TOU products and check hours.</p>
+    <div id="power-products-card" class="card"><div class="card-heading"><div><h2>TOU products</h2><p>Peak definitions used by the hours check. The seeded ISO products follow common conventions; verify them against the product specification before any settlement use. Off-peak is always the exact complement; each published version fixes its calendar, clock, weekly hours and holiday treatment.</p></div></div>
+      <div id="tou-list" class="table-wrap"></div>
+      <section id="tou-editor" hidden><div class="card-heading"><div><h3>Edit a TOU product</h3><p id="tou-version">New product</p></div><button id="tou-new" type="button" class="secondary">New product</button></div>
+        <form id="tou-form">
+          <div class="schedule-fields"><div><label for="tou-code">Code · stable identity</label><input id="tou-code" required maxlength="32" pattern="[a-z][a-z0-9_]{0,31}" autocomplete="off"></div><div><label for="tou-name">Name</label><input id="tou-name" required maxlength="80" autocomplete="off"></div></div>
+          <div class="schedule-fields three"><div><label for="tou-clock">Market clock</label><select id="tou-clock" required></select></div><div><label for="tou-start">Peak starts</label><select id="tou-start" required></select></div><div><label for="tou-end">Peak ends · last hour</label><select id="tou-end" required></select></div></div>
+          <div class="schedule-fields three"><div><label for="tou-saturday">Peak days</label><select id="tou-saturday" required><option value="">Choose…</option><option value="false">Monday–Friday</option><option value="true">Monday–Saturday</option></select></div></div>
+          <div class="schedule-fields"><div><label for="tou-calendar">Product calendar · exact version</label><select id="tou-calendar" required></select></div><div><label for="tou-holidays">Holiday treatment</label><select id="tou-holidays" required><option value="">Choose…</option><option value="weekly_mask_explicit_closures_v1">Weekly hours with explicit holiday closures</option></select></div></div>
+          <div id="tou-calendar-details" class="field-help"></div>
+          <div class="schedule-actions"><button id="tou-save" type="submit">Save draft</button><button id="tou-publish" type="button">Publish draft</button></div>
+          <p class="field-help">Published versions never change; saving an edit to one creates the next draft. Calculations use published versions only.</p>
+        </form></section>
+    </div>
+    <div id="power-check-card" class="card"><div class="card-heading"><div><h2>Hours &amp; settlement check</h2><p id="power-context"></p></div><span class="unit-pill">Unsaved example</span></div>
+      <p id="power-guidance" class="field-help">Choose a market date above to load power curves.</p>
+      <form id="power-form" hidden>
+        <h3 class="form-section">Contract</h3>
+        <div class="schedule-fields"><div><label for="power-curve">Power curve</label><select id="power-curve" required></select></div><div><label for="power-contract">Delivery period</label><select id="power-contract" required></select></div></div>
+        <h3 class="form-section">Time-of-use product</h3>
+        <p id="power-unavailable" class="field-help" role="note" hidden></p>
+        <div class="schedule-fields three"><div><label for="power-product">Product &amp; market clock</label><select id="power-product" required></select></div><div><label for="power-block">Hours</label><select id="power-block" required></select></div><div><label for="power-minutes">Grid interval</label><select id="power-minutes" required></select></div></div>
+        <div class="schedule-fields"><div><label for="power-labels">Hour labels</label><select id="power-labels" required></select><p class="field-help">Labels only; the intervals do not change.</p></div><div><span class="label">Holidays</span><p id="power-holiday-calendar" class="field-value"></p></div></div>
+        <details class="tou-editor" open><summary>Hour mask</summary><p class="field-help">Select cells to include or exclude them. Holiday dates use the second grid. Repeated autumn hours share a cell; the result keeps both actual intervals.</p><h4>Non-holidays</h4><div id="power-normal-grid" class="tou-scroll"></div><h4>Holidays</h4><div id="power-holiday-grid" class="tou-scroll"></div></details>
+        <h3 class="form-section">Quantity &amp; classification</h3>
+        <div class="schedule-fields"><div><label for="power-quantity-basis">Quantity basis</label><select id="power-quantity-basis" required></select></div><div id="power-allocation-field" hidden><label for="power-allocation">Allocate total energy</label><select id="power-allocation"><option value="">Choose…</option><option value="flat_rate">Flat MW across the selected intervals</option></select></div></div>
+        <div class="schedule-fields three"><div><label id="power-quantity-label" for="power-mw">Amount</label><input id="power-mw" type="text" inputmode="decimal" value="10" required></div><div><label for="power-price-type">Price type</label><input id="power-price-type" list="power-price-types" maxlength="40" required><datalist id="power-price-types"></datalist></div><div><label for="power-timing">Price timing</label><input id="power-timing" list="power-timings" maxlength="40" required><datalist id="power-timings"></datalist></div></div>
+        <p class="field-help">Generated test fixings use the contract's curve price in its own currency per MWh. Classifications are labels, never a claim of official publication.</p>
+         <div class="schedule-actions"><button type="submit">Check hours &amp; settlements</button></div>
+         <details id="power-advanced" class="advanced-settings"><summary>Advanced settings</summary><label for="power-money-precision">Money decimal places</label><input id="power-money-precision" type="number" min="0" max="18" required><p class="field-help">Formats final money amounts for this example. Exact quantities and calculations are unchanged.</p></details>
+       </form>
+    </div>
+    <div id="power-result" hidden><div class="card"><h3 id="power-summary"></h3><p id="power-price-note" class="muted"></p><p id="power-holiday-note" class="muted"></p><div id="power-days" class="table-wrap"></div></div><div class="card"><div class="card-heading"><h3>Settlement intervals</h3><div><label for="power-show">Rows</label><select id="power-show"><option value="few">First 60</option><option value="all">Show all</option></select></div></div><p id="power-rows-note" class="field-help"></p><div id="power-intervals" class="table-wrap"></div></div></div>
+  </section>
+<section id="parties-page" hidden><div class="card"><div class="card-heading"><div><h2>Legal entities &amp; counterparties</h2><p>Maintain names and effective versions. Trades retain the exact version selected when booked.</p></div><button id="party-refresh" type="button" class="secondary">Reload</button></div>
+<label for="party-kind">Party type</label><select id="party-kind"><option value="legal_entity">Legal entities</option><option value="counterparty">Counterparties</option></select><div id="party-list" class="table-wrap"></div>
+<p id="party-read-only" class="field-help" hidden>Read-only. Editing requires party-maintenance permission and working data.</p><button id="party-new" type="button" class="secondary">New party</button><p id="party-saved" role="status"></p></div>
+<div class="card"><h3 id="party-edit-title">New party</h3><form id="party-form" hidden><fieldset id="party-fields"><div class="schedule-fields"><div><label for="party-code">Code · permanent identity</label><input id="party-code" required maxlength="48" pattern="[a-z][a-z0-9_]{0,47}"></div><div><label for="party-name">Name</label><input id="party-name" required aria-describedby="party-name-limit"><small id="party-name-limit">Maximum 80 characters.</small></div><div><label for="party-effective">Effective from · <span data-user-time-zone></span></label><input id="party-effective" type="datetime-local" step="60" required></div></div><p class="field-help">Saving appends a version. Earlier versions and booked trades keep their original names and references.</p><button type="submit">Save version</button></fieldset></form><div id="party-pending" hidden><p>The save outcome is unconfirmed. Retry the original request, or inspect saved versions before discarding it.</p><button id="party-retry" type="button">Retry original save</button><button id="party-discard" type="button" class="secondary">Discard request after checking</button></div><h3>Version history</h3><div id="party-history" class="table-wrap"></div></div></section>
+<section id="reference-page" hidden><div class="card"><div id="reference-search-hits" class="reference-search-hits" hidden></div>
+<div id="reference-panel"><div id="reference-list"><p id="data-description" class="reference-description">Units, currencies, locations and contract details.</p><div class="reference-toolbar"><form id="reference-search-form" class="inline-form"><div><label for="reference-search" class="sr-only">Search this category</label><input id="reference-search" type="search" maxlength="160" autocomplete="off" placeholder="Search every row of this category…"></div><button type="submit" class="secondary">Search</button></form><div class="schedule-actions"><button id="reference-previous" type="button" class="secondary" disabled>Previous page</button><button id="reference-next" type="button" class="secondary" disabled>Next page</button><span id="reference-page-status" role="status"></span></div></div><div id="reference" class="table-wrap"></div></div><div id="reference-item" class="reference-item" hidden></div></div></div><div id="unit-converter" class="card" hidden><h3>Convert quantities</h3><p>Conversions preserve commodity and measurement basis. Gas volume needs a heating value to become energy; MW needs a delivery duration to become MWh.</p>
+<form id="unit-conversion-form"><div class="schedule-fields converter-fields"><div><label for="unit-value">Amount</label><input id="unit-value" required inputmode="decimal" maxlength="45"></div><div><label for="unit-commodity">Commodity</label><select id="unit-commodity" required></select></div><div><label for="unit-from">From</label><select id="unit-from" required></select></div><div><label for="unit-to">To</label><select id="unit-to" required></select></div></div>
+<div class="converter-precision"><div><label for="unit-rounding">Conversion precision</label><select id="unit-rounding"><option value="exact">Exact · reject an unrepresentable result</option><option value="round">Round the final result</option></select></div><div id="unit-rounding-fields" class="schedule-fields" hidden><div><label for="unit-decimals">Decimal places</label><input id="unit-decimals" type="number" min="0" max="18" value="6" required></div><div><label for="unit-tie">Ties</label><select id="unit-tie"><option value="to_even">To even</option><option value="away_from_zero">Away from zero</option></select></div></div><button type="submit">Convert</button></div></form><p id="unit-conversion-result" role="status"></p></div></section>
+<div id="curve-date-editor" class="card" hidden><h2>Date mappings</h2><p class="muted">Save reviewed date rules as a draft, then publish an immutable version for the workspace. Schedule references retain the exact versions used when saving. Resolve a published version in an explicitly selected context. This does not create exchange contracts, curves or booked sides.</p>
+<div class="schedule-actions"><button id="curve-dates-new" type="button" class="secondary">New date mapping</button><button id="curve-dates-reload" type="button" class="secondary">Reload library</button></div><p id="curve-dates-version" class="field-help">New date mapping</p><p id="curve-dates-access" class="field-help" hidden></p>
+<form id="curve-dates-form"><fieldset id="curve-dates-fields"><div class="schedule-fields"><div><label for="curve-dates-name">Mapping name</label><input id="curve-dates-name" required maxlength="80"></div><div><label for="curve-dates-code">Mapping code</label><input id="curve-dates-code" required maxlength="32" pattern="[a-z][a-z0-9_]{0,31}"></div></div>
+<div class="schedule-fields"><div><label for="curve-dates-kind">Mapping type</label><select id="curve-dates-kind" required><option value="contracts">Contracts · start, end and last trading</option><option value="dates">Date list · one date per row</option></select></div></div>
+<div class="schedule-fields"><div><label for="curve-dates-example-kind">Example</label><select id="curve-dates-example-kind"><option value="">Choose an example…</option></select></div><div><label for="curve-dates-schedule">Published schedule for monthly example</label><select id="curve-dates-schedule"><option value="">Choose a published schedule…</option></select></div></div><button id="curve-dates-example" type="button" class="secondary">Load mapping example</button><p id="curve-dates-example-help" class="field-help">Examples have explicit synthetic date conventions. They do not create exchange contracts or prices.</p>
+<div class="regular-table-scroll"><table class="contract-date-inputs"><thead id="curve-dates-head"><tr><th>Date set</th><th>Start · date or reference</th><th>End · date or reference</th><th>Last trading · date or reference</th><th>Last trading time · UTC</th><th></th></tr></thead><tbody id="curve-dates-rows"></tbody></table></div><button id="curve-dates-add" type="button" class="secondary">Add date set</button><div class="schedule-actions"><button type="submit">Preview current form</button><button id="curve-dates-keep" type="button" class="secondary">Save shared draft</button></div></fieldset><button id="curve-dates-publish" type="button" hidden>Publish saved draft</button></form>
+<div id="curve-dates-pending" class="mode-banner" hidden><p>The save or publication outcome is unconfirmed. Inspect the library, then retry the original request or discard it after checking.</p><button id="curve-dates-retry" type="button">Retry original request</button><button id="curve-dates-discard" type="button" class="secondary">Discard checked request</button></div><p id="curve-dates-status" role="status"></p>
+<div id="curve-dates-result" hidden><h3 id="curve-dates-result-title"></h3><p id="curve-dates-spec" class="muted"></p><div id="curve-dates-table" class="table-wrap"></div></div><h3>Saved versions</h3><div id="curve-dates-saved" class="muted">No shared definitions saved yet.</div></div>
+  <section id="schedules-page" hidden aria-label="Schedules">
+    <section class="card"><div class="card-heading"><div><h2>Saved schedules</h2><p id="dates-library-help">Upload or generate dates. Reference them symbolically, for example oe.ng[0].</p></div></div><div id="dates-saved" class="muted">No schedules saved yet.</div></section>
+    <section id="dates-result" class="card" hidden><h3 id="dates-result-title"></h3><div id="dates-table" class="table-wrap"></div></section>
+    <section class="card"><h2>Look up a date</h2><p class="field-help">Enter a date such as 2021-01-01, or a reference such as oe.ng[0] - 3bd. References resolve against published schedules in the market view chosen in the header.</p><form id="date-expression-form" class="inline-form"><div><label for="date-expression">Date or reference</label><input id="date-expression" required maxlength="100" placeholder="oe.ng[0] - 3bd"></div><button type="submit">Resolve date</button></form><p id="date-expression-result" role="status" hidden></p></section>
+    <section id="dates-editor" class="card" hidden><div class="card-heading"><div><h2>Edit a schedule</h2><p id="dates-version">New schedule</p></div><div class="schedule-actions"><button id="dates-example" type="button" class="secondary">Load monthly example</button><button id="dates-new" type="button" class="secondary">New schedule</button></div></div>
+    <form id="dates-form"><div class="schedule-fields"><div><label for="dates-import">Dates · one YYYY-MM-DD per line</label><textarea id="dates-import" rows="6" placeholder="2021-01-01&#10;2021-02-01"></textarea></div><div><label for="dates-upload">Upload dates · text or CSV</label><input id="dates-upload" type="file" accept=".txt,.csv,text/plain,text/csv"><button id="dates-merge" type="button" class="secondary">Add dates / reimport</button><p>Identical dates are ignored. New dates are added to the saved schedule.</p></div></div>
+      <h3 class="form-section">Identity</h3>
+      <div class="schedule-fields"><div><label for="dates-name">Schedule name</label><input id="dates-name" required maxlength="80"></div><div><label for="dates-symbol">Reference · stable identity</label><input id="dates-symbol" required maxlength="35" placeholder="oe.ng" pattern="oe\.[a-z][a-z0-9_]{0,31}"></div></div>
+      <h3 class="form-section">Daily dates</h3>
+      <div class="schedule-fields three"><div><label for="dates-daily">Generate every day</label><select id="dates-daily"><option value="">No · monthly rules or a date list</option></select></div><div><label for="dates-daily-first">First date · included</label><input id="dates-daily-first" type="date"></div><div><label for="dates-daily-last">Last date · included</label><input id="dates-daily-last" type="date"></div></div>
+      <p class="field-help">Daily dates are generated when read, never stored. [0] is the first date on or after the context date; +Nbd counts on the business calendar.</p>
+      <h3 class="form-section">Dates</h3>
+      <div class="schedule-fields"><div><label for="dates-first">First month · included</label><input id="dates-first" type="month" required></div><div><label for="dates-last">Last month · included</label><input id="dates-last" type="month" required></div></div>
+      <div class="schedule-fields three"><div><label for="dates-anchor">Monthly anchor</label><select id="dates-anchor" required><option value="">Choose…</option></select></div><div><label for="dates-day">Day · for day-of-month anchors</label><input id="dates-day" type="number" min="1" max="31" step="1"></div><div><label for="dates-short">If the day is missing</label><select id="dates-short" required><option value="">Choose…</option></select></div></div>
+      <h3 class="form-section">Business days</h3>
+      <div class="schedule-fields"><div><label for="dates-calendar">Business calendar · optional for date lists</label><select id="dates-calendar" required><option value="">Choose a calendar…</option></select><p id="dates-calendar-summary" class="field-help"></p></div><div><label for="dates-adjustment">Business-day adjustment</label><select id="dates-adjustment" required><option value="">Choose…</option></select></div></div>
+      <h3 class="form-section">Applicability</h3>
+      <div class="schedule-fields three"><div><label for="dates-selection">How context selects dates</label><select id="dates-selection" required><option value="">Choose…</option></select></div><div><label for="dates-effective-from">Effective from · included</label><input id="dates-effective-from" type="date" required></div><div><label for="dates-effective-to">Effective until · not included</label><input id="dates-effective-to" type="date" required></div></div>
+      <div class="schedule-actions"><button type="submit" class="secondary">Preview dates</button><button id="dates-keep" type="button">Save draft</button><button id="dates-publish" type="button">Publish draft</button></div>
+      <p class="field-help">Drafts can be edited. Published versions never change; editing one creates a new draft.</p>
+    </form></section>
+    <details id="schedule-inspector" class="card"><summary>Contract roll shortcuts · this session only</summary><div class="schedule-intro"><div class="eyebrow">REUSABLE DATES</div><h2>Look up a contract date</h2><p>Inspect dates supplied with imported contracts. This separate lookup tool does not generate or publish a schedule.</p><button id="schedule-example" type="button" class="secondary">Try the gas prompt example</button><p class="field-help">Sample definitions only. Kept shortcuts stay in this demo user’s browser session.</p></div>
+    <div id="schedule-unavailable" class="card" hidden>No contract schedule is configured in this sample. Required trading dates must be supplied explicitly.</div>
+    <form id="schedule-form" class="card">
+      <div class="schedule-fields"><div><label for="schedule-name">Schedule name</label><input id="schedule-name" maxlength="80" required placeholder="Gas prompt"></div><div><label for="schedule-symbol">Shortcut</label><input id="schedule-symbol" maxlength="35" required placeholder="oe.ng1" pattern="oe\.[a-z][a-z0-9_]{0,31}"></div></div>
+      <div class="schedule-fields"><div><label for="schedule-source">Source schedule</label><select id="schedule-source" required><option value="">Choose a source schedule…</option></select></div><div><label for="schedule-position">Contract position</label><input id="schedule-position" type="number" min="1" max="10000" step="1" required placeholder="1"><p class="field-help">1 = prompt, 2 = the next contract. The shortcut’s name does not set this rule.</p></div></div>
+      <div class="schedule-fields"><div><label for="schedule-date-role">Date to return</label><select id="schedule-date-role" required><option value="">Choose a date…</option></select></div><div><label for="schedule-at">Test date &amp; time · <span data-user-time-zone></span></label><input id="schedule-at" type="datetime-local" step="60" required><p id="schedule-context-note" class="field-help"></p></div></div>
+      <div class="schedule-actions"><button id="schedule-preview" type="submit">Preview shortcut</button><button id="schedule-keep" type="button" class="secondary">Keep shortcut for this preview</button></div>
+    </form>
+    <p id="schedule-summary" role="status" aria-live="polite">Choose a source and date rule, then preview your shortcut.</p>
+    <section id="schedule-output" class="card shortcut-result" hidden><div><h3 id="schedule-result-title"></h3><p id="schedule-result-detail" class="muted"></p></div><strong id="schedule-result-date"></strong></section>
+    <section id="schedule-source-panel" class="card" hidden><h3>Contract schedule</h3><p id="schedule-coverage" class="muted"></p><div class="schedule-roll-test"><label for="schedule-boundary">Test expiry of</label><select id="schedule-boundary"></select><button id="schedule-before" type="button" class="secondary">Before expiry</button><button id="schedule-at-boundary" type="button" class="secondary">At expiry</button></div><div id="schedule-contracts" class="table-wrap"></div></section>
+    <section class="card"><h3>Kept shortcuts</h3><p id="schedule-saved-empty" class="muted">No shortcuts kept in this demo user’s session.</p><div id="schedule-saved"></div></section>
+    </details>
+  </section>
+  <!-- blotter-window: page -->
+  <section id="futures-page" hidden>
+    <div id="futures-retained"><div id="futures-pending" class="profile-note retained-request" role="status" hidden><p id="futures-pending-text"></p><div class="schedule-actions"><button id="futures-reconcile" type="button" class="secondary">Check status</button><button id="futures-retry" type="button" class="secondary">Retry original request</button></div></div></div>
+    <p id="new-trade-availability" class="table-workspace-note" role="status" hidden></p>
+    <div id="blotter-workspace"></div>
+    <div id="desk-lens" class="desk-lens-bar" hidden><div class="desk-lens" role="group" aria-label="Positions lens"><button type="button" data-lens="values" aria-pressed="true">Values</button><button type="button" data-lens="risk" aria-pressed="false">Risk</button><button type="button" data-lens="ladder" aria-pressed="false">Ladder</button></div><div id="desk-ladder-value" class="desk-lens" role="group" aria-label="Ladder values" hidden><button type="button" data-ladder-value="delta" aria-pressed="true">Delta</button><button type="button" data-ladder-value="upPnl" aria-pressed="false">Up P&amp;L</button><button type="button" data-ladder-value="downPnl" aria-pressed="false">Down P&amp;L</button></div></div>
+    <div id="blotter-dock" class="blotter-dock">
+      <div id="blotter-pane-summary" class="blotter-pane">
+        <div id="desk" class="desk" hidden>
+          <section id="desk-run" class="desk-run" hidden>
+        <span class="desk-run-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 19l5-6 4 3 7-9"/></svg></span>
+        <div class="desk-run-text">
+          <p id="desk-run-title" class="desk-run-title"><strong>Risk report</strong> · <span id="risk-run-setup"></span></p>
+          <p id="desk-run-detail" class="desk-run-detail"></p>
+          <ul id="desk-run-notes" class="desk-run-notes"></ul>
+          <p id="risk-export-note" class="desk-run-export-note" hidden></p>
+        </div>
+        <div class="desk-run-actions"><button id="desk-run-edit" type="button" class="secondary">Edit shocks</button><button id="risk-export" type="button" class="secondary">Export</button><button id="desk-run-clear" type="button" class="secondary">Clear</button></div>
+      </section>
+      <details id="desk-risk-full" class="card risk-full-report" hidden><summary>Full risk report and graphics</summary><div id="desk-risk-full-results"></div></details>
+          <ul id="blotter-strip" class="summary-strip" aria-label="Book summary at this close"></ul>
+        </div>
+      </div>
+      <div id="blotter-pane-grid" class="blotter-pane blotter-pane-grid">
+        <div id="blotter-progress" class="blotter-progress" role="progressbar" aria-label="Valuing positions" hidden></div>
+        <p id="blotter-load-status" class="blotter-load-status" role="status" hidden><span id="blotter-load-text"></span><button id="blotter-retry" type="button" class="secondary" hidden>Retry</button></p>
+        <div class="table-workspace-footer"><p id="futures-summary" role="status">Choose a market date above.</p><details class="blotter-scope"><summary>Calculation scope</summary><p class="field-help">Futures show execution P&amp;L; financial swaps show projected PV. These are separate measures. Blank values are unavailable. Futures PV and daily settlement remain separate work. Values use the selected saved market inputs; no live feed is connected.</p></details></div>
+      </div>
+      <div id="blotter-pane-details" class="blotter-pane"></div>
+      <div id="blotter-pane-charts" class="blotter-pane">
+        <div id="desk-charts" class="desk-charts" hidden>
+          <section id="desk-chart-pv" class="desk-chart" aria-labelledby="desk-chart-pv-title"><h3 id="desk-chart-pv-title" class="desk-chart-title">Value by market</h3></section>
+          <section id="desk-chart-position" class="desk-chart" aria-labelledby="desk-chart-position-title"><h3 id="desk-chart-position-title" class="desk-chart-title">Long and short by market</h3></section>
+          <section id="desk-chart-books" class="desk-chart" aria-labelledby="desk-chart-books-title"><h3 id="desk-chart-books-title" class="desk-chart-title">Totals by book</h3></section>
+          <section id="desk-chart-mix" class="desk-chart" aria-labelledby="desk-chart-mix-title"><h3 id="desk-chart-mix-title" class="desk-chart-title">Positions by commodity and instrument type</h3></section>
+        </div>
+        <section id="blotter-chart-card" class="card blotter-analysis" hidden><div class="analysis-heading"><div><div class="eyebrow">BLOTTER ANALYTICS</div><h3>Visual analysis</h3><p id="blotter-chart-scope" class="field-help"></p></div><div class="plot-style-controls" role="group" aria-label="Chart style"><button type="button" data-plot-kind="bar" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3v17h17M8 16v-5m5 5V7m5 9V4"/></svg>Bars</button><button type="button" data-plot-kind="line" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3v17h17M7 15l5-7 4 3 5-7"/></svg>Line</button><button type="button" data-plot-kind="heatmap" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4zM4 10h16m-16 5h16M10 4v16m5-16v16"/></svg>Heatmap</button></div></div><div id="blotter-chart"></div><p class="analysis-footnote">Hover for exact values. Use the legend to isolate a series and the slider to zoom. Empty cells indicate unavailable values.</p></section>
+      </div>
+    </div>
+  </section>
+  <!-- /blotter-window: page -->
+  <section id="blotter-away" class="card blotter-away" aria-labelledby="blotter-away-title" hidden><h2 id="blotter-away-title">Blotter is in its own window</h2><p class="muted">Its books, view and positions are in that window, which follows the market date and context chosen here. Bring back shows the Blotter here again, as that window shows it.</p><button id="blotter-bring-back" type="button">Bring back</button></section>
+  <section id="dashboard-page" hidden>
+    <div class="card dashboard-controls"><div class="card-heading"><p id="dashboard-scope"></p>
+      <div class="filter-tabs" role="group" aria-label="Arrangement"><button id="dashboard-board" type="button" aria-pressed="true">Board</button><button id="dashboard-morning" type="button" aria-pressed="false">Morning</button></div></div>
+      <p id="dashboard-conflict" role="alert" hidden>This dashboard changed in another session. <button id="dashboard-reload" type="button" class="secondary">Reload</button></p>
+      <div id="dashboard-add"></div></div>
+    <div id="dashboard-widgets"></div>
+  </section>
+  <section id="risk-page" hidden>
+    <div id="risk-page-prompt" class="side-panel-prompt" hidden></div>
+    <div class="card risk-workspace-heading">
+      <div class="risk-scope-bar"><span class="risk-scope-label">Scope</span><span id="risk-scope-summary"></span>
+      <details id="risk-scope-editor" class="risk-scope-editor"><summary>Change scope</summary>
+      <div class="risk-workspace-scope"><label>Portfolios<select id="risk-workspace-portfolios" multiple size="3" aria-describedby="risk-workspace-scope-help"></select></label><label>Books<select id="risk-workspace-books" multiple size="3" aria-describedby="risk-workspace-scope-help"></select></label></div>
+      <p id="risk-workspace-scope-help" class="field-help">Portfolio → books → trades. No portfolio or book filter means all readable books. Scope changes affect the next calculation; a retained report keeps its captured selection.</p>
+      <div class="risk-trade-scope"><label>Trade scope<select id="risk-workspace-trade-mode"><option value="all">All trades in these books</option><option value="selected">Choose individual trades</option></select></label><label>Trades in these books<select id="risk-workspace-trades" multiple size="7" aria-describedby="risk-workspace-trade-help"></select></label><p id="risk-workspace-trade-help" class="field-help" role="status"></p><button id="risk-workspace-trades-more" type="button" class="secondary" hidden>Load more trades</button></div>
+      </details>
+      <label>Pricing policy<select id="risk-workspace-pricing-policy" aria-describedby="risk-workspace-pricing-help" disabled><option value="">Read the Risk scope first…</option></select></label><p id="risk-workspace-pricing-help" class="field-help" role="status"></p>
+      <div class="actions"><button id="risk-jobs-new" class="secondary" type="button" data-risk-view="risk-scenarios">New run</button><button id="risk-history-open" type="button" disabled data-risk-view="risk-var">Prepare static VaR / ES</button><button id="risk-workspace-export" class="secondary" type="button" disabled data-risk-view="risk">Export report</button><button id="risk-workspace-refresh" class="secondary" type="button" data-risk-view="risk">Refresh Risk</button></div></div>
+      <p id="risk-workspace-note" role="status"></p>
+    </div>
+    <p id="risk-workspace-context-note" class="risk-context-note" role="status"></p>
+    <section id="risk-pnl-view" class="card" data-risk-view="risk-pnl" aria-label="Trading P&amp;L"></section>
+    <details id="risk-economic-panel" class="card" data-risk-view="risk-var" open><summary>Event-aware economic VaR / ES</summary><div id="risk-economic-body"></div></details>
+    <details id="risk-history-panel" class="card" data-risk-view="risk-var"><summary>Static portfolio VaR / ES and price coverage</summary><div id="risk-history-body"></div></details>
+    <div id="risk-economic-results" data-risk-view="risk" class="card risk-results" aria-live="polite" hidden></div>
+    <div id="risk-workspace-results" data-risk-view="risk" class="card risk-results" aria-live="polite"></div>
+    <details id="risk-workspace-editor" class="card" data-risk-view="risk-scenarios"><summary>Run setup and job status</summary><p class="field-help">Run now is available for this visit. Queue as job retains the exact inputs and report for reload and reopening by link under the submitting account’s current authority.</p><div id="risk-workspace-editor-body"></div></details>
+    <details class="card risk-report-library" data-risk-view="risk-runs" open><summary>Reports and runs</summary><div class="card-heading"><p>The recent directory is bounded. A missing part is unavailable, never a completed or zero-risk part. Open a report to read its captured context.</p><button id="risk-jobs-refresh" class="secondary" type="button">Refresh recent runs</button></div><div id="risk-jobs-list" class="table-wrap" aria-live="polite"></div><div id="risk-jobs-report"></div>
+    </details>
+  </section>
+  <section id="jobs-page" hidden>
+    <div class="card"><div class="card-heading"><p id="jobs-scope"></p><button id="jobs-refresh" class="secondary" type="button">Refresh jobs</button></div><div id="jobs-table" class="table-wrap"></div><p id="jobs-page-count"></p><div class="actions"><button id="jobs-previous" type="button" class="secondary" disabled>Previous page</button><button id="jobs-next" type="button" class="secondary" disabled>Next page</button></div></div>
+    <div class="card"><details id="job-editor" hidden><summary id="job-editor-title">New job</summary><form id="job-create" hidden>
+      <div class="schedule-fields"><label>Name<input id="job-name" maxlength="80" required></label><label>Operation<select id="job-operation" required><option value="">Choose an operation…</option><option value="worker_check">Worker readiness check</option><option value="swarm_job">Approved container job</option></select></label><label id="job-profile-field" hidden>Execution profile<select id="job-profile"><option value="">Choose an approved image…</option></select></label></div>
+      <div class="schedule-fields"><label>Due at<input id="job-due" type="datetime-local" step="1" required></label><label>Expires at<input id="job-expires" type="datetime-local" step="1" required></label><label>Frequency<select id="job-frequency" required><option value="">Choose frequency…</option><option value="once">Once</option><option value="interval">Fixed interval</option></select></label><label id="job-interval-field" hidden>Interval (seconds)<input id="job-interval" type="number" min="60" max="31536000"></label></div>
+      <div class="schedule-fields"><label>Run timeout (seconds)<input id="job-timeout" type="number" min="1" max="3600" required></label><label>Maximum attempts<input id="job-attempts" type="number" min="1" max="3" required></label></div>
+      <p class="field-help">Enter times in <span id="job-zone" data-user-time-zone></span>. Times are stored in UTC; fixed intervals measure elapsed time. A late occurrence runs once; overlapping runs are forbidden. Recurring jobs advance to the next future interval. Readiness checks verify the separate worker’s durable execution path. Container jobs require one attempt, a configured controller and an approved image.</p><button id="job-submit" type="submit">Create job</button><button id="job-cancel-edit" type="button" class="secondary" hidden>Cancel edit</button>
+    </form></details><div id="job-pending" class="profile-note" hidden><p>A job request is retained. Refresh and inspect saved changes before retrying or discarding it.</p><button id="job-retry-request" type="button" class="secondary">Retry original request</button><button id="job-discard-request" type="button" class="secondary">Discard retained request</button></div></div>
+    <div class="card"><details id="pilot-close-editor"><summary>New generated pilot-close job</summary>
+      <p class="field-help">Generate labelled pilot prices, then report futures execution P&amp;L, swap PV and open quote risk for the selected books.</p><button id="pilot-close-load" type="button" class="secondary">Load current configuration choices</button><p id="pilot-close-warning" class="field-help"></p><p id="pilot-close-status" role="status"></p>
+      <details><summary>Retain an existing close as an anchor</summary><form id="pilot-close-anchor-form" hidden><div class="schedule-fields"><label>Existing market inputs<select id="pilot-close-anchor" required></select></label><label>Retained close name<input id="pilot-close-anchor-name" maxlength="80" required></label><label>Close session<select id="pilot-close-anchor-session" required></select></label><label>Outputs to retain<select id="pilot-close-anchor-scope" required></select></label></div><button type="submit">Retain selected close</button></form></details>
+      <form id="pilot-close-form" hidden>
+        <div class="schedule-fields"><label>Job name<input id="pilot-close-name" maxlength="80" required></label><label>Prior retained close<select id="pilot-close-prior" required></select></label><label>Generated close session<select id="pilot-close-session" required></select></label><label>Generated-price source<select id="pilot-close-source" required></select></label></div>
+        <div class="schedule-fields"><label>Books<select id="pilot-close-books" required multiple size="5"></select></label><label>Curves<select id="pilot-close-curves" required multiple size="7"></select></label></div>
+        <details open><summary>Price generation and valuation policies</summary><div class="schedule-fields"><label>Generator<select id="pilot-close-generator" required></select></label><label>Price move unit<select id="pilot-close-tickBasis" required></select></label><label>Parameter inputs<select id="pilot-close-parameterPolicy" required></select></label><label>Final-settlement inputs<select id="pilot-close-frozenPolicy" required></select></label><label>Contract membership<select id="pilot-close-membershipPolicy" required></select></label><label>Close calendar<select id="pilot-close-calendarPolicy" required></select></label><label>Close timestamp<select id="pilot-close-closePolicy" required></select></label><label>Valuation and risk<select id="pilot-close-policy" required></select></label><label>Deterministic seed<input id="pilot-close-seed" type="number" step="1" required></label><label>Risk bump (trading ticks)<input id="pilot-close-bump-ticks" type="number" step="1" required></label></div><p class="field-help">Select every policy explicitly. Existing exchange definitions and booked terms are retained. Generated prices are simulation inputs.</p></details>
+        <p>Maximum generated price move for each supplied price curve</p><div id="pilot-close-moves" class="schedule-fields"></div>
+        <div class="schedule-fields"><label>Due at<input id="pilot-close-due" type="datetime-local" step="1" required></label><label>Expires at<input id="pilot-close-expires" type="datetime-local" step="1" required></label><label>Frequency<select id="pilot-close-frequency" required></select></label><label>Run timeout (seconds)<input id="pilot-close-timeout" type="number" step="1" required></label><label>Maximum attempts<input id="pilot-close-attempts" type="number" step="1" required></label></div>
+        <p class="field-help">Enter times in <span data-user-time-zone></span>. The simulation schedule uses UTC instants and its explicitly selected calendar policy.</p><button type="submit">Create generated pilot-close job</button>
+      </form></details></div>
+    <div class="card"><h3>Delivery-price collection</h3><p class="field-help">Existing collector jobs use their registered service and sources. Their schedule is separate from market snapshots and the jobs above.</p><div id="collection-jobs-table" class="table-wrap"></div><p id="collection-jobs-page-count"></p><div class="actions"><button id="collection-jobs-previous" type="button" class="secondary" disabled>Previous collection page</button><button id="collection-jobs-next" type="button" class="secondary" disabled>Next collection page</button></div></div>
+    <div class="card"><details id="collection-job-editor" hidden><summary id="collection-job-editor-title">Collection schedule</summary><p id="collection-job-cadence" class="field-help"></p><p id="collection-job-status" role="status"></p><form id="collection-job-form"><div class="schedule-fields"><label>Name<input id="collection-job-name" required aria-describedby="collection-job-name-limit"><small id="collection-job-name-limit"></small></label><label>Daily schedule<select id="collection-job-schedule" required><option value="">Choose schedule state…</option><option value="false">Paused</option><option value="true">Enabled</option></select></label><label>First delivery day offset<input id="collection-job-from" type="number" required step="1"></label><label>Last delivery day offset<input id="collection-job-through" type="number" required step="1"></label></div><p class="field-help">Delivery offsets are whole calendar days relative to the UTC run date. Both endpoints are included. The registered service, source references and daily cadence cannot be changed here.</p><button id="collection-job-save" type="submit">Save collection schedule</button><button id="collection-job-close" type="button" class="secondary">Close details</button></form></details></div>
+    <div class="card"><h3>Recent runs</h3><div id="job-runs" class="table-wrap"></div></div>
+    <div id="pilot-report" class="card" hidden><h3 id="pilot-report-title"></h3><p class="field-help">Generated pilot prices. Futures execution P&amp;L and swap PV are separate measures. Quote risk holds the retained interest-rate inputs fixed. This report does not perform settlement or variation-margin processing.</p><p id="pilot-report-work" class="field-help"></p><div id="pilot-report-totals" class="table-wrap"></div><h4>Open quote risk</h4><p class="field-help">Changes use the row’s currency. Delta is cash per quote-price unit; gamma is cash per squared quote-price unit.</p><div id="pilot-report-risk" class="table-wrap"></div></div>
+    <div class="card"><h3>Risk worker pool</h3><div id="jobs-worker-pool"></div><div id="jobs-infra-log" aria-live="polite"></div></div>
+    <div class="card"><h3>Infrastructure</h3><p id="jobs-infrastructure"></p><div id="jobs-nodes" class="table-wrap"></div><div id="jobs-node-commands" class="table-wrap"></div></div>
+  </section>
+  <section id="no-access-page" class="card" hidden><h2>Workspace access unavailable</h2><p>This account has no current permissions here. An access administrator can restore access. You can switch demo users in Profile.</p></section>
+  <section id="access-policy-page" hidden aria-label="Access operating policy"></section>
+  <section id="assistant-policy-page" hidden aria-label="Assistant operating policy"></section>
+  <section id="admin-page" hidden>
+    <div class="card"><div class="card-heading"><div><h2>Accounts</h2><p>Access changes apply immediately, including while others view business history.</p></div><button id="admin-refresh" type="button" class="secondary">Refresh accounts</button></div>
+    <p class="field-help">Preview identity registration does not create passwords or send invitations. Agents require separate delegated authority; a role alone cannot act as an agent.</p><div id="admin-members" class="table-wrap"></div><button id="admin-new" type="button" class="secondary">New account</button></div>
+    <div class="card"><h2 id="admin-form-title">Create account</h2><form id="admin-form"><label for="admin-name">Name</label><input id="admin-name" required maxlength="80" autocomplete="off"><div id="admin-new-fields" class="schedule-fields"><div><label for="admin-login">Login name</label><input id="admin-login" required pattern="[a-z][a-z0-9_]{0,47}" maxlength="48" autocomplete="off"></div><div><label for="admin-kind">Identity kind</label><select id="admin-kind" required><option value="">Choose a kind…</option></select></div></div><label id="admin-enabled-field" hidden><input id="admin-enabled" type="checkbox"> Workspace access enabled</label><h3>Roles</h3><p class="field-help">Choose roles explicitly. Access administrators have no automatic business-data access. Instrument and trading capabilities are planned; their role permissions do not enable an unfinished feature.</p><div id="admin-roles" class="admin-roles"></div><div class="schedule-actions"><button type="submit">Save account</button></div></form>
+    <div id="admin-pending" class="profile-note" hidden><p>A request is retained for reconciliation. Check accounts and recent changes before retrying. Retry sends the original command with the same request identity.</p><button id="admin-retry" type="button" class="secondary">Retry original request</button><button id="admin-discard" type="button" class="secondary">Discard retained request</button></div></div>
+    <div class="card"><h2>Recent access changes</h2><p class="field-help">Latest 100 committed changes in this workspace. Earlier audit records remain in storage.</p><div id="admin-audit" class="table-wrap"></div></div>
+    <div id="admin-grants-card" class="card" hidden><h2>Agent grants in force</h2><p class="field-help">Every agent grant in this workspace that is neither revoked nor expired, by person and then agent. Each person grants and revokes their own, and Retire ends every grant to an agent. A grant reads nothing while its person lacks access.</p><div id="admin-grants" class="table-wrap"></div></div>
+    <div id="admin-grant-history-card" class="card" hidden><h2>Recent agent grant changes</h2><p class="field-help">Latest 100 grants and ends of grants in this workspace, newest first. A person’s new grant to an agent replaces their earlier one. Earlier records remain in storage.</p><div id="admin-grant-history" class="table-wrap"></div></div>
+  </section>
+  <section id="ai-page" hidden aria-label="AI settings">
+    <div class="tabs" role="tablist" aria-label="AI settings"><button id="ai-tab-usage" type="button" class="ai-tab" role="tab" aria-selected="false" aria-controls="ai-usage">Usage</button><button id="ai-tab-models" type="button" class="ai-tab active" role="tab" aria-selected="true" aria-controls="ai-models">Models &amp; prices</button><button id="ai-tab-providers" type="button" class="ai-tab" role="tab" aria-selected="false" aria-controls="ai-providers">Providers</button><button id="ai-tab-agents" type="button" class="ai-tab" role="tab" aria-selected="false" aria-controls="ai-agents">Agents</button><button id="ai-tab-prompts" type="button" class="ai-tab" role="tab" aria-selected="false" aria-controls="ai-prompts">Prompts</button></div>
+    <section id="ai-prompts" role="tabpanel" aria-labelledby="ai-tab-prompts" hidden>
+      <div class="card"><h2>Prompts</h2><p>Configure application, page, tool and provider-test text for this installation. No assistant prompt text is bundled. Prompts guide its work; permissions, explicit financial choices and user authorization still apply. Assign the Assistant prompt editor role to delegate this configuration.</p>
+        <form id="ai-prompt-form"><label>Scope<select id="ai-prompt-page"></select></label><p id="ai-prompt-version" class="field-help"></p>
+          <label>Guidance<textarea id="ai-prompt-instructions" rows="12" spellcheck="true"></textarea></label>
+          <p class="field-help">Blank optional guidance is omitted; provider tests require a question. Agent instructions are configured on the Agents tab. Saved versions are retained for the questions that used them.</p>
+          <div class="actions"><button id="ai-prompt-save" type="submit">Save prompt</button><button id="ai-prompt-retry" type="button" class="secondary" hidden>Retry same save</button><button id="ai-prompt-discard" type="button" class="secondary" hidden>Discard saved request</button></div>
+        </form><p id="ai-prompt-status" role="status"></p>
+      </div>
+    </section>
+    <section id="ai-usage" role="tabpanel" aria-labelledby="ai-tab-usage" hidden>
+      <div class="card"><div class="card-heading"><div><h2>Usage</h2><p>Model calls, tokens and exact cost by model, user or agent.</p></div><button id="ai-usage-refresh" type="button" class="secondary">Refresh AI settings</button></div><p class="field-help">A call falls on the local date of its start in the time zone you choose. Each currency reference has its own totals, never added to another’s, and provider tests are a row of their own. Usage shows who made calls and what they cost, never what was asked or answered.</p>
+        <form id="ai-usage-form"><div class="schedule-fields"><label>Time zone<select id="ai-usage-zone"></select></label><label>Group by<select id="ai-usage-by"><option value="">Choose a grouping…</option></select></label><label>From · first day<input id="ai-usage-from" type="date"></label><label>To · day after the last, not included<input id="ai-usage-to" type="date" aria-describedby="ai-usage-range"></label></div><p id="ai-usage-range" class="field-help"></p>
+          <div class="schedule-actions"><button type="submit">Show usage</button><button id="ai-usage-export" type="button" class="secondary">Export CSV</button></div></form></div>
+      <div id="ai-usage-pending" class="profile-note" hidden><p id="ai-usage-pending-text"></p><button id="ai-usage-retry" type="button" class="secondary">Retry original request</button><button id="ai-usage-discard" type="button" class="secondary">Discard retained request</button></div>
+      <div id="ai-usage-report" class="card" hidden><h2>Report</h2><p id="ai-usage-bounds" class="field-help"></p><p id="ai-usage-empty" class="field-help" hidden>No call started on these days.</p><div id="ai-usage-sections"></div></div>
+      <div class="card"><h2>Recent exports</h2><p class="field-help">Latest 100 usage exports in this workspace. Each records the report it carried; earlier audit records remain in storage.</p><div id="ai-usage-audit" class="table-wrap"></div></div>
+    </section>
+    <section id="ai-models" role="tabpanel" aria-labelledby="ai-tab-models">
+      <div class="card"><div class="card-heading"><div><h2>Models</h2><p id="ai-model-asof"></p></div><button id="ai-models-refresh" type="button" class="secondary">Refresh AI settings</button></div><p class="field-help">Rates are per million tokens in the stated currency. No model or price is installed: administrators enter each one, and every change appends a new version.</p><div id="ai-model-table" class="table-wrap"></div></div>
+      <div class="card"><h3>Add a model</h3><form id="ai-model-form"><div class="schedule-fields three"><label>Provider<select id="ai-model-vendor" required><option value="">Choose a provider…</option></select></label><label>Model identifier<input id="ai-model-identifier" required autocomplete="off" autocapitalize="off" spellcheck="false"></label><label>Display name<input id="ai-model-name" required autocomplete="off"></label></div><p class="field-help">Enter the vendor’s exact model identifier; it cannot change later, while the display name can. A provider’s first model also adds the provider, without a key.</p><div class="schedule-actions"><button type="submit">Add model</button></div></form></div>
+      <div id="ai-model-card" class="card" hidden><h3 id="ai-model-title"></h3><p id="ai-model-facts" class="field-help"></p>
+        <form id="ai-rename-form" class="ai-rename"><label>Display name<input id="ai-rename-name" required autocomplete="off"></label><button type="submit" class="secondary">Save display name</button></form>
+        <h4>Capabilities</h4><p id="ai-capability-summary" class="field-help"></p><div id="ai-capability-table" class="table-wrap"></div>
+        <div class="schedule-actions"><button id="ai-model-enable" type="button">Enable model</button><button id="ai-model-disable" type="button" class="secondary">Disable model</button></div>
+        <form id="ai-capability-form" class="ai-price"><h4>Record capabilities</h4><p class="field-help">Enter each fact from the vendor’s published documentation with its source and the date you checked it. A new version leaves the model enabled or disabled; a running turn stops at its next call.</p><p id="ai-capability-note" class="field-help" hidden></p>
+          <fieldset class="ai-choice"><legend>Model identifier policy</legend>
+            <label><input type="radio" name="ai-identifier-policy" value="fixed"> Fixed identifier: the vendor documents that it is not repointed</label>
+            <label><input type="radio" name="ai-identifier-policy" value="alias"> Approve provider alias: the vendor may change its underlying model</label>
+          </fieldset><p class="field-help">For an alias, cite the vendor's alias policy in Identifier source. Capabilities and prices remain the recorded versions; review them when the vendor changes the model. Calls accept only the requested name or the other served identifiers explicitly listed below. A vendor reporting the alias itself does not prove which underlying model ran.</p>
+          <label class="ai-currency">Output limit · tokens<input id="ai-capability-limit" inputmode="numeric" autocomplete="off"></label>
+          <fieldset class="ai-choice"><legend>Reasoning efforts the model accepts</legend><div id="ai-capability-efforts"></div></fieldset>
+          <label class="ai-served">Other identifiers its vendor may report as served<textarea id="ai-capability-served" rows="2" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="ai-capability-served-help"></textarea></label><p id="ai-capability-served-help" class="field-help">Separate identifiers with spaces, commas or new lines: at most 16, each once, and never the model’s own.</p><label class="ai-none"><input id="ai-capability-only-own" type="checkbox"> The vendor reports only this model’s own identifier</label>
+          <div class="table-wrap"><table class="ai-rates ai-sources"><thead><tr><th scope="col">Fact</th><th scope="col">Source</th><th scope="col">Checked on</th></tr></thead><tbody id="ai-capability-sources"></tbody></table></div>
+          <div class="schedule-actions"><button type="submit">Record capabilities</button></div></form>
+        <h4>Price revisions</h4><div id="ai-price-history" class="table-wrap"></div>
+        <h4>Pricing from now on</h4><div id="ai-price-schedule" class="table-wrap"></div>
+        <form id="ai-price-form" class="ai-price"><h4>Add a price revision</h4><p class="field-help">Within its interval a new revision takes precedence over every earlier one; earlier revisions stay unchanged. Choose each value explicitly: a blank is never read as “not offered”, no tier or open-ended.</p>
+          <label class="ai-currency">Currency<select id="ai-price-currency"><option value="">Choose a currency…</option></select></label><p id="ai-price-currency-note" class="field-help" hidden>No currency is readable with your current roles. Pricing needs a role that reads market data, which an access administrator can grant.</p>
+          <div class="table-wrap"><table class="ai-rates"><thead><tr><th scope="col">Rate per million tokens</th><th scope="col">All prompts</th><th scope="col">Long-prompt tier</th></tr></thead><tbody><tr><th scope="row">Uncached input</th><td><input id="ai-rate-uncachedInput" inputmode="decimal" autocomplete="off" aria-label="All prompts · Uncached input"></td><td><input id="ai-tier-uncachedInput" inputmode="decimal" autocomplete="off" aria-label="Long-prompt tier · Uncached input"></td></tr><tr><th scope="row">Cache read</th><td><input id="ai-rate-cacheRead" inputmode="decimal" autocomplete="off" aria-label="All prompts · Cache read"><label class="ai-none"><input id="ai-none-cacheRead" type="checkbox"> Not offered</label></td><td><input id="ai-tier-cacheRead" inputmode="decimal" autocomplete="off" aria-label="Long-prompt tier · Cache read"></td></tr><tr><th scope="row">Cache write</th><td><input id="ai-rate-cacheWrite" inputmode="decimal" autocomplete="off" aria-label="All prompts · Cache write"><label class="ai-none"><input id="ai-none-cacheWrite" type="checkbox"> Not offered</label></td><td><input id="ai-tier-cacheWrite" inputmode="decimal" autocomplete="off" aria-label="Long-prompt tier · Cache write"></td></tr><tr><th scope="row">Output</th><td><input id="ai-rate-output" inputmode="decimal" autocomplete="off" aria-label="All prompts · Output"></td><td><input id="ai-tier-output" inputmode="decimal" autocomplete="off" aria-label="Long-prompt tier · Output"></td></tr></tbody></table></div>
+          <fieldset class="ai-choice"><legend>Long-prompt tier</legend><label><input id="ai-tier-none" type="radio" name="ai-price-tier" value="none"> No tier</label><label><input id="ai-tier-on" type="radio" name="ai-price-tier" value="tier"> Tier rates for prompts over</label><input id="ai-tier-threshold" inputmode="numeric" autocomplete="off" aria-label="Tier threshold in prompt tokens"> tokens</fieldset>
+          <div class="schedule-fields"><label>Effective from · <span data-user-time-zone></span><input id="ai-price-from" type="datetime-local" step="1"></label><fieldset class="ai-choice"><legend>Ends</legend><label><input id="ai-price-open" type="radio" name="ai-price-end" value="open"> Open-ended</label><label><input id="ai-price-ends" type="radio" name="ai-price-end" value="ends"> At</label><input id="ai-price-to" type="datetime-local" step="1" aria-label="Price ends at"></fieldset></div>
+          <div class="schedule-actions"><button type="submit">Add price</button></div></form>
+        <form id="ai-withdraw-form" class="ai-price"><h4>Withdraw pricing</h4><p class="field-help">Calls starting in this interval have no price in force, so they are refused. Revisions outside it are unaffected.</p>
+          <div class="schedule-fields"><label>Effective from · <span data-user-time-zone></span><input id="ai-withdraw-from" type="datetime-local" step="1"></label><fieldset class="ai-choice"><legend>Ends</legend><label><input id="ai-withdraw-open" type="radio" name="ai-withdraw-end" value="open"> Open-ended</label><label><input id="ai-withdraw-ends" type="radio" name="ai-withdraw-end" value="ends"> At</label><input id="ai-withdraw-to" type="datetime-local" step="1" aria-label="Withdrawal ends at"></fieldset></div>
+          <div class="schedule-actions"><button type="submit" class="secondary">Withdraw price</button></div></form></div>
+      <div id="ai-models-pending" class="profile-note" hidden><p>A model or price request is retained for reconciliation. Check the models and recent changes before retrying. Retry sends the original request with the same request identity.</p><button id="ai-models-retry" type="button" class="secondary">Retry original request</button><button id="ai-models-discard" type="button" class="secondary">Discard retained request</button></div>
+      <div class="card"><h2>Recent model changes</h2><p class="field-help">Latest 100 model and price changes in this workspace. Earlier audit records remain in storage.</p><div id="ai-model-audit" class="table-wrap"></div></div>
+    </section>
+    <section id="ai-providers" role="tabpanel" aria-labelledby="ai-tab-providers" hidden>
+      <div class="card"><div class="card-heading"><div><h2>Providers</h2><p>Model vendors the page assistant can call once a provider is qualified.</p></div><button id="ai-providers-refresh" type="button" class="secondary">Refresh AI settings</button></div><p class="field-help">Once a provider is qualified and enabled, users’ questions and the data visible to them are sent to its vendor account, whose owner may see them. That account’s spending limit is the only cumulative cap.</p><div id="ai-provider-table" class="table-wrap"></div></div>
+      <div id="ai-provider-card" class="card" hidden><h3 id="ai-provider-title"></h3><p id="ai-provider-facts" class="field-help"></p>
+        <div class="schedule-actions"><button id="ai-provider-enable" type="button">Enable provider</button><button id="ai-provider-disable" type="button" class="secondary">Disable provider</button><button id="ai-provider-key" type="button" class="secondary">Replace key</button></div>
+        <h4>Terms</h4><p id="ai-terms-summary" class="field-help"></p><div id="ai-terms-table" class="table-wrap"></div>
+        <form id="ai-terms-form" class="ai-price"><h4>Record terms</h4><p class="field-help">Copy each term from the vendor’s published documents for the account type, with its source and the date you checked it. Recording terms clears the attestation and disables the provider until it is attested and enabled again.</p>
+          <label class="ai-served">Account type<input id="ai-terms-account" autocomplete="off"></label>
+          <div class="table-wrap"><table class="ai-rates ai-sources"><thead><tr><th scope="col">Terms</th><th scope="col">Text</th><th scope="col">Source</th><th scope="col">Checked on</th></tr></thead><tbody>
+            <tr><th scope="row">Retention</th><td><textarea id="ai-terms-retention" rows="2" aria-label="Retention terms"></textarea></td><td><input id="ai-terms-retention-source" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Retention terms source"></td><td><input id="ai-terms-retention-on" type="date" aria-label="Retention terms checked on"></td></tr>
+            <tr><th scope="row">Training use</th><td><textarea id="ai-terms-training" rows="2" aria-label="Training-use terms"></textarea></td><td><input id="ai-terms-training-source" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Training-use terms source"></td><td><input id="ai-terms-training-on" type="date" aria-label="Training-use terms checked on"></td></tr>
+            <tr><th scope="row">Owner access</th><td><textarea id="ai-terms-owner" rows="2" aria-label="Owner-access terms"></textarea></td><td><input id="ai-terms-owner-source" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Owner-access terms source"></td><td><input id="ai-terms-owner-on" type="date" aria-label="Owner-access terms checked on"></td></tr>
+          </tbody></table></div>
+          <div class="schedule-actions"><button type="submit">Record terms</button></div></form>
+        <form id="ai-attest-form" class="ai-price"><h4>Attest</h4><p id="ai-attest-statement"></p><label class="ai-none"><input id="ai-attest-confirm" type="checkbox" aria-describedby="ai-attest-statement"> I make this attestation</label>
+          <div class="schedule-actions"><button type="submit" class="secondary">Attest</button></div></form>
+        <form id="ai-test-form" class="ai-price"><h4>Test</h4><p class="field-help">Test sends the provider-test question and optional instructions configured under Prompts, without workspace data or tools, once to the model you choose. It records the outcome, usage and cost and works whether or not the provider and the model are enabled.</p>
+          <label>Model<select id="ai-test-model"></select></label><label>Reasoning effort<select id="ai-test-effort"></select></label><p id="ai-test-note" class="field-help" hidden></p>
+          <div class="schedule-actions"><button type="submit">Test</button></div></form>
+        <h4>Last test</h4><p id="ai-test-summary" class="field-help"></p><div id="ai-test-table" class="table-wrap"></div></div>
+      <div id="ai-providers-pending" class="profile-note" hidden><p>A provider request is retained for reconciliation. Check the provider and recent changes before retrying. Retry sends the original request with the same request identity.</p><button id="ai-providers-retry" type="button" class="secondary">Retry original request</button><button id="ai-providers-discard" type="button" class="secondary">Discard retained request</button></div>
+      <div id="ai-test-pending" class="profile-note" hidden><p id="ai-test-pending-text"></p><button id="ai-test-retry" type="button" class="secondary">Retry original request</button><button id="ai-test-discard" type="button" class="secondary">Discard retained request</button></div>
+      <form id="ai-key-form" class="card" hidden><h3 id="ai-key-title"></h3><label>Key<input id="ai-key-value" type="password" autocomplete="off" spellcheck="false"></label><p class="field-help">The key is sent once and never shown again, and this browser never stores it; only its last four characters are kept for display. Replacing it clears the attestation and disables the provider until it is attested and enabled again.</p><div class="schedule-actions"><button id="ai-key-submit" type="submit">Replace key</button><button id="ai-key-cancel" type="button" class="secondary">Cancel</button></div></form>
+      <div id="ai-key-pending" class="profile-note" hidden><p id="ai-key-pending-text"></p><button id="ai-key-retry" type="button" class="secondary">Retry with the same key</button><button id="ai-key-discard" type="button" class="secondary">Discard retained request</button></div>
+      <div class="card"><h2>Recent provider changes</h2><p class="field-help">Latest 100 provider changes in this workspace. A key change records only that the key was replaced.</p><div id="ai-provider-audit" class="table-wrap"></div></div>
+    </section>
+    <section id="ai-agents" role="tabpanel" aria-labelledby="ai-tab-agents" hidden>
+      <div class="card"><div class="card-heading"><div><h2>Agents</h2><p>Agents answer questions on the pages of users who grant them access.</p></div><button id="ai-agents-refresh" type="button" class="secondary">Refresh AI settings</button></div><p class="field-help">Each save records the next version as a draft, and Publish publishes the newest version. Retire is permanent: the agent can never be used or changed again, and its history stays. Opening or creating an agent fills its card from its newest version, discarding what the open card has not saved.</p><div id="ai-agent-table" class="table-wrap"></div></div>
+      <div class="card"><h3>Create an agent</h3><form id="ai-agent-create-form"><div class="schedule-fields"><label>Name<input id="ai-agent-name" required autocomplete="off"></label></div><p class="field-help">The name cannot change later. An agent is a member of this workspace with an identity of its own; it reads market data, trades and trade parties only for users who grant it access.</p><div class="schedule-actions"><button type="submit">Create agent</button></div></form></div>
+      <div id="ai-agents-pending" class="profile-note" hidden><p id="ai-agents-pending-text"></p><button id="ai-agents-retry" type="button" class="secondary">Retry original request</button><button id="ai-agents-discard" type="button" class="secondary">Discard retained request</button></div>
+      <div id="ai-agent-card" class="card" hidden><h3 id="ai-agent-title"></h3><p id="ai-agent-facts" class="field-help"></p>
+        <div class="schedule-actions"><button id="ai-agent-publish" type="button">Publish newest version</button></div>
+        <h4>Published version</h4><div id="ai-agent-published" class="table-wrap"></div>
+        <h4>Draft</h4><div id="ai-agent-draft" class="table-wrap"></div>
+        <form id="ai-agent-form" class="ai-price"><h4>Save a version</h4><p class="field-help">Every field is saved exactly as entered, and a save creates the next version as a draft.</p>
+          <div id="ai-agent-stale" class="profile-note" hidden><p>A newer version of this agent was saved after this form was filled, so saving it is refused. Start again from the newest version to see what changed.</p><button id="ai-agent-restart" type="button" class="secondary">Start from the newest version</button></div>
+          <label class="ai-served">Description<textarea id="ai-agent-description" rows="2" autocomplete="off"></textarea></label>
+          <label class="ai-served">Instructions<textarea id="ai-agent-instructions" rows="6" autocomplete="off" aria-describedby="ai-agent-instructions-help"></textarea></label><p id="ai-agent-instructions-help" class="field-help"></p>
+          <div class="schedule-fields three"><label>Model<select id="ai-agent-model"><option value="">Choose a model…</option></select></label><label>Reasoning effort<select id="ai-agent-effort"><option value="">Choose an effort…</option></select></label><label>Prompt caching<select id="ai-agent-caching"><option value="">Choose…</option><option value="on">On</option><option value="off">Off</option></select></label></div>
+          <p id="ai-agent-model-note" class="field-help" hidden>No model can be chosen yet. A version needs an enabled, qualified model with a price in force, on an enabled, qualified provider.</p>
+          <p id="ai-agent-model-pin-note" class="field-help" hidden>The model this form named is no longer offered at the capability version it named, so it is unchosen. Choose a model and an effort again.</p>
+          <fieldset class="ai-choice ai-checks"><legend>Tools</legend><div id="ai-agent-tools"></div></fieldset>
+          <fieldset class="ai-choice ai-checks"><legend>Allowed roles</legend><div id="ai-agent-roles"></div></fieldset><p id="ai-agent-roles-note" class="field-help" hidden></p><p class="field-help">Users with an allowed role may grant this agent access to what its tools read. Each allowed role must use agents and hold every permission the tools need.</p>
+          <label>Additional operating role<select id="ai-agent-operating-role"><option value="">Choose an additional operating role…</option></select></label><p class="field-help">The agent keeps its base reader role. Publish activates this additional role; changing it ends existing access grants. Each user must explicitly grant its permissions and still hold them when an operation runs. Financial changes require manual review and approval.</p>
+          <div class="schedule-fields three"><label>Tool steps per turn<input id="ai-agent-tool-steps" inputmode="numeric" autocomplete="off"></label><label>Input tokens per turn<input id="ai-agent-input-tokens" inputmode="numeric" autocomplete="off"></label><label>Output tokens per call<input id="ai-agent-output-tokens" inputmode="numeric" autocomplete="off" aria-describedby="ai-agent-output-help"></label><label>Time per turn · seconds<input id="ai-agent-elapsed" inputmode="numeric" autocomplete="off"></label><label>Time per read · seconds<input id="ai-agent-read" inputmode="numeric" autocomplete="off" aria-describedby="ai-agent-read-help"></label><label>Retries per call<input id="ai-agent-retries" inputmode="numeric" autocomplete="off"></label><label>Earlier turns sent per turn<input id="ai-agent-history" inputmode="numeric" autocomplete="off" aria-describedby="ai-agent-history-help"></label><label>Grant duration · days<input id="ai-agent-grant-days" inputmode="numeric" autocomplete="off" aria-describedby="ai-agent-grant-help"></label></div><p id="ai-agent-output-help" class="field-help"></p><p id="ai-agent-grant-help" class="field-help"></p><p id="ai-agent-read-help" class="field-help">Each read the agent makes may take 1 to 30 seconds, and no more than the time per turn. A read that takes longer ends the answer.</p><p id="ai-agent-history-help" class="field-help">Each question sends the agent the latest 0 to 1,000 earlier questions and answers of its conversation; older ones are left out, so a conversation can keep going. The input tokens per turn still bound what is sent.</p>
+          <div class="schedule-actions"><button type="submit">Save version</button></div></form>
+        <div class="schedule-actions"><label class="ai-none"><input id="ai-agent-retire-confirm" type="checkbox"> I understand that retiring this agent is permanent</label><button id="ai-agent-retire" type="button" class="secondary">Retire agent</button></div></div>
+      <div class="card"><h2>Recent agent changes</h2><p class="field-help">Latest 100 agent changes in this workspace. Earlier audit records remain in storage.</p><div id="ai-agent-audit" class="table-wrap"></div></div>
+    </section>
+  </section>
+  <footer id="workspace-footer">Workspace information has not been verified.</footer>
+</main>
+<aside id="assistant-panel" class="assistant-panel" aria-label="Assistant" hidden>
+  <div id="assistant-resize" class="assistant-resize" role="separator" aria-orientation="vertical" aria-label="Resize the assistant" tabindex="0"></div>
+  <div class="assistant-header">
+    <label for="assistant-agent" class="sr-only">Agent</label><select id="assistant-agent"></select>
+    <div class="assistant-header-actions"><button id="assistant-history-open" type="button" class="secondary">History</button><button id="assistant-new" type="button" class="secondary">New conversation</button><button id="assistant-close" type="button" class="icon-button" aria-label="Close the assistant">×</button></div>
+  </div>
+  <section id="assistant-history" class="assistant-history" aria-labelledby="assistant-history-title" hidden>
+    <div class="assistant-history-heading"><h2 id="assistant-history-title">Conversations</h2><button id="assistant-history-close" type="button" class="text-button">Back to the conversation</button></div>
+    <p id="assistant-history-status" role="status"></p><ul id="assistant-history-list"></ul>
+  </section>
+  <div id="assistant-conversation" class="assistant-conversation">
+    <p id="assistant-empty" class="assistant-empty">Ask about the page you are looking at. The assistant reads it at the knowledge and As of date below.</p>
+    <ol id="assistant-turns" class="assistant-turns"></ol>
+  </div>
+  <p id="assistant-status" class="sr-only" role="status" aria-live="polite"></p>
+  <div id="assistant-stream" class="assistant-stream" role="status" hidden><p id="assistant-stream-text"></p><button id="assistant-resume" type="button" class="secondary">Resume</button><button id="assistant-reload" type="button" class="secondary">Reload the page</button></div>
+  <div id="assistant-consent" class="assistant-consent" role="group" aria-labelledby="assistant-consent-text" hidden><p id="assistant-consent-text"></p><div class="assistant-consent-actions"><button id="assistant-allow" type="button">Allow</button><button id="assistant-deny" type="button" class="secondary">Cancel</button></div></div>
+  <div class="assistant-looking"><span class="eyebrow">Looking at</span><strong id="assistant-looking-page"></strong><span id="assistant-looking-shows"></span><span id="assistant-looking-layout" hidden></span><span id="assistant-looking-context" class="assistant-looking-context"></span></div>
+  <form id="assistant-composer" class="assistant-composer">
+    <label for="assistant-question" class="sr-only">Your question</label><textarea id="assistant-question" rows="3" placeholder="Ask about this page" autocomplete="off"></textarea>
+<p id="assistant-error" class="assistant-error" role="alert" hidden></p>
+    <div class="assistant-composer-actions"><span id="assistant-composer-note" class="field-help"></span><button id="assistant-discard" type="button" class="secondary" hidden>Discard</button><button id="assistant-retry" type="button" class="secondary" hidden>Retry</button><button id="assistant-send" type="submit">Send</button></div>
+  </form>
+</aside>
+<!-- blotter-window: shelf -->
+<div id="editor-shelf" hidden>
+<div id="risk-report" class="risk-report" hidden>
+ <p id="risk-scope" class="field-help">Selected books and portfolios before table row filters, using the financial context above. Revalue held instruments through connected market quotes and computed curve outputs. Results keep each valuation measure and currency separate; rates, actual fixings and futures settlement state stay fixed.</p>
+ <p id="risk-status" class="side-panel-status" role="status" hidden></p><button id="risk-reload" type="button" class="secondary" hidden>Read it again</button>
+ <details id="risk-history"><summary>Recent risk jobs</summary><label for="risk-job-history">Job captured market time · <span data-user-time-zone></span></label><select id="risk-job-history"><option value="">Choose a retained job…</option></select><button id="risk-job-return" type="button" class="text-button" hidden>Return to selected financial context</button></details>
+ <form id="risk-form"><fieldset id="risk-fields">
+  <p id="risk-carried" class="field-help" role="status" hidden></p>
+  <fieldset class="risk-choices"><legend>Report</legend>
+   <label class="risk-choice"><input type="radio" name="risk-choice" value="held" required><span><strong>Shock every held contract</strong><small id="risk-choice-held-detail"></small></span></label>
+   <label class="risk-choice"><input type="radio" name="risk-choice" value="parallel" required><span><strong>Parallel shift</strong><small id="risk-choice-parallel-detail"></small></span></label>
+   <label class="risk-choice"><input type="radio" name="risk-choice" value="custom" required><span><strong>Custom scenario</strong><small>Any target the catalog offers, around nested stresses</small></span></label>
+   <label class="risk-choice"><input type="radio" name="risk-choice" value="scenarios" required><span><strong>Named joint scenarios</strong><small>Move several factors together and compare full repricing losses</small></span></label>
+   <label class="risk-choice"><input type="radio" name="risk-choice" value="derivatives" required><span><strong>Greeks and selected cross-gamma</strong><small>Choose axes and mixed pairs, with half / nominal / double step agreement</small></span></label>
+  </fieldset>
+  <fieldset id="risk-preset" class="risk-preset" hidden disabled>
+   <p id="risk-preset-summary" class="field-help"></p>
+   <div id="risk-sizes" class="risk-sizes"></div>
+   <p class="field-help">Each size is a positive absolute bump in its price unit. There are no built-in sizes.</p>
+   <p id="risk-preset-gaps" class="field-help" hidden></p>
+  </fieldset>
+  <fieldset id="risk-custom" class="risk-custom" hidden disabled>
+   <div class="risk-scenario-editor"><div class="risk-scenario-heading"><div><span class="eyebrow">Scenario lab</span><h4>Explore a market move</h4></div><p id="risk-scenario" class="field-help" role="status">Risk around the selected unchanged market.</p></div>
+   <div class="risk-target-filters"><label>Coordinate<select id="risk-coordinate"><option value="all">All coordinates</option><option value="market_quote">Shared market factor</option><option value="computed_output">Computed curve output</option></select></label><label>Target shape<select id="risk-target-kind"><option value="all">All target shapes</option><option value="contract">Exact contract</option><option value="points">Explicit points</option><option value="parallel">Whole curve</option><option value="delivery_bucket">Delivery bucket</option></select></label></div>
+   <label for="risk-factor">Scenario target</label><select id="risk-factor" required><option value="">Choose a scenario target…</option></select>
+   <div id="risk-bucket" class="risk-bucket-fields" hidden><label>Delivery start<input id="risk-from" type="date"></label><label>Delivery end · exclusive<input id="risk-to" type="date"></label><p class="field-help">The backend selects whole contracts contained in this delivery window.</p></div>
+   <label for="risk-bump">Symmetric bump · positive price points</label><input id="risk-bump" type="text" inputmode="decimal" required maxlength="45" placeholder="Enter an explicit bump"><p id="risk-unit" class="field-help"></p></div>
+  </fieldset>
+  <fieldset id="risk-joint" class="risk-joint-editor" hidden disabled></fieldset>
+  <fieldset id="risk-parent" hidden disabled><legend>Parent market scenario</legend><p id="risk-parent-context" class="field-help"></p>
+   <details id="risk-stress"><summary>Build a nested stress scenario</summary><p class="field-help">Each child adds an explicit offset to its parent. Quote shifts flow through connected curves; output shifts keep those connections. Return to a parent to remove only the last child.</p>
+   <div class="risk-target-filters"><label>Coordinate<select id="risk-stress-coordinate"><option value="all">All coordinates</option><option value="market_quote">Shared market factor</option><option value="computed_output">Computed curve output</option></select></label><label>Target shape<select id="risk-stress-target-kind"><option value="all">All target shapes</option><option value="contract">Exact contract</option><option value="points">Explicit points</option><option value="parallel">Whole curve</option><option value="delivery_bucket">Delivery bucket</option></select></label></div>
+   <label for="risk-stress-factor">Scenario target</label><select id="risk-stress-factor"><option value="">Choose a scenario target…</option></select>
+   <div id="risk-stress-bucket" class="risk-bucket-fields" hidden><label>Delivery start<input id="risk-stress-from" type="date"></label><label>Delivery end · exclusive<input id="risk-stress-to" type="date"></label><p class="field-help">The backend selects whole contracts contained in this delivery window.</p></div>
+   <label for="risk-stress-size">Signed shift · price points</label><input id="risk-stress-size" type="text" inputmode="decimal" maxlength="45" placeholder="For example 0.10 or -0.10"><p id="risk-stress-unit" class="field-help"></p><div class="pricing-toolbar"><button id="risk-stress-add" type="button" class="secondary">Add child stress</button><button id="risk-stress-parent" type="button" class="secondary" disabled>Return to parent</button><button id="risk-stress-clear" type="button" class="text-button" disabled>Return to market</button></div><ol id="risk-stress-stack"></ol></details>
+  </fieldset>
+  <p id="risk-excluded" class="field-help" hidden></p>
+  <div class="risk-run-actions"><button id="risk-run" type="submit">Run now</button><button id="risk-queue" type="submit" class="secondary">Queue as job</button></div>
+  <p id="risk-run-note" class="field-help" hidden></p>
+ </fieldset></form>
+ <p id="risk-progress" class="field-help" role="status"></p>
+ <div id="risk-job" hidden><p id="risk-job-context" class="field-help"></p><p id="risk-job-scenario" class="field-help"></p><p id="risk-job-status" class="field-help" role="status"></p><ul id="risk-job-parts" class="risk-job-parts"></ul><div class="pricing-toolbar"><button id="risk-job-cancel" type="button" class="secondary" hidden>Cancel job</button><button id="risk-job-refresh" type="button" class="secondary" hidden>Refresh job</button><button id="risk-job-retry" type="button" class="secondary" hidden>Reconcile submission</button><button id="risk-job-discard" type="button" class="text-button" hidden>Discard unconfirmed request</button></div></div>
+ <div id="risk-work" class="field-help" role="status"></div>
+</div>
+<div id="futures-new-trade" class="editing" hidden>
+ <form id="futures-form" hidden><fieldset id="futures-fields" class="futures-fields">
+  <section id="futures-instrument"></section>
+  <p id="futures-terms" class="field-help">Select a dated contract to see its terms.</p>
+  <section id="futures-trade-terms" class="trade-booking-terms"></section>
+  <section id="futures-draft-valuation" class="draft-valuation"></section>
+  <p class="field-help">Booking facts are assigned by the server. The selected market date supplies the separate pricing effective time.</p>
+  <button id="futures-book-submit" type="submit">Book future</button>
+ </fieldset></form>
+</div>
+<div id="swap-editing" class="editing swap-editing" hidden>
+ <p id="swap-reference" class="profile-note"></p><p id="swap-mode" class="field-help" role="status"></p><p id="swap-error" role="alert" hidden></p>
+ <div class="trade-editor-actions"><p id="swap-action-status" class="field-help" role="status"></p><button id="swap-preview" type="submit" form="swap-form">Preview booking</button><button id="swap-submit" type="button" disabled>Book financial swap</button></div>
+ <div id="swap-revisions" hidden><label for="swap-revision">Trade revision · selected by context</label><input id="swap-revision" readonly><button id="swap-latest" type="button" class="secondary">Reload latest revision</button></div>
+ <form id="swap-form"><fieldset id="swap-fields">
+  <div id="swap-amendment" hidden><label for="swap-reason">Amendment reason</label><input id="swap-reason" maxlength="500"><p id="swap-effective" class="field-help"></p></div>
+  <section id="swap-instrument" class="instrument-editor" data-instrument-type="financial_swap"><div class="entry-section-heading"><div><div class="eyebrow">INSTRUMENT</div><h3>Swap sides</h3></div></div>
+  <div id="swap-type-choices" class="ticket-add" role="group" aria-label="Add swap side"></div>
+  <select id="swap-type" hidden aria-label="Selected instrument type"><option value=""></option><option value="financial_fixed_floating">Fixed for floating</option><option value="financial_floating_floating">Floating for floating</option></select>
+  <p id="swap-template-note" class="field-help" role="status">Choose a structure to set up its sides.</p>
+  <section id="swap-delivery"><h3>Contract delivery terms</h3><p class="field-help">Choose each side independently. Delivery ends are exclusive.</p><div class="swap-term-columns"><section id="swap-fixed-delivery"><h4>Fixed side</h4></section><section id="swap-first-delivery" hidden><h4>First floating side</h4></section><section id="swap-floating-delivery"><h4>Floating side</h4></section></div><div id="swap-date-tools"></div></section>
+  <section id="swap-quantity-terms"><h3>Notional quantity</h3>
+  <div class="schedule-fields"><div><label for="swap-quantity">Amount · <span id="swap-unit"></span></label><input id="swap-quantity" required inputmode="decimal" maxlength="45"></div><div><label for="swap-quantity-unit">Quantity unit</label><select id="swap-quantity-unit" required></select></div></div>
+  <p><strong>Application basis · Total for each side’s delivery period</strong></p><p class="field-help">The full notional applies once to each side’s selected delivery period, even when dates differ. Daily observations average prices; they do not repeat the quantity. Each booked side has one settlement payment. Compatible energy units convert directly. Daily quantity rates, allocation across recurring settlements and MW levels are unavailable in this ticket.</p></section>
+  <div class="entry-section-heading"><div><div class="eyebrow">SIDES</div><h3>Direction &amp; side pricing</h3></div></div>
+  <p id="swap-side-compatibility" class="field-help" hidden>Both floating sides must use the same commodity and compatible quantity units.</p>
+  <div class="instrument-sides swap-sides" aria-label="Financial swap sides">
+   <div id="swap-fixed-editor"></div><div id="swap-first-editor" hidden></div>
+   <div id="swap-floating-editor"></div>
+  </div>
+
+  <section id="swap-observations"><h3>Observation &amp; payment rules</h3><p class="field-help">Reset frequency selects price observations; averaging combines their prices. Fixing boundaries come from the exact index convention. Payment rules determine when cash is due, independently of observations and quantity.</p><div class="swap-term-columns"><section id="swap-fixed-observations"><h4>Fixed side payment</h4></section><section id="swap-first-observations" hidden><h4>First floating side</h4></section><section id="swap-floating-observations"><h4>Floating side</h4></section></div></section>
+  <h3>Valuation review &amp; booking</h3><div class="schedule-fields"><div><label for="swap-discounting">Discounting</label><select id="swap-discounting" required><option value="">Choose…</option><option value="currency_default">Currency default curve</option><option value="none">Explicitly undiscounted</option></select></div></div>
+  <section id="swaps-draft-valuation" class="draft-valuation"></section>
+  </section>
+  <section id="swap-trade-terms" class="trade-booking-terms"></section>
+  <p id="swap-coverage" class="field-help"></p><p class="field-help">Reset frequency selects observation dates; averaging method combines their prices. Payment frequency groups the resulting cash flows. The instrument quantity applies once after signed side PVs are summed. This model has one monthly payment per side. Each floating reset uses its index’s fixing convention and the selected market context; inspect its actual or projected state in the valued schedule.</p>
+ </fieldset></form>
+ <section id="swap-change-review" class="trade-change-review" hidden></section>
+ <div id="swap-confirmation" class="trade-editor-confirmation" hidden><label><input id="swap-confirm" type="checkbox"> <span id="swap-confirm-label">I reviewed these exact terms and valuation.</span></label></div>
+ <section id="swap-result" hidden><h3>Valuation &amp; schedules</h3><p id="swap-pv" class="profile-note"></p><div id="swap-schedules"></div></section>
+ <div id="swap-amount-format"></div>
+</div>
+<div id="trade-editing" class="editing" hidden>
+  <div class="schedule-fields"><div><label for="trade-revision">Trade revision · selected by context</label><input id="trade-revision" readonly></div><div><label>View</label><p id="trade-editor-mode" role="status"></p><button id="trade-reload" type="button" class="secondary">Reload latest revision</button></div></div>
+  <p id="trade-editor-reference" class="profile-note"></p>
+  <p id="trade-error" role="alert" hidden></p>
+  <div class="trade-editor-actions"><p id="trade-action-status" class="field-help" role="status">Change the terms, enter an amendment reason, then preview changes.</p><button id="trade-preview" type="submit" form="trade-amend-form">Preview changes</button><button id="trade-submit" type="button" disabled>Save amendment</button></div>
+  <form id="trade-amend-form"><fieldset id="trade-amend-fields" class="futures-fields">
+    <div><label for="trade-reason">Amendment reason</label><input id="trade-reason" required maxlength="500" autocomplete="off"><p id="trade-effective" class="field-help"></p></div>
+    <section id="trade-trade-terms" class="trade-booking-terms"></section>
+    <section id="trade-instrument"></section>
+    <p id="trade-editor-terms" class="field-help"></p>
+    <p class="field-help">This corrects the current unprocessed booking. Standard contract terms stay shared. Rolls, termination and settlement are separate operations.</p>
+  </fieldset></form>
+  <div id="trade-preview-result" class="profile-note trade-editor-confirmation" hidden><p id="trade-preview-values"></p><label><input id="trade-confirm" type="checkbox"> I reviewed these changes and their effective time.</label></div>
+  <div id="trade-amount-format"></div>
+</div>
+</div>
+<!-- /blotter-window: shelf -->
+<dialog id="profile-dialog" aria-labelledby="profile-title"><form id="preferences-form"><div class="dialog-heading"><div><div class="eyebrow">PERSONAL SETTINGS</div><h2 id="profile-title">Your profile</h2></div><button type="button" id="profile-close" class="icon-button" aria-label="Close profile">×</button></div><p id="profile-access" class="muted">Make this view work for you.</p><p id="profile-error" role="alert" hidden></p><label for="zone">Time zone</label><select id="zone" required></select><p class="field-help">Dates and times will appear in your chosen time zone.</p><div id="profile-close-convention"><label for="default-close-session">Default close convention</label><select id="default-close-session"></select><p class="field-help">Used when you open the workspace. Changing this default keeps the close currently shown; As of details can override it for this view.</p></div><label for="preferred-browse">Browse market data by</label><select id="preferred-browse"><option value="commodity">Commodity</option><option value="marketType">Market type</option></select><label class="assistant-preference"><input id="show-assistant" type="checkbox"> Show floating Assistant button</label><label class="assistant-preference"><input id="assistant-search-history" type="checkbox" aria-describedby="assistant-search-history-help"> Allow searching my chat history</label><p id="assistant-search-history-help" class="field-help">Search your earlier chats in this workspace. Matching excerpts are sent to this agent's model.</p><div class="profile-note">Your preferences are saved to your account in this workspace.</div><div class="dialog-actions"><button type="button" id="profile-cancel" class="secondary">Cancel</button><button id="profile-save" type="submit">Save preferences</button></div></form><section id="profile-grants" class="profile-grants" aria-labelledby="profile-grants-title"><h3 id="profile-grants-title" tabindex="-1">Agent access</h3><p class="field-help">The agents you allowed to read on your behalf, what each reads and until when. A grant also covers the agent’s later versions that use the same model and read nothing more. Revoking ends it at once and stops anything the agent is doing for you.</p><button id="profile-grants-show" type="button" class="secondary" aria-controls="profile-grants-list">Show agent access</button><p id="profile-grants-status" class="field-help" role="status"></p><p id="profile-grants-error" role="alert" hidden></p><ul id="profile-grants-list" class="grant-list" aria-labelledby="profile-grants-title"></ul><div id="profile-grants-pending" class="profile-note" hidden><p id="profile-grants-pending-text"></p><button id="profile-grants-retry" type="button" class="secondary">Retry revocation</button><button id="profile-grants-discard" type="button" class="secondary">Discard kept request</button></div></section>
+<details id="preview-access" class="preview-tools"><summary>Preview access</summary><p class="muted">Try different permissions in the sample app. These are demo users.</p><label for="profile">Demo user</label><select id="profile"></select><button id="open" class="secondary">Switch demo user</button></details><button id="sign-out" class="secondary" hidden>Sign out</button></dialog>
+<!-- blotter-window: templates -->
+<template id="swap-fixed-template">   <section class="instrument-side" aria-labelledby="swap-fixed-title"><h3 id="swap-fixed-title">Fixed side</h3><div class="fixed-side-description"><span class="eyebrow">FIXED PRICE</span><p class="field-help">A cash price in the instrument’s compatible units.</p></div>
+    <div><label for="swap-direction">Direction</label><select id="swap-direction" required><option value="">Choose…</option><option value="-1">Pay fixed</option><option value="1">Receive fixed</option></select></div>
+    <div><label for="swap-fixed-currency">Currency</label><select id="swap-fixed-currency" required></select></div>
+    <div><label for="swap-price">Fixed price · <span id="swap-price-unit">choose projection curve</span></label><select id="swap-price-mode" required aria-label="Fixed pricing choice"><option value="">Choose fixed pricing…</option><option value="agreed">Enter agreed fixed price</option><option value="par">Calculate par fixed price</option></select><input id="swap-price" inputmode="decimal" maxlength="45" required><div id="swap-par-controls" hidden><label for="swap-par-places">Par rate decimal places · ties to even</label><input id="swap-par-places" type="number" min="0" max="18"><p id="swap-par-result" class="field-help"></p></div></div>
+    <div><label for="swap-fixed-from">Delivery start</label><input id="swap-fixed-from" type="date" required></div>
+    <div><label for="swap-fixed-to">Delivery end · exclusive</label><input id="swap-fixed-to" type="date" required></div>
+
+
+
+
+
+
+    <div class="side-payment-rule"><h4>Payment schedule</h4>
+     <label for="swap-fixed-payment-frequency">Payment frequency</label><select id="swap-fixed-payment-frequency" required></select>
+     <label for="swap-fixed-payment-rule">Payment date rule</label><select id="swap-fixed-payment-rule" required></select>
+     <label id="swap-fixed-payment-number-label" for="swap-fixed-payment-number">Rule parameter</label><input id="swap-fixed-payment-number" type="number" step="1" required disabled>
+     <div id="swap-fixed-day-basis-field" hidden><label for="swap-fixed-day-basis">Lag day basis</label><select id="swap-fixed-day-basis"></select></div>
+     <div id="swap-fixed-short-month-field" hidden><label for="swap-fixed-short-month">Short month</label><select id="swap-fixed-short-month"></select></div>
+     <label for="swap-fixed-payment-adjustment">Business-day adjustment</label><select id="swap-fixed-payment-adjustment" required></select>
+     <p class="field-help">Payment dates are generated from these rules. Lag is applied before adjustment; business-day lag counts strictly after the last delivery day.</p>
+    </div>
+   </section>
+</template>
+<template id="swap-floating-template">   <section class="instrument-side" aria-labelledby="swap-floating-title"><h3 id="swap-floating-title">Floating side</h3>
+  <div class="swap-commodity"><label for="swap-commodity">Commodity</label><select id="swap-commodity" required></select><p id="swap-price-source-unavailable" class="field-help" role="status" hidden></p><p class="field-help">Filters the available floating indices, projection curves and compatible quantity units.</p></div>
+
+    <div><label>Direction</label><p id="swap-floating-direction" class="field-help">Choose the fixed-side direction.</p></div>
+    <div><label for="swap-floating-currency">Currency</label><select id="swap-floating-currency" required></select></div>
+    <div><label for="swap-index">Floating Index</label><select id="swap-index" required></select><label for="swap-spread">Fixed spread · <span id="swap-spread-unit">choose projection curve</span></label><input id="swap-spread" inputmode="decimal" maxlength="45" required></div>
+    <div><label for="swap-floating-from">Delivery start</label><input id="swap-floating-from" type="date" required></div>
+    <div><label for="swap-floating-to">Delivery end · exclusive</label><input id="swap-floating-to" type="date" required></div>
+
+
+    <div><label for="swap-reset-frequency">Reset frequency</label><select id="swap-reset-frequency" required></select></div>
+    <div><label for="swap-projection">Contractual index curve</label><select id="swap-projection" required></select><div class="swap-projection-choice"><label for="swap-price-source">Projected price source</label><select id="swap-price-source" required></select><p id="swap-projection-note" class="field-help" role="status"></p></div></div>
+    <div><label for="swap-averaging">Averaging method</label><select id="swap-averaging" required></select></div>
+    <div><span class="field-help">Index fixing convention</span><p id="swap-fixing-convention" class="field-help" role="status">Choose an index and projection curve to inspect its fixing convention.</p></div>
+    <div class="side-payment-rule"><h4>Payment schedule</h4>
+     <label for="swap-floating-payment-frequency">Payment frequency</label><select id="swap-floating-payment-frequency" required></select>
+     <label for="swap-floating-payment-rule">Payment date rule</label><select id="swap-floating-payment-rule" required></select>
+     <label id="swap-floating-payment-number-label" for="swap-floating-payment-number">Rule parameter</label><input id="swap-floating-payment-number" type="number" step="1" required disabled>
+     <div id="swap-floating-day-basis-field" hidden><label for="swap-floating-day-basis">Lag day basis</label><select id="swap-floating-day-basis"></select></div>
+     <div id="swap-floating-short-month-field" hidden><label for="swap-floating-short-month">Short month</label><select id="swap-floating-short-month"></select></div>
+     <label for="swap-floating-payment-adjustment">Business-day adjustment</label><select id="swap-floating-payment-adjustment" required></select>
+     <p class="field-help">Payment dates are generated from these rules. Lag is applied before adjustment; business-day lag counts strictly after the last delivery day.</p>
+    </div>
+   </section>
+</template>
+<!-- /blotter-window: templates -->
+<button id="assistant-launcher" type="button" class="assistant-launcher secondary" aria-controls="assistant-panel" aria-expanded="false" aria-label="Assistant" hidden><span aria-hidden="true">✦</span><span class="assistant-launcher-text">Assistant</span><span id="assistant-dot" class="assistant-dot" hidden></span></button><button id="assistant-hide" type="button" class="assistant-hide icon-button" aria-label="Minimize Assistant button" title="Minimize Assistant button" hidden><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16"><path d="M3 11h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button></body></html>

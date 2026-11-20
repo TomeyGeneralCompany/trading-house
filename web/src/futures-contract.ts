@@ -1,0 +1,19 @@
+import {curveName,deliveryLabel,displayInstant,displayDate} from './market-view.js';
+export type FuturesContract={definitionRevisionId:string;commodity:string;commodityName:string;exchange:string;exchangeName:string;product:string;quoteKind?:string;basisSettlement?:{index:{code:string};benchmarkSeries:{code:string};implementation:string}|null;sourceUrl:string|null;eligibilityNote:string|null;index:string|null;id:string;curve:string;name:string;deliveryFrom:string;deliveryTo:string;firstTrading:string|null;firstTradingDate?:string|null;priceSource?:{kind:string};priceRole?:string;priceAsOf?:string;series?:{code:string};eligibleFrom:string;lastTrading:string;contractSize:string;nominalSize:string;nominalUnit:string;lotFactor:string|null;lotResolution:string|null;unit:string;currency:string;quoteMultiplier:string;tick:string;clearingIncrement:string;minimumPrice:string;maximumPrice:string;mark:string;lotBasis:string;settlementMethod:string};
+export const futuresContractKey=(contract:Pick<FuturesContract,'definitionRevisionId'|'curve'|'id'>)=>JSON.stringify([contract.definitionRevisionId,contract.curve,contract.id]);
+export const futuresSelectionKey=(selection:{definitionRevisionId:string;curve:string;contractId:string})=>futuresContractKey({...selection,id:selection.contractId});
+/** A dated contract as a trader picks it: its delivery period and pricing curve. */
+export const futuresContractLabel=(c:FuturesContract)=>`${deliveryLabel(c.deliveryFrom,c.deliveryTo)} · ${curveName(c.curve)}`;
+export const firstTradingText=(value:string|null,zone:string)=>value===null?'Source time unavailable':displayInstant(value,zone);
+export function futuresContractDescription(c:FuturesContract,zone:string){
+ return `${c.basisSettlement?`Basis settlement: ${c.basisSettlement.index.code} minus ${c.basisSettlement.benchmarkSeries.code}; quoted basis is its own market factor. `:""}${curveName(c.curve)} · ${c.name} · ${c.contractSize} ${c.unit} per lot · nominal ${c.nominalSize} ${c.nominalUnit} (${c.lotBasis.replaceAll('_',' ')}) · ${c.settlementMethod==='cash'?'cash-settled':'physical delivery settlement'}. ${c.priceSource?.kind==='synthetic'?'Generated price':'Selected curve price'} ${c.mark}; each quoted price point is ${c.quoteMultiplier} ${c.currency}/${c.unit}. Execution tick ${c.tick}; settlement-price increment ${c.clearingIncrement}; supported price range ${c.minimumPrice} to ${c.maximumPrice}. ${c.firstTrading===null&&c.firstTradingDate?`First trading date ${displayDate(c.firstTradingDate)}; exact time unknown.`:`Actual first trading: ${firstTradingText(c.firstTrading,zone)}.`} Trading eligibility interval ${displayInstant(c.eligibleFrom,zone)} to ${displayInstant(c.lastTrading,zone)} (end excluded). Execution P&L and open sensitivity only; daily/final settlement is not processed. ${c.eligibilityNote??''}`;
+}
+
+export type FuturesFilters={commodity?:string;exchange?:string;product?:string;date?:string};
+// Filter only the authorized, priced catalog returned for the selected context.
+// These are presentation choices, not inferred product or pricing policies.
+export function futuresSelection(contracts:FuturesContract[],filters:FuturesFilters){
+ const choices=(rows:FuturesContract[],key:'commodity'|'exchange'|'product',label:'commodityName'|'exchangeName'|'name')=>Array.from(new Map(rows.map(c=>[c[key],{value:c[key],name:c[label]}])).values()).sort((a,b)=>a.name.localeCompare(b.name));
+ const commodity=contracts.filter(c=>c.commodity===filters.commodity),exchange=commodity.filter(c=>c.exchange===filters.exchange),product=exchange.filter(c=>c.product===filters.product);
+ return{commodities:choices(contracts,'commodity','commodityName'),exchanges:choices(commodity,'exchange','exchangeName'),products:choices(exchange,'product','name'),dates:[...new Set(product.map(c=>c.deliveryFrom))].sort(),contracts:filters.date?product.filter(c=>c.deliveryFrom===filters.date):product};
+}

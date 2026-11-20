@@ -1,0 +1,517 @@
+"""Project-authored synthetic data for a newly owned local preview cluster."""
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+import json
+from functools import lru_cache
+from hashlib import sha256
+from zoneinfo import ZoneInfo
+import os
+from pathlib import Path
+import re
+from uuid import uuid4
+
+CAT = '40000000-0000-0000-0000-000000000001'
+REV = '60000000-0000-0000-0000-000000000001'
+RCAT = '10000000-0000-0000-0000-000000000001'
+RREV = '20000000-0000-0000-0000-000000000001'
+CURRENCY = 'usd'
+TENANT = 'b0000000-0000-0000-0000-000000000001'
+WORKSPACE = 'b1000000-0000-0000-0000-000000000001'
+R = f"'{RCAT}','{RREV}'"
+M = f"'{CAT}','{REV}'"
+
+
+# Synthetic display names; every curve in this fixture must have exactly one.
+CURVE_NAMES = {
+    'future': 'Gas futures', 'bridge_basis': 'Futures–forward spread', 'base_forward': 'Gas forwards',
+    'gas_basis': 'Regional gas spread', 'local_gas': 'Regional gas forwards', 'power_spread': 'Power spread',
+    'hub_power': 'Hub power forwards', 'power_basis': 'Local power spread', 'local_power': 'Local power forwards',
+    'local_power_all_in': 'Local power · all-in prices', 'interest_rates': 'Interest rates'}
+
+
+def commodity(key, code, name, dimension, icon):
+    """One commodity row that names its icon. An upgrade check loads fixtures before the icon column exists, so the row is
+    built from named fields: an earlier schema ignores the icon, and the migration that adds the column then assigns one."""
+    return ("INSERT INTO ref_data.commodities SELECT(jsonb_populate_record(NULL::ref_data.commodities,jsonb_build_object("
+            f"'catalog_id',k.c,'revision_id',k.r,'code','{code}','name','{name}','quantity_dimension_code','{dimension}','icon_code','{icon}'))).* "
+            f"FROM(VALUES({key}))k(c,r);")
+
+
+def named_curves(sql):
+    """Append each curve's display name to its positional insert; unknown codes fail."""
+    return re.sub(r"(INSERT INTO market_data\.(?:rate_)?curves VALUES \('[^']*','[^']*','([a-z0-9_]+)'[^;]*)\);",
+                  lambda m: f"{m.group(1)},'{CURVE_NAMES[m.group(2)]}');", sql)
+
+
+def installed_tzdb():
+    """The tzdb release the API will use (same lookup as TimeZoneDatabase); the preview declares it explicitly."""
+    tzdir = os.environ.get('TZDIR')
+    if tzdir == '':
+        raise RuntimeError('TZDIR is set but empty; set a zoneinfo directory or unset it')
+    root = Path(tzdir or '/usr/share/zoneinfo')
+    marker, data = root / '+VERSION', root / 'tzdata.zi'
+    if marker.is_file():
+        return marker.read_text().strip()
+    first = data.read_text().splitlines()[0] if data.is_file() else ''
+    if not first.startswith('# version '):
+        raise RuntimeError('Cannot determine the installed tzdb release for the power clock rules')
+    return first.removeprefix('# version ').strip()
+
+
+# Common ISO peak conventions seeded as published TOU products (verify before any
+# settlement use). Peak is hour-beginning [start, end) Monday–Friday, or Monday–Saturday.
+TOU_PRODUCTS = [
+    ('pjm', 'PJM · Eastern prevailing', 'eastern', 7, 23, False),
+    ('nyiso', 'NYISO · Eastern prevailing', 'eastern', 7, 23, False),
+    ('isone', 'ISO-NE · Eastern prevailing', 'eastern', 7, 23, False),
+    ('miso', 'MISO settlement / FTR · fixed EST', 'fixed_est', 6, 22, False),
+    ('spp', 'SPP · Central prevailing', 'central', 6, 22, False),
+    ('ercot', 'ERCOT · Central prevailing', 'central', 6, 22, False),
+    ('caiso', 'CAISO / WECC · Pacific prevailing', 'pacific', 6, 22, True)]
+
+
+def tou_products(catalog, reference, clocks, published_at, product_id, calendar):
+    """Published TOU product rows for one market catalog, bound to that catalog's clock rules."""
+    rows = []
+    for n, (code, name, clock, start, end, saturday) in enumerate(TOU_PRODUCTS, start=1):
+        pid = product_id(n)
+        product_calendar = calendar[clock] if isinstance(calendar,dict) else calendar
+        rows.append(f"INSERT INTO market_data.tou_products VALUES ('{catalog}','{pid}','{code}');")
+        columns='catalog_id,product_id,version,generation,state,name,clock_catalog_id,clock_revision_id,clock_code,peak_start_hour,peak_end_hour,peak_saturday,publication_order,published_at'
+        values=f"'{catalog}','{pid}',1,1,'published','{name}',{reference},'{clocks[clock]}',{start},{end},{str(saturday).lower()},{n},'{published_at}'"
+        # Populated-upgrade checks load the original synthetic TOU contract into
+        # the pre-calendar schema. New-schema fixtures author an exact calendar;
+        # this never updates or backfills any retained product version.
+        rows.append(f"""DO $tou_fixture$ BEGIN
+ IF EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='market_data.tou_product_versions'::regclass AND attname='calendar_catalog_id') THEN
+  INSERT INTO market_data.tou_product_versions({columns},calendar_catalog_id,calendar_revision_id,calendar_code,holiday_treatment)
+   VALUES({values},{reference},'{product_calendar}','weekly_mask_explicit_closures_v1');
+ ELSE INSERT INTO market_data.tou_product_versions({columns}) VALUES({values});END IF;
+END $tou_fixture$;""".replace("\n", " "))
+    return rows
+
+
+def identity(prefix, n):
+    return f'{prefix}0000000-0000-0000-0000-{n:012d}'
+
+
+def monthly_value(kind, month, distance=0):
+    m=Decimal(month);d=Decimal(distance)
+    return {1:Decimal('3')+m*Decimal('.05')-d*Decimal('.01'),
+            2:Decimal('.1')+m*Decimal('.005'),3:Decimal('.2')+m*Decimal('.01'),
+            4:Decimal('4')+m*Decimal('.1'),5:Decimal('2')+m*Decimal('.05'),
+            8:Decimal('.025')-d*Decimal('.0001'),9:Decimal('.03')-d*Decimal('.0001'),10:Decimal('.035')-d*Decimal('.0001'),
+            6:Decimal('7')-d*Decimal('.02'),7:Decimal('29.1')+m*Decimal('.605')-d*Decimal('.05')}[kind]
+
+
+def fixture(root, current_schema=True, fixing_frames=False, date_plan=None, window_frames=False, publish_clocks=True):
+    """current_schema=False omits rows that need migrations 0026+ (curve names, TOU products)."""
+    def historical(text):
+        for old, new in [('2039','2019'),('2040','2020'),('2041','2021'),('2042','2022')]:
+            text = text.replace(old, new)
+        return text
+    reference = historical((root / 'tests/fixtures/reference-synthetic.sql').read_text())
+    # D334 close sessions keep their business days on these synthetic regional clocks and calendars.
+    head, tail = reference.rsplit('COMMIT;', 1)
+    reference = head + ''.join(
+        f"INSERT INTO ref_data.clock_rules(catalog_id,revision_id,code,kind,iana_zone,tzdb_version) VALUES ({R},'{clock}','iana','{zone}','{installed_tzdb()}');\n"
+        for clock, zone in [('test_london_clock', 'Europe/London'), ('test_new_york_clock', 'America/New_York')]) + (
+        # A clock eighteen hours behind UTC: its 22:00 cutoff falls on the next UTC date, so business day and UTC date differ.
+        f"INSERT INTO ref_data.clock_rules(catalog_id,revision_id,code,kind,fixed_offset_seconds) VALUES ({R},'test_minus_18_clock','fixed_offset',-64800);\n") + ''.join(
+        f"INSERT INTO ref_data.calendars VALUES ({R},'{calendar}','{clock}',{weekend},'2020-01-01','{until}');\n"
+        for calendar, clock, weekend, until in [('test_london_days', 'test_london_clock', 96, '2023-01-01'), ('test_new_york_days', 'test_new_york_clock', 96, '2023-01-01'),
+                                                ('test_london_every_day', 'test_london_clock', 0, '2023-01-01'), ('test_minus_18_days', 'test_minus_18_clock', 96, '2023-01-01'),
+                                                # Checks also close at real and far-future instants.
+                                                ('test_utc_every_day', 'test_utc', 0, '2100-01-01')]) + 'COMMIT;' + tail
+    market = historical((root / 'tests/fixtures/market-synthetic.sql').read_text())
+    if date_plan is not None:
+        from demo_date_plan import schedule_sql
+        gas_dates=next(m['contracts'] for m in date_plan['mappings'] if m['code']=='gas_delivery')
+        forward_dates=next(m['contracts'] for m in date_plan['mappings'] if m['code']=='forward_delivery')
+        listing=next(s['definition']['dates'][0] for s in date_plan['schedules'] if s['definition']['symbol']=='oe.listing_dates')
+        rate_dates=next(s['definition']['dates'] for s in date_plan['schedules'] if s['definition']['symbol']=='oe.rate_pillars')
+        reference=reference.replace('BEGIN;', 'BEGIN;\n'+schedule_sql(date_plan,CAT),1)
+        catalog=f"INSERT INTO market_data.catalogs VALUES ('{CAT}','synthetic');"
+        if catalog not in market:raise ValueError('The fixture catalog declaration changed.')
+        market=market.replace(catalog,'')
+        first=gas_dates[0]
+        reference=reference.replace("'2021-01-01','2021-02-01'",f"'{first['start']}','{first['end']}'")
+        reference=reference.replace("'2020-12-28','2020-12-28 15:30:00+00'",f"'{first['lastTradingReference']['date']}','{first['lastTradingAt']}'")
+        reference=reference.replace("'2020-01-01','2020-01-01 00:00:00+00'",f"'{listing}','{listing} 00:00:00+00'")
+        def initial_contract(match):
+            row=gas_dates[0] if "'future'" in match[0] else forward_dates[0]
+            return re.sub(r"'2021-01-01','2021-02-01','[^']+'",f"'{row['start']}','{row['end']}','{row['lastTradingAt']}'",match[0])
+        market=re.sub(r'INSERT INTO market_data.contracts VALUES [^;]+;',initial_contract,market)
+    extra_ref=[]; extra_market=[]; extra_obs=[]
+    # The power-hours consumer requires an actual MWh definition, never an
+    # assumed conversion from the fixture's unrelated synthetic energy units.
+    power_units=[
+        f"INSERT INTO ref_data.units (catalog_id,revision_id,code,symbol,dimension_code) VALUES ({R},'megawatt_hour','MWh','energy');",
+        f"INSERT INTO ref_data.units (catalog_id,revision_id,code,symbol,dimension_code) VALUES ({R},'megawatt','MW','power');",
+        f"INSERT INTO ref_data.commodity_units VALUES ({R},'test_power','megawatt_hour','energy');"]
+    reference=reference.replace('COMMIT;', '\n'.join(power_units)+'\nCOMMIT;',1)
+    market=market.replace("'test_power_energy','energy_a','energy'", "'test_power_energy','megawatt_hour','energy'")
+    for index_code in ('test_power_price','test_power_price_b'):
+        market=market.replace(f"'{index_code}','test_power','test_hub_a','test_currency_a','energy_a'",
+                              f"'{index_code}','test_power','test_hub_a','test_currency_a','megawatt_hour'")
+    for kind in ['pipeline','node','region','terminal','delivery_point','physical_site']:
+        extra_ref.append(f"INSERT INTO ref_data.location_types VALUES ({R},'test_{kind}','Synthetic {kind.replace('_',' ')}');")
+    extra_ref.append(f"INSERT INTO ref_data.locations (catalog_id,revision_id,code,name,type_code,clock_code,latitude,longitude) VALUES ({R},'test_facility_a','Synthetic facility A','test_physical_site','test_utc',12.345678,-45.678912);")
+    if current_schema:
+        # One complete operating right is the external unit for constrained-facility
+        # pricing; its fixed access payment consumes the corresponding exact quote.
+        # Dimensionless counts share one physical dimension; exact unit
+        # and quantity identities distinguish resource rights from certificates.
+        extra_ref.extend([
+            f"INSERT INTO ref_data.dimensions VALUES ({R},'certificate',0,0,0,0,0,0,0) ON CONFLICT(catalog_id,revision_id,code) DO NOTHING;",
+            f"INSERT INTO ref_data.units (catalog_id,revision_id,code,symbol,dimension_code) VALUES ({R},'resource_right','right','certificate');",
+            f"INSERT INTO ref_data.commodity_units VALUES ({R},'test_power','resource_right','certificate');",
+            f"INSERT INTO ref_data.measurement_bases VALUES ({R},'test_resource_right_basis','test_power','certificate');",
+            f"INSERT INTO ref_data.quantity_specifications VALUES ({R},'test_resource_right_quantity','test_power','test_resource_right_basis','resource_right','certificate');",
+            f"INSERT INTO ref_data.quote_specifications VALUES ({R},'test_resource_right_quote','test_power','outright','test_resource_right_quantity','usd',1,0.01,0.01,-1000000,1000000);"])
+    for kind in ['pipeline','node','region','terminal','delivery_point']:
+        extra_ref.append(f"INSERT INTO ref_data.locations (catalog_id,revision_id,code,name,type_code,clock_code) VALUES ({R},'test_{kind}_a','Synthetic {kind.replace('_',' ')} A','test_{kind}','test_utc');")
+    # Market clocks for the TOU products, and weekday closures in the business calendar.
+    tzdb=installed_tzdb()
+    for code,zone in [('synthetic_eastern','America/New_York'),('synthetic_central','America/Chicago'),('synthetic_pacific','America/Los_Angeles')]:
+        extra_ref.append(f"INSERT INTO ref_data.clock_rules (catalog_id,revision_id,code,kind,iana_zone,tzdb_version) VALUES ({R},'{code}','iana','{zone}','{tzdb}');")
+    extra_ref.append(f"INSERT INTO ref_data.clock_rules (catalog_id,revision_id,code,kind,fixed_offset_seconds) VALUES ({R},'synthetic_fixed_est','fixed_offset',-18000);")
+    extra_ref.append(f"INSERT INTO ref_data.clock_rules (catalog_id,revision_id,code,kind,fixed_offset_seconds) VALUES ({R},'synthetic_fixed_east','fixed_offset',39600);")
+    for closed in ['2021-01-01','2021-03-15']:
+        extra_ref.append(f"INSERT INTO ref_data.calendar_days VALUES ({R},'test_business','{closed}',false,'Synthetic weekday closure');")
+    now=datetime.now(timezone.utc).isoformat()
+    market=market.replace('2020-12-18 16:01:00+00',now)
+    # A separately observed all-in alternative demonstrates independent inputs.
+    extra_market.append(f"INSERT INTO market_data.curves VALUES ({M},'local_power_all_in',{R},'test_power','test_hub_a','test_power_outright','test_uniform','test_power_target','direct','fixture','trader_mark');")
+    # Distinct delivery points can share a market hub while retaining their own path and adjustment.
+    extra_ref.append(f"INSERT INTO ref_data.location_types VALUES ({R},'synthetic_gas_zone','Synthetic gas zone');")
+    extra_ref.append(f"INSERT INTO ref_data.locations (catalog_id,revision_id,code,name,type_code,clock_code) VALUES ({R},'synthetic_gas_pipeline_b','Synthetic pipeline B','test_pipeline','test_utc');")
+    for letter in ['a','b','c']:
+        extra_ref.append(f"INSERT INTO ref_data.locations (catalog_id,revision_id,code,name,type_code,clock_code) VALUES ({R},'synthetic_gas_zone_{letter}','Synthetic zone {letter.upper()}','synthetic_gas_zone','test_utc');")
+    for letter in ['a','b','c','d','unpriced']:
+        extra_ref.append(f"INSERT INTO ref_data.locations (catalog_id,revision_id,code,name,type_code,clock_code) VALUES ({R},'synthetic_gas_point_{letter}','Synthetic delivery location {letter.upper()}','test_delivery_point','test_utc');")
+    for location in ['test_pipeline_a','synthetic_gas_pipeline_b','synthetic_gas_point_a','synthetic_gas_point_b','synthetic_gas_point_c','synthetic_gas_point_d','synthetic_gas_point_unpriced']:
+        extra_ref.append(f"INSERT INTO ref_data.commodity_locations VALUES ({R},'test_gas','{location}');")
+    extra_ref.append(f"DO $gas$ BEGIN IF to_regclass('ref_data.pipeline_zones') IS NOT NULL THEN INSERT INTO ref_data.pipeline_zones VALUES ({R},'test_pipeline_a','synthetic_gas_zone_a'),({R},'test_pipeline_a','synthetic_gas_zone_b'),({R},'synthetic_gas_pipeline_b','synthetic_gas_zone_c'); INSERT INTO ref_data.pipeline_delivery_points VALUES ({R},'test_pipeline_a','synthetic_gas_zone_a','synthetic_gas_point_a'),({R},'test_pipeline_a','synthetic_gas_zone_b','synthetic_gas_point_b'),({R},'synthetic_gas_pipeline_b','synthetic_gas_zone_c','synthetic_gas_point_c'),({R},'test_pipeline_a','synthetic_gas_zone_a','synthetic_gas_point_d'),({R},'test_pipeline_a','synthetic_gas_zone_a','synthetic_gas_point_unpriced'); END IF; END $gas$;")
+    for letter,pipe,zone in [('a','test_pipeline_a','a'),('b','test_pipeline_a','b'),('c','synthetic_gas_pipeline_b','c'),('d','test_pipeline_a','a'),('unpriced','test_pipeline_a','a')]:
+        extra_ref.append(f"DO $gas$ BEGIN IF to_regclass('ref_data.gas_delivery_conventions') IS NOT NULL THEN INSERT INTO ref_data.gas_delivery_conventions VALUES ({R},'{pipe}','synthetic_gas_zone_{zone}','synthetic_gas_point_{letter}','test_gas','test_utc',{60 if letter=='c' else 0}); END IF; END $gas$;")
+    # This path has no imported clock or valuation. A maintained setup can
+    # explicitly supply both; the master must already be available in choices.
+    extra_ref.append(f"INSERT INTO ref_data.locations(catalog_id,revision_id,code,name,type_code,clock_code) VALUES({R},'synthetic_gas_point_reference_only','Synthetic reference-only gas point','test_delivery_point','test_utc');")
+    extra_ref.append(f"INSERT INTO ref_data.commodity_locations VALUES({R},'test_gas','synthetic_gas_point_reference_only');")
+    extra_ref.append(f"DO $gas$ BEGIN IF to_regclass('ref_data.pipeline_delivery_points') IS NOT NULL THEN INSERT INTO ref_data.pipeline_delivery_points VALUES({R},'test_pipeline_a','synthetic_gas_zone_a','synthetic_gas_point_reference_only'); END IF; END $gas$;")
+    for group,pipe,adjustment in [('a','test_pipeline_a','-0.1'),('b','synthetic_gas_pipeline_b','-0.3')]:
+        extra_market.append(f"DO $gas$ BEGIN IF to_regclass('market_data.gas_valuation_groups') IS NOT NULL THEN INSERT INTO market_data.gas_valuation_groups VALUES ({M},'synthetic_gas_group_{group}',{R},'{pipe}','test_gas','local_gas',{adjustment}); END IF; END $gas$;")
+    for letter,pipe,zone,group,group_adjustment,location_adjustment in [('a','test_pipeline_a','a','a','-0.1','0'),('b','test_pipeline_a','b','a','-0.1','-0.1'),('c','synthetic_gas_pipeline_b','c','b','-0.3','0'),('d','test_pipeline_a','a','a','-0.1','-0.05')]:
+        extra_market.append(f"DO $gas$ BEGIN IF to_regclass('market_data.gas_valuation_assignments') IS NOT NULL THEN INSERT INTO market_data.gas_valuation_assignments (catalog_id,revision_id,code,reference_catalog_id,reference_revision_id,pipeline_code,zone_code,point_code,product_code,curve_code,group_code,group_adjustment,location_adjustment) VALUES ({M},'synthetic_gas_value_{letter}',{R},'{pipe}','synthetic_gas_zone_{zone}','synthetic_gas_point_{letter}','test_gas','local_gas','synthetic_gas_group_{group}',{group_adjustment},{location_adjustment}); END IF; END $gas$;")
+    for code,pipe,zone,point,identifier,start,end in [('a_jan','test_pipeline_a','a','a','SYN-METER-A-JAN','2021-01-01','2021-02-01'),('a_feb','test_pipeline_a','a','a','SYN-METER-A-FEB','2021-02-01','2022-01-01'),('b','test_pipeline_a','b','b','SYN-METER-B','2021-01-01','2022-01-01'),('c','synthetic_gas_pipeline_b','c','c','SYN-METER-C','2021-01-01','2022-01-01')]:
+        extra_ref.append(f"DO $gas$ BEGIN IF to_regclass('ref_data.gas_meter_assignments') IS NOT NULL THEN INSERT INTO ref_data.gas_meter_assignments VALUES ({R},'synthetic_gas_meter_{code}','{pipe}','synthetic_gas_zone_{zone}','synthetic_gas_point_{point}','test_gas','{identifier}','test_gas_quantity','{start}','{end}'); END IF; END $gas$;")
+    extra_market.append(f"DO $gas$ BEGIN IF to_regclass('market_data.gas_usage_tariffs') IS NOT NULL THEN INSERT INTO market_data.gas_usage_tariffs VALUES ({M},'synthetic_gas_usage_a',{R},'test_pipeline_a','test_gas','test_gas_outright',0.12,'2021-01-01','2021-02-01'); END IF; END $gas$;")
+    curves=[('future',1),('bridge_basis',2),('base_forward',2),('gas_basis',3),('local_gas',3),
+            ('power_spread',4),('hub_power',4),('power_basis',5),('local_power',5),('local_power_all_in',5)]
+    mappings=[('base_forward',2,'future',1,'bridge_basis'),('local_gas',3,'base_forward',2,'gas_basis'),
+              ('hub_power',4,'local_gas',3,'power_spread'),('local_power',5,'hub_power',4,'power_basis')]
+    extra_ref.append(f"INSERT INTO ref_data.value_specifications VALUES ({R},'test_zero_rate','dimensionless',NULL,NULL,-0.1,1);")
+    extra_ref.append(f"INSERT INTO ref_data.value_specifications VALUES ({R},'test_zero_rate_percent','dimensionless',NULL,NULL,-10,100);")
+    # D359: the dated discount curve is an admitted interest-rate definition whose tenors are these fixed pillar dates.
+    from rate_curve_fixture import dated_curve
+    pillars=rate_dates if date_plan is not None else ['2021-01-18','2021-06-18','2021-12-18']
+    rate_series=[identity('9',800+ordinal) for ordinal in range(len(pillars))]
+    for ordinal,sid in enumerate(rate_series):
+        extra_market.append(f"INSERT INTO market_data.series VALUES ({M},'{sid}','zero_rate_{ordinal}',{R},NULL,NULL,'test_zero_rate');")
+    extra_market.append(dated_curve(CAT,REV,R,'interest_rates',CURVE_NAMES['interest_rates'],pillars,rate_series,currency=CURRENCY,source='fixture',
+                                    interest_rate='test_interest',named=current_schema))
+    series=[]
+    for month in range(6):
+        start=date.fromisoformat(gas_dates[month]['start']) if date_plan is not None else date(2021,month+1,1)
+        end=date.fromisoformat(gas_dates[month]['end']) if date_plan is not None else date(2021,month+2,1)
+        if month:
+            previous=date.fromisoformat(gas_dates[month]["lastTradingReference"]["date"]) if date_plan is not None else date(2020,12,28) if month==0 else date(2021,month,28)
+            code=f'test_gas_2021{month+1:02d}'
+            first_trading=listing if date_plan is not None else '2020-01-01'
+            last_trading=gas_dates[month]['lastTradingAt'] if date_plan is not None else f'{previous} 15:30:00+00'
+            extra_ref.extend([
+                f"INSERT INTO ref_data.futures_series VALUES ({R},'{code}','test_gas_future','2021-{month+1:02d}','synthetic','{start}','{end}');",
+                f"INSERT INTO ref_data.futures_milestones VALUES ({R},'{code}','first_trading','known','{first_trading}','{first_trading} 00:00:00+00','test_utc','fixture');",
+                f"INSERT INTO ref_data.futures_milestones VALUES ({R},'{code}','last_trading','known','{previous}','{last_trading}','test_utc','fixture');"])
+            for n in range(1,6):
+                cid=identity('5',month*5+n)
+                kind='future' if n==1 else 'forward'
+                expiry=(gas_dates[month]['lastTradingAt'] if n==1 else forward_dates[month]['lastTradingAt']) if date_plan is not None else f'{previous} 15:30:00+00' if n==1 else f'{end} 00:00:00+00'
+                series_code=f"'{code}'" if n==1 else 'NULL'
+                extra_market.append(f"INSERT INTO market_data.contracts VALUES ({M},'{cid}',{R},'{kind}','{start}','{end}','{expiry}',{series_code});")
+            for curve,n in curves:
+                extra_market.append(f"INSERT INTO market_data.curve_members VALUES ({M},'{curve}','{identity('5',month*5+n)}',{month});")
+            for target,n,source,sn,spread in mappings:
+                for slot,sc,cn in [('base',source,sn),('spread',spread,n)]:
+                    extra_market.append(f"INSERT INTO market_data.constituent_mappings VALUES ({M},'{target}','{slot}','{identity('5',month*5+n)}','{sc}','{identity('5',month*5+cn)}');")
+        else:
+            extra_market.append(f"INSERT INTO market_data.curve_members VALUES ({M},'local_power_all_in','{identity('5',5)}',0);")
+        for n, quote in [(1,'gas_outright'),(2,'gas_basis'),(3,'gas_basis'),(4,'power_basis'),(5,'power_basis'),(7,'power_outright')]:
+            number=month*100+n; sid=identity('9',number); cn=5 if n==7 else n
+            if month or n==7:
+                extra_market.append(f"INSERT INTO market_data.series VALUES ({M},'{sid}','series_{number}',{R},'{identity('5',month*5+cn)}','test_{quote}',NULL);")
+            series.append((number,n,month))
+        if current_schema:
+            # These are deliberately invented publication instants and prices,
+            # not a claim about a publisher's real bidweek methodology. One
+            # published monthly index is shared by same-index curve recipes.
+            fixing_at=f'{start-timedelta(days=1)}T12:00:00Z'
+            gas_sid=identity('9',9200+month)
+            extra_market.append(f"INSERT INTO market_data.series VALUES ({M},'{gas_sid}','synthetic_monthly_gas_fixing_{month}',{R},'{identity('5',month*5+2)}','test_gas_outright',NULL);")
+            for index,quote,sid in [('test_price','test_gas_outright',gas_sid),('test_power_price','test_power_outright',identity('9',month*100+7))]:
+                extra_market.append(f"INSERT INTO market_data.index_fixing_observations (catalog_id,revision_id,index_code,observation_from,observation_to,reference_catalog_id,reference_revision_id,quote_code,series_id,source_code,fixing_at,implementation) VALUES ({M},'{index}','{start}','{end}',{R},'{quote}','{sid}','fixture','{fixing_at}','published_index_observations_v1');")
+    series.append((6,6,0))
+    series.extend((800+n,8+n,0) for n in range(3))
+    frames=[]
+    for day in range(15,19):
+        pins=[]; distance=18-day
+        for number,n,month in series:
+            oid=identity('7',number if day==18 else 10000+day*1000+number)
+            pins.append(oid)
+            if day==18 and number<=6: continue
+            value=monthly_value(n,month,distance)
+            role='daily_settlement' if n==1 else 'parameter' if n==6 or n>=8 else 'trader_mark'
+            event=f'event_{number}' if day==18 else f'history_{day}_{number}'
+            extra_obs.append(f"INSERT INTO market_data.observations VALUES ('{CAT}','{oid}','{REV}','{identity('9',number)}',{R},'fixture','{event}','1','{role}','final','2020-12-{day} 16:00:00+00','{now}',{value},NULL);")
+        frames.append({'at':f'2020-12-{day}T16:00:00Z','observationIds':pins,'frozenObservationIds':[],
+                       'curveContracts':{code:[identity('5',month*5+n) for month in range(6)] for code,n in curves}})
+    if fixing_frames:
+        if not current_schema:
+            raise ValueError('Fixing frames require the current schema.')
+        # Keep the original four frames and their exact prices/pins unchanged.
+        # These extra frames are enabled only by the dedicated fixing check.
+        emitted=set()
+        for sample,at in enumerate(['2021-01-01T08:00:00Z','2021-01-15T08:00:00Z','2021-01-31T08:00:00Z']):
+            pins=[]
+            for number,n,month in series:
+                oid=identity('7',4000000+sample*10000+number);pins.append(oid)
+                value=monthly_value(n,month)
+                role='daily_settlement' if n==1 else 'parameter' if n==6 or n>=8 else 'trader_mark'
+                extra_obs.append(f"INSERT INTO market_data.observations VALUES ('{CAT}','{oid}','{REV}','{identity('9',number)}',{R},'fixture','fixing_frame_{sample}_{number}','1','{role}','final','{at}','{now}',{value},NULL);")
+            for month in range(6):
+                start=date(2021,month+1,1);fixing_at=f'{start-timedelta(days=1)}T12:00:00Z'
+                if fixing_at>at:
+                    continue
+                for n,sid,value in [(0,identity('9',9200+month),Decimal('3.5')+Decimal(month)/10),(1,identity('9',month*100+7),Decimal('45')+Decimal(month))]:
+                    oid=identity('7',5000000+month*10+n)
+                    pins.append(oid)
+                    if oid not in emitted:
+                        extra_obs.append(f"INSERT INTO market_data.observations VALUES ('{CAT}','{oid}','{REV}','{sid}',{R},'fixture','synthetic_monthly_fixing_{month}_{n}','1','index_fixing','final','{fixing_at}','{now}',{value},NULL);")
+                        emitted.add(oid)
+            frames.append({'at':at,'observationIds':pins,'frozenObservationIds':[],'curveContracts':{code:[identity('5',month*5+n) for month in range(6)] for code,n in curves}})
+        partial=next(frame for frame in frames if frame['at']=='2021-01-15T08:00:00Z')
+        frames.append({**partial,'at':'2021-01-15T09:00:00Z'})
+    if window_frames:
+        # Closes either side of the 202102 last trading day (2021-01-28), for curve windows that roll with the selected
+        # close. They repeat 18 December's prices; only their dates are read.
+        frames.extend({**frames[3],'at':at} for at in ('2021-01-15T16:00:00Z','2021-02-15T16:00:00Z'))
+        # D359: a definition-driven rate curve whose tenors roll with these two closes, marked at each.
+        from rate_curve_fixture import rolling_curve
+        definitions,marks,pins=rolling_curve(CAT,REV,R,'usd_rolling','Synthetic rolling USD zero rates',[('1M',30),('1Y',365)],
+            {'2021-01-15T16:00:00Z':['4.10','4.30'],'2021-02-15T16:00:00Z':['4.20','4.40']})
+        extra_market.append(definitions);extra_obs.append(marks)
+        for frame in frames[-2:]:frame['observationIds']=[*frame['observationIds'],*pins[frame['at']]]
+        # D362: a futures curve admitted from its published definition, over contracts the 'future' curve also carries. A close
+        # names each curve's contracts, so these closes name the admitted curve's as well.
+        from contract_curve_fixture import admitted_future_curve
+        rolling=[identity('5',month*5+1) for month in (1,2,3)]
+        extra_market.append(admitted_future_curve(CAT,REV,R,'rolling_gas','Synthetic admitted gas futures',
+            [(contract,f'2021-{month+1:02d}',f'2021-{month+1:02d}-01',f'2021-{month+2:02d}-01',f'2021-{month:02d}-28') for contract,month in zip(rolling,(1,2,3))],
+            commodity='test_gas',location='test_hub_a',quote='test_gas_outright',profile='test_uniform',product='test_gas_future',target='test_future_target',source='fixture'))
+        for frame in frames[-2:]:frame['curveContracts']={**frame['curveContracts'],'rolling_gas':rolling}
+    extra_ref.append(f"DO $$ BEGIN IF to_regclass('ref_data.futures_product_terms') IS NOT NULL THEN INSERT INTO ref_data.futures_product_terms VALUES({R},'test_gas_future','test_uniform',NULL); END IF; END $$;")
+    extra_ref.append(f"""DO $policy$ BEGIN
+ IF to_regclass('ref_data.futures_execution_policies') IS NOT NULL THEN
+  INSERT INTO ref_data.futures_execution_policies(catalog_id,revision_id,series_code,implementation,eligibility_rule,eligible_from,
+   source_date_offset_seconds,source_date_tzdb_version,price_role,price_source_code,evidence_source_code)
+  SELECT s.catalog_id,s.revision_id,s.code,'contract_lot_execution_pnl_v2','source_first_trade_instant_v1',m.event_at,
+   NULL,NULL,'daily_settlement','fixture','fixture'
+  FROM ref_data.futures_series s JOIN ref_data.futures_milestones m
+   ON(m.catalog_id,m.revision_id,m.series_code,m.milestone)=(s.catalog_id,s.revision_id,s.code,'first_trading')
+  WHERE(s.catalog_id,s.revision_id,s.product_code)=({R},'test_gas_future');
+ END IF;
+ END $policy$;""")
+    market=market.replace('UPDATE ref_data.revisions SET', '\n'.join(extra_ref)+'\nUPDATE ref_data.revisions SET',1)
+    extra_market.append(f"INSERT INTO market_data.revision_periods VALUES ({M},'2020-01-01','2022-01-01');")
+    market=market.replace('UPDATE market_data.revisions SET','\n'.join(extra_market)+'\nUPDATE market_data.revisions SET',1)
+    market=market.rsplit('COMMIT;',1)[0]+'\n'+'\n'.join(extra_obs)+'\nCOMMIT;\n'
+    if current_schema:
+        market=named_curves(market)
+        clocks={'eastern':'synthetic_eastern','central':'synthetic_central','pacific':'synthetic_pacific','fixed_est':'synthetic_fixed_est'}
+        tou=tou_products(CAT,R,clocks,now,lambda n:identity('d',n),'test_business')
+        market=market.rsplit('COMMIT;',1)[0]+'\n'.join(tou)+'\nCOMMIT;\n'
+    manifest={'mode':'local-synthetic-preview','catalogId':CAT,'revisionId':REV,'referenceCatalogId':RCAT,'referenceRevisionId':RREV,
+              'tenantId':TENANT,'workspaceId':WORKSPACE,'frames':frames,'futuresConvention':'contract_lot_execution_pnl_v2',
+              'schedules':[{'curve':'future','from':'2020-12-01T00:00:00Z','to':'2021-05-28T15:30:00Z','exampleAt':'2020-12-28T15:29:00Z'}],
+              'example':{'at':'2020-12-18T16:00:00Z','curve':'local_power'},
+              'unitCatalog':{'referenceRevisionId':RREV,'definitionRevisionId':REV}}
+    # This preview assigns a named IT energy convention to its gas quotes.
+    # The generic schema fixtures keep their unrelated synthetic units.
+    reference=reference.replace("'energy_a'", "'mmbtu_it'").replace("'EA'", "'MMBtu (IT)'")
+    market=market.replace("'energy_a'", "'mmbtu_it'")
+    common=(root/'tests/fixtures/common-units.sql').read_text()
+    market=market.replace('UPDATE ref_data.revisions SET',common+'\nUPDATE ref_data.revisions SET',1)
+    # The preview uses a real currency reference; market prices remain synthetic.
+    reference=reference.replace("'test_currency_a'",f"'{CURRENCY}'").replace("'TST','Synthetic currency A'","'USD','US Dollar'")
+    market=market.replace("'test_currency_a'",f"'{CURRENCY}'")
+    if publish_clocks:
+        market=market.replace("UPDATE ref_data.revisions SET", fixture_clock_publications(clock_capture_request(manifest))+"\nUPDATE ref_data.revisions SET",1)
+    return reference, market, security_fixture(CAT,RCAT), manifest
+
+
+def catalogue_fixture(manifest,issuer,*,curve_sources=(),role_revisions=None,expected_head=None,request_id='ebc5e695-c5c3-413f-9533-cba165b4d626'):
+    """Publish the explicitly selected baseline through the ordinary native command."""
+    catalog,revision,reference_catalog,reference_revision,tenant,workspace=(manifest[key] for key in
+        ('catalogId','revisionId','referenceCatalogId','referenceRevisionId','tenantId','workspaceId'))
+    curve_revisions = ','.join(f"'{source}'" for source in [revision, *curve_sources])
+    selected_roles=json.dumps(role_revisions or {}).replace("'", "''")
+    expected='NULL' if expected_head is None else "'"+str(expected_head)+"'::uuid"
+    return f"""
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION preview_authenticator;
+SELECT security.issue_context('{issuer}','approver','human_interactive','{tenant}','{workspace}',NULL,'preview_runtime',120) AS token \\gset
+SET LOCAL SESSION AUTHORIZATION preview_runtime;
+SELECT security.use_context(:'token');
+SELECT security.publish_catalogue('{catalog}','{request_id}',{expected},
+ (SELECT jsonb_build_object('effectiveFrom',p.effective_from,'effectiveTo',p.effective_to,
+ 'curves',coalesce((SELECT jsonb_agg(jsonb_build_object('code',c.code,'kind',c.kind,'definitionRevisionId',c.revision_id,
+ 'referenceCatalogId',r.reference_catalog_id,'referenceRevisionId',r.reference_revision_id) ORDER BY c.code)
+ FROM(SELECT code,revision_id,'curve' kind FROM market_data.curves WHERE catalog_id='{catalog}' AND revision_id IN({curve_revisions})
+ UNION ALL SELECT code,revision_id,'rate' FROM market_data.rate_curves WHERE(catalog_id,revision_id)=('{catalog}','{revision}'))c
+ JOIN market_data.revisions r ON(r.catalog_id,r.id)=('{catalog}',c.revision_id)),'[]'::jsonb),
+ 'roles',(SELECT jsonb_object_agg(role,jsonb_build_object('definitionRevisionId',r.id,
+ 'referenceCatalogId',r.reference_catalog_id,'referenceRevisionId',r.reference_revision_id))
+ FROM(SELECT unnest(ARRAY['primary','units','gas','ppa'])role UNION ALL
+ SELECT jsonb_object_keys('{selected_roles}'::jsonb) UNION
+ SELECT 'reference:'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='ref_data' AND c.relkind='r'
+ AND EXISTS(SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attname='catalog_id' AND NOT a.attisdropped)
+ AND EXISTS(SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attname='revision_id' AND NOT a.attisdropped))roles
+ JOIN market_data.revisions r ON r.catalog_id='{catalog}' AND r.id=coalesce(('{selected_roles}'::jsonb->>role)::uuid,'{revision}'::uuid)))
+ FROM market_data.revision_periods p WHERE(p.catalog_id,p.revision_id)=('{catalog}','{revision}')));
+COMMIT;
+"""
+
+
+def security_fixture(catalog,reference_catalog):
+    security=[f"INSERT INTO security.tenants VALUES ('{TENANT}','preview');",
+              f"INSERT INTO security.workspaces VALUES ('{TENANT}','{WORKSPACE}','synthetic_market');",
+              f"INSERT INTO security.market_catalog_scopes VALUES ('{catalog}','{TENANT}','{WORKSPACE}');",
+              f"INSERT INTO security.reference_catalog_scopes VALUES ('{reference_catalog}','{TENANT}','{WORKSPACE}','owner');"]
+    for n,slug,role in [(1,'viewer',1),(2,'editor',4),(3,'approver',5),(4,'admin',6),(5,'trader',2),(6,'risk',3)]:
+        pid=identity('c',n)
+        security.extend([f"INSERT INTO security.principals VALUES ('{pid}','human',true);",
+            f"INSERT INTO security.identity_bindings VALUES ('https://preview.invalid','{slug}','{pid}','human_interactive');",
+            f"INSERT INTO security.workspace_memberships VALUES ('{TENANT}','{WORKSPACE}','{pid}','{slug}','Synthetic {slug}',true,1);",
+            f"INSERT INTO security.role_grants VALUES (gen_random_uuid(),'{pid}','a0000000-0000-0000-0000-{role:012d}','{TENANT}','{WORKSPACE}',CURRENT_TIMESTAMP-INTERVAL '1 day',CURRENT_TIMESTAMP+INTERVAL '1 day',false);"])
+    security.extend(['CREATE ROLE preview_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS INHERIT IN ROLE openetrm_runtime;',
+                     'CREATE ROLE preview_authenticator LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS INHERIT IN ROLE openetrm_authenticator;'])
+    return '\n'.join(security)
+
+
+def trading_fixture(catalog, swap_defaults=False, annotations=True):
+    """Immutable synthetic books used by the local futures booking operation."""
+    from rate_curve_fixture import discount_default
+    defaults = '\n'.join(discount_default(catalog,f'd2000000-0000-0000-0000-00000000000{n}',revision,f"'{RCAT}','{RREV}'",CURRENCY,'interest_rates',1,'2020-01-01 00:00:00+00')
+                         for n,revision in [(1,REV),(2,'60000000-0000-0000-0000-000000000002')]) if swap_defaults else ''
+    parties = '\n'.join(f"INSERT INTO trading.{table} VALUES ('{catalog}','{prefix}000000-0000-0000-0000-00000000000{n}',1,'{code}_{n}','Synthetic {label} {n}',1,'2020-01-01T00:00:00Z');" for table,prefix,code,label in [('legal_entities','d4','entity','entity'),('counterparties','d5','party','party')] for n in (1,2)) if annotations else ''
+    return f"""BEGIN;
+INSERT INTO trading.publications VALUES ('{catalog}',1,pg_current_xact_id());
+INSERT INTO trading.portfolios VALUES ('{catalog}','d0000000-0000-0000-0000-000000000001','Synthetic portfolio',1,'2020-01-01 00:00:00+00');
+INSERT INTO trading.books VALUES ('{catalog}','d1000000-0000-0000-0000-000000000001','d0000000-0000-0000-0000-000000000001','Book A',1,'2020-01-01 00:00:00+00');
+INSERT INTO trading.books VALUES ('{catalog}','d1000000-0000-0000-0000-000000000002','d0000000-0000-0000-0000-000000000001','Book B',1,'2020-01-01 00:00:00+00');
+{parties}
+{defaults}
+COMMIT;"""
+
+
+def held_gas_measures(read, preview):
+    """A held gas read also reports its started-delivery measures; an unbooked preview has no recorded cash and reports none.
+    Before delivery nothing is realized unsettled and the labelled sum is the contractual PV. Returns the read without them."""
+    held = dict(read); measures = held.pop('measures')
+    assert preview['measures'] is None and (measures['realizedUnsettled'], measures['unrealized'], measures['total']) == \
+        ('0', preview['presentValue'], preview['presentValue']), measures
+    return held
+
+
+def trade_booking():
+    """Exact party choices for the standard synthetic trading fixture."""
+    return {'legalEntityId': 'd4000000-0000-0000-0000-000000000001', 'legalEntityRevision': 1,
+            'counterpartyId': 'd5000000-0000-0000-0000-000000000001', 'counterpartyRevision': 1}
+
+
+def gas_purchase(context, catalog, point='synthetic_gas_point_a', fee='0.1'):
+    """One gas side received at a synthetic point through January 2021, paid at 3 with a manual usage fee on its delivered quantity.
+
+    It is the composition of one physical side that a single-point gas trade maps to; `fee=None` leaves the fee out.
+    """
+    from synthetic_side_calendars import side_calendar_policy
+    reference = next(c['reference'] for c in catalog['sideCalendars'] if c['code'] == 'test_utc_every_day')
+    physical_policy = side_calendar_policy(reference, delivery=True, observation=False, payment=False)
+    cash_policy = side_calendar_policy(reference, delivery=True, observation=False, payment=True)
+    p = next(p for p in catalog['locations'] if p['deliveryPoint'] == point)
+    charge = lambda code, role, price: {'code': code, 'role': role, 'direction': 'pay', 'source': 'gas', 'stage': 'delivery', 'price': price,
+                                        'tariffCode': None, 'paymentAt': '2021-02-02T00:00:00Z', 'calendarPolicy': cash_policy}
+    return {**context, **trade_booking(), 'operationId': str(uuid4()), 'bookId': catalog['books'][0]['id'], 'definitionRevisionId': p['definitionRevisionId'],
+            'gasSetupId': catalog['gasSetupId'], 'discounting': False, 'profile': 'fixed_gas_composition_v1',
+            'physicalSides': [{'code': 'gas', 'pipeline': p['pipeline'], 'zone': p['zone'], 'deliveryPoint': p['deliveryPoint'], 'product': p['product'], 'direction': 'receive',
+                               'deliveryFrom': '2021-01-01', 'deliveryTo': '2021-02-01', 'quantityBasis': 'period_total_equal_days', 'quantity': '1000', 'link': None, 'calendarPolicy': physical_policy}],
+            'cashSides': [charge('payment', 'consideration', '3'), *([] if fee is None else [charge('usage', 'fee', fee)])]}
+
+
+def clock_capture_request(manifest):
+    """Explicit reusable power-clock publication for this synthetic reference."""
+    clocks=[dict(code='test_utc',kind='fixed_offset',fixedOffsetSeconds=0,ianaZone=None,tzdbVersion=None),
+            dict(code='synthetic_fixed_est',kind='fixed_offset',fixedOffsetSeconds=-18000,ianaZone=None,tzdbVersion=None),
+            dict(code='synthetic_fixed_east',kind='fixed_offset',fixedOffsetSeconds=39600,ianaZone=None,tzdbVersion=None)]
+    for code,zone in [('synthetic_eastern','America/New_York'),('synthetic_central','America/Chicago'),
+                      ('synthetic_pacific','America/Los_Angeles'),('test_london_clock','Europe/London'),('test_new_york_clock','America/New_York')]:
+        clocks.append(dict(code=code,kind='iana',fixedOffsetSeconds=None,ianaZone=zone,tzdbVersion=installed_tzdb()))
+    return dict(referenceCatalogId=manifest['referenceCatalogId'],referenceRevisionId=manifest['referenceRevisionId'],
+                **{'from':'2020-01-01','to':'2053-01-01'},clocks=clocks)
+
+
+@lru_cache(maxsize=32)
+def fixture_clock_payload(code, kind, seconds, zone, release, start, end):
+    """Synthetic publication input, not an expected-date/quantity oracle.
+
+    Read the exact TZif source whose release the fixture declares. Production
+    publication uses the managed renderer. Native-only tests do not build or
+    invoke application binaries; both fixtures publish explicit bounded cells.
+    """
+    if kind == 'fixed_offset':
+        clock = timezone(timedelta(seconds=seconds))
+        identifier = code
+    else:
+        if release != installed_tzdb():
+            raise ValueError('The fixture clock release is unavailable')
+        with (Path(os.environ.get('TZDIR') or '/usr/share/zoneinfo') / zone).open('rb') as source:
+            clock = ZoneInfo.from_file(source, key=zone)
+        identifier = zone
+    first = datetime.fromisoformat(start).replace(tzinfo=clock).astimezone(timezone.utc)
+    last = datetime.fromisoformat(end).replace(tzinfo=clock).astimezone(timezone.utc)
+    at, previous, runs = first, None, []
+    while at <= last:
+        offset = at.astimezone(clock).utcoffset().total_seconds()
+        if offset % 60:
+            raise ValueError('The synthetic clock must use whole-minute offsets')
+        minutes = int(offset / 60)
+        if minutes != previous:
+            runs.append(dict(From=at.isoformat(), Minutes=minutes))
+            previous = minutes
+        at += timedelta(minutes=5)
+    return json.dumps(dict(Implementation='captured_power_grid_clock_v1', Id=identifier,
+                           From=first.isoformat(), To=last.isoformat(), Runs=runs), separators=(',', ':'))
+
+
+def fixture_clock_publications(request):
+    """Publish only on the new schema, before the synthetic reference is sealed."""
+    rows=[]
+    literal=lambda value: 'NULL' if value is None else "'"+str(value).replace("'", "''")+"'"
+    for clock in request['clocks']:
+        payload=fixture_clock_payload(clock['code'],clock['kind'],clock['fixedOffsetSeconds'],clock['ianaZone'],clock['tzdbVersion'],request['from'],request['to'])
+        arguments=[literal(request['referenceCatalogId']),literal(request['referenceRevisionId']),literal(clock['code']),
+                   literal(request['from']),literal(request['to']),literal(payload),
+                   "decode('"+sha256(payload.encode()).hexdigest()+"','hex')",literal(clock['tzdbVersion'])]
+        rows.append('PERFORM ref_data.publish_clock_capture('+','.join(arguments)+');')
+    return "DO $clock_fixture$ BEGIN IF to_regprocedure('ref_data.publish_clock_capture(uuid,uuid,text,date,date,text,bytea,text)') IS NOT NULL THEN\n"+'\n'.join(rows)+"\nEND IF;END $clock_fixture$;"

@@ -1,0 +1,93 @@
+"""Independent mixed-portfolio crude risk oracles in an owned disposable database."""
+from fractions import Fraction
+from uuid import uuid4
+from synthetic_side_calendars import side_calendar_policy
+from preview_client import PreviewClient, initial_frame
+from preview_fixture import trade_booking
+
+
+def run_checks(url, receipt, *, run_worker):
+    c = PreviewClient(url)
+    c.bootstrap()
+    c.call('profile', {'profile': 'trader'})
+    frame = initial_frame(c.call('workspace'), '2020-12-18')
+    context = dict(snapshotId=frame['id'], convention='trading_workspace_v1', knowledgeMode='current')
+    positions = c.call('trading/positions', dict(context=context, bookIds=[], portfolioIds=[], offset=0, limit=64))
+    crude = next(p for p in positions['positions'] if p['tradeId'] == receipt['tradeId'])
+    book = crude['bookId']
+
+    future_context = {**context, 'convention': 'contract_lot_execution_pnl_v2'}
+    futures = c.call('futures/catalog', future_context)
+    contract = next(k for k in futures['contracts'] if k['curve'] == 'future')
+    future = c.call('futures/book', {**future_context, **trade_booking(), 'operationId': str(uuid4()),
+        'bookId': book, 'curve': contract['curve'], 'contractId': contract['id'], 'definitionRevisionId': contract['definitionRevisionId'], 'lots': '1', 'executionPrice': contract['mark']})
+
+    gas_context = {**context, 'convention': 'physical_gas_fixed_quantity_v4'}
+    gas_catalog = c.call('gas/catalog', gas_context)
+    location = next(p for p in gas_catalog['locations'] if p['deliveryPoint'] == 'synthetic_gas_point_a')
+    reference=next(c['reference'] for c in gas_catalog['sideCalendars'] if c['code']=='test_utc_every_day')
+    cash = lambda code, role, price: {'code': code, 'role': role, 'direction': 'pay', 'source': 'physical', 'stage': 'delivery',
+        'price': price, 'tariffCode': None, 'paymentAt': '2021-02-01T00:00:00Z', 'calendarPolicy':side_calendar_policy(reference,delivery=True,observation=False,payment=True)}
+    gas = c.call('gas/composition/book', {**gas_context, **trade_booking(), 'operationId': str(uuid4()), 'bookId': book,
+        'gasSetupId': gas_catalog['gasSetupId'], 'definitionRevisionId': location['definitionRevisionId'],
+        'discounting': False, 'profile': 'fixed_gas_composition_v1',
+        'physicalSides': [{'code': 'physical', 'pipeline': location['pipeline'], 'zone': location['zone'], 'deliveryPoint': location['deliveryPoint'],
+            'product': location['product'], 'direction': 'receive', 'deliveryFrom': '2021-01-01', 'deliveryTo': '2021-02-01',
+            'quantityBasis': 'period_total_equal_days', 'quantity': '1000', 'link': None, 'calendarPolicy':side_calendar_policy(reference,delivery=True,observation=False,payment=False)}],
+        'cashSides': [cash('cash', 'consideration', '3'), cash('fee', 'fee', '0.1')]})
+
+    view = dict(mode='trades', bookIds=[book], portfolioIds=[], groupBy=[], measures=[], pivotConvention=None)
+    blotter = c.call('trading/blotter', dict(context=context, view=view))
+    held = {row['tradeId']: row for row in blotter['holdings']}
+    assert {receipt['tradeId'], future['tradeId'], gas['tradeId']} <= held.keys()
+    assert Fraction(held[receipt['tradeId']]['presentValue']) == 10100
+    assert Fraction(held[gas['tradeId']]['presentValue']) == 100
+    assert Fraction(held[future['tradeId']]['executionPnl']) == 0
+    retained = {**context, 'knowledgeMode': 'retained', 'contextId': blotter['context']['contextId']}
+
+    c.call('profile', {'profile': 'risk'})
+    c.select_inputs(blotter['context'])
+    catalog = c.call('portfolio/risk/catalog', dict(context=retained, bookIds=[book], portfolioIds=[]))
+    assert not any(x['tradeId'] == gas['tradeId'] for x in catalog['excludedPositions']), 'PV-capable gas must enter the common risk portfolio'
+    assert not any(x['tradeId'] == receipt['tradeId'] for x in catalog['excludedPositions'])
+    crude_factor = next(f for f in catalog['factors'] if 'synthetic_crude_forward' in f['curves'])
+    future_factor = next(f for f in catalog['factors'] if 'future' in f['curves'])
+    gas_curve = location['valuation']['curve']
+    assert len({f['id'] for f in catalog['factors']}) == len(catalog['factors']), 'Shared market factors must appear once'
+    assert any(t['id'] in catalog['heldCurveTargets'] and t['factor']['target']['curve']['code'] == gas_curve for t in catalog['scenarioTargets'])
+    gas_factor = next(f for f in catalog['factors'] if 'gas_basis' in f['curves'])
+    request = dict(context=retained, bookIds=[book], portfolioIds=[], bumps=[
+        dict(factor=crude_factor['factor'], size='1', convention=catalog['bumpConvention']),
+        dict(factor=future_factor['factor'], size='1', convention=catalog['bumpConvention']),
+        dict(factor=gas_factor['factor'], size='0.1', convention=catalog['bumpConvention'])],
+        convention=catalog['convention'], numericalPolicy=catalog['numericalPolicy'], pricingPolicy=catalog['pricingPolicy'], stress=[])
+    report = c.call('portfolio/risk', request)
+    from check_trade_risk import selected_scope
+    selected_scope(c, request, receipt['tradeId'], report, run_worker=run_worker)
+    crude_risk = next(p for p in report['factors'][0]['positions'] if p['tradeId'] == receipt['tradeId'])
+    assert crude_risk['measure'] == 'crude_contractual_present_value'
+    assert {key: Fraction(crude_risk['values'][key]) for key in ('base', 'up', 'down', 'delta', 'gamma')} == {
+        'base': 10100, 'up': 11100, 'down': 9100, 'delta': 1000, 'gamma': 0}
+    untouched_future = next(p for p in report['factors'][0]['positions'] if p['tradeId'] == future['tradeId'])
+    untouched_crude = next(p for p in report['factors'][1]['positions'] if p['tradeId'] == receipt['tradeId'])
+    assert Fraction(untouched_future['values']['upPnl']) == Fraction(untouched_crude['values']['upPnl']) == 0
+    gas_risk = next(p for p in report['factors'][2]['positions'] if p['tradeId'] == gas['tradeId'])
+    assert gas_risk['measure'] == 'gas_lifecycle_value_v1'
+    assert {key: Fraction(gas_risk['values'][key]) for key in ('base', 'up', 'down', 'delta', 'gamma')} == {
+        'base': 100, 'up': 200, 'down': 0, 'delta': 1000, 'gamma': 0}
+    untouched_gas = next(p for p in report['factors'][0]['positions'] if p['tradeId'] == gas['tradeId'])
+    assert Fraction(untouched_gas['values']['upPnl']) == Fraction(untouched_gas['values']['downPnl']) == 0
+    shared_gas = next(p for p in report['factors'][1]['positions'] if p['tradeId'] == gas['tradeId'])
+    assert Fraction(shared_gas['values']['delta']) == 1000, 'The shared futures factor must also propagate into physical gas'
+    stressed = c.call('portfolio/risk', {**request, 'stress': [dict(factor=crude_factor['factor'], size='2', convention=catalog['stressConvention'])]})
+    stressed_crude = next(p for p in stressed['factors'][0]['positions'] if p['tradeId'] == receipt['tradeId'])
+    assert Fraction(stressed_crude['values']['base']) == 12100
+    assert c.call('portfolio/risk', request)['factors'] == report['factors'], 'Stress must not mutate the base market'
+
+    job = c.call('portfolio/risk/jobs', dict(requestId=str(uuid4()), request=request))
+    run_worker()
+    completed = c.call('portfolio/risk/jobs/' + job['id'])
+    assert completed['state'] == 'completed', completed
+    assert completed['result']['factors'] == report['factors']
+    assert completed['result']['excludedPositions'] == report['excludedPositions']
+    print('PASS mixed crude/futures/gas: exact retained PV, unique held factors, independent shocks and stress, queued replay parity', flush=True)

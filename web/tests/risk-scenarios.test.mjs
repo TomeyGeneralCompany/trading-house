@@ -1,0 +1,55 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+test('scenario controls transport the exact offered coordinate and explicit decimal size',async()=>{
+ const {scenarioShift}=await import('../dist/risk-scenarios.js');
+ const offered={id:'computed-a',label:'Synthetic output',coordinate:'computed_output',kind:'points',unit:'USD/unit',factor:{coordinate:'computed_output',target:{kind:'points',curve:{revision:{catalogId:'catalog',revisionId:'revision'},code:'saved'},points:['point-a']}}};
+ const before=structuredClone(offered),shift=scenarioShift(offered,'-0.700000000000000001','selected-convention');
+ assert.deepEqual(shift,{factor:offered.factor,size:'-0.700000000000000001',convention:'selected-convention'});
+ shift.factor.target.points.push('other');assert.deepEqual(offered,before);
+});
+test('delivery bucket transport preserves the server containment policy and requires explicit bounds',async()=>{
+ const {scenarioShift}=await import('../dist/risk-scenarios.js');
+ const offered={id:'bucket',label:'Synthetic delivery bucket',coordinate:'market_quote',kind:'delivery_bucket',unit:'USD/unit',factor:{coordinate:'market_quote',target:{kind:'delivery_bucket',curve:{code:'synthetic'},from:null,to:null,convention:'selected-containment-policy'}}};
+ assert.throws(()=>scenarioShift(offered,'1','selected-convention',{from:'',to:''}),/delivery/);
+ assert.deepEqual(scenarioShift(offered,'1','selected-convention',{from:'2027-01-01',to:'2027-04-01'}).factor.target,{...offered.factor.target,from:'2027-01-01',to:'2027-04-01'});
+ assert.equal(offered.factor.target.from,null);
+});
+test('rejected scenario admission releases only a first attempt and never erases an uncertain original job',async()=>{
+ const {knownRiskRejection}=await import('../dist/risk-scenarios.js');
+ const {PendingCommand}=await import('../dist/pending-command.js');
+ const pending=new PendingCommand(knownRiskRejection);
+ pending.begin('portfolio/risk/jobs',{request:{bumps:[]}});
+ pending.failed('scenario_bucket',pending.sending());
+ assert.equal(pending.command,undefined);
+ pending.begin('portfolio/risk/jobs',{request:{bumps:[]}});
+ const original=pending.command;
+ pending.failed(undefined,pending.sending());
+ pending.failed('scenario_target',pending.sending());
+ assert.equal(pending.command,original);
+ assert.equal(pending.command.uncertain,true);
+});
+test('typed joint refusals are definite first-attempt refusals while an uncertain write retains its identity',async()=>{
+ const {knownRiskRejection}=await import('../dist/risk-scenarios.js');
+ const {PendingCommand}=await import('../dist/pending-command.js');
+ for(const code of ['risk_parametric_policy','risk_parametric_scope','risk_parametric_delta','risk_parametric_capacity','risk_history_capture','risk_history_manifest','risk_joint_contract','risk_joint_input','risk_scenario_capacity','risk_size','risk_job_run']){
+  const p=new PendingCommand(knownRiskRejection);p.begin('portfolio/risk/jobs',{request:{joint:{}}});p.failed(code,p.sending());assert.equal(p.command,undefined,code);
+  p.begin('portfolio/risk/jobs',{request:{joint:{}}});const original=p.command;p.failed(undefined,p.sending());p.failed(code,p.sending());assert.equal(p.command,original,code);
+ }
+});
+
+test('historical SQL admission refusals clear only a definitely rejected first command',async()=>{
+ const {knownRiskRejection}=await import('../dist/risk-scenarios.js');const {PendingCommand}=await import('../dist/pending-command.js');
+ for(const code of ['risk_historical_input','risk_statistical_history']){
+  const fresh=new PendingCommand(knownRiskRejection);fresh.begin('portfolio/risk/jobs',{request:{historical:{}}});fresh.failed(code,fresh.sending());assert.equal(fresh.command,undefined,code);
+  const retry=new PendingCommand(knownRiskRejection);retry.begin('portfolio/risk/jobs',{request:{historical:{}}});retry.failed('transport',retry.sending());retry.failed(code,retry.sending());assert.ok(retry.command,code);
+ }
+});
+
+test('Monte Carlo preparation refusals release fresh submissions and preserve previously uncertain requests',async()=>{
+ const {knownRiskRejection}=await import('../dist/risk-scenarios.js'),{PendingCommand}=await import('../dist/pending-command.js');
+ for(const code of ['risk_monte_carlo_policy','risk_monte_carlo_scope','risk_monte_carlo_history','risk_monte_carlo_capacity','risk_monte_carlo_covariance','risk_monte_carlo_numeric','risk_monte_carlo_exposures','risk_monte_carlo_input','risk_parametric_numeric','risk_result_limit']){
+  const fresh=new PendingCommand(knownRiskRejection);fresh.begin('portfolio/risk/jobs',{request:{monteCarlo:{}}});fresh.failed(code,fresh.sending());assert.equal(fresh.command,undefined,code);
+  const retry=new PendingCommand(knownRiskRejection);retry.begin('portfolio/risk/jobs',{request:{monteCarlo:{}}});const original=retry.command;retry.failed('transport',retry.sending());retry.failed(code,retry.sending());assert.equal(retry.command,original,code);assert.equal(retry.command.uncertain,true);
+ }
+});

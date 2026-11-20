@@ -1,0 +1,293 @@
+"""Authorized, exact-snapshot date availability for the header calendar."""
+from copy import deepcopy
+from contextlib import contextmanager
+from uuid import uuid4
+from preview_client import PreviewClient
+
+# The built-in frames are recorded as closes of one synthetic UTC session per cutoff time (tools/seed_session_closes.py).
+SESSION='demo_close_1600'
+
+
+@contextmanager
+def visibility_probe(query,predicate):
+    """Observe or subtract native visibility tuples without changing SELECT policies."""
+    signature='security.observation_visibility_scope(uuid,uuid,uuid[])'
+    original=query(f"SELECT pg_get_functiondef('{signature}'::regprocedure);")
+    header='FUNCTION security.observation_visibility_scope('
+    assert original.count(header)==1
+    assert query("SELECT to_regprocedure('public.synthetic_calendar_visibility_source(uuid,uuid,uuid[])') IS NULL;")=='t'
+    source=original.replace(header,'FUNCTION public.synthetic_calendar_visibility_source(',1)
+    prefix,separator,_=original.partition('AS $function$')
+    assert separator
+    wrapper=prefix+separator+f"""
+BEGIN
+ RETURN QUERY SELECT v.catalog,v.revision,v.observation
+ FROM public.synthetic_calendar_visibility_source(requested_catalog,requested_revision,requested_pins)v
+ WHERE {predicate};
+END;
+$function$;
+"""
+    try:
+        query('BEGIN;'+source+";ALTER FUNCTION public.synthetic_calendar_visibility_source(uuid,uuid,uuid[]) OWNER TO openetrm_security_owner;REVOKE ALL ON FUNCTION public.synthetic_calendar_visibility_source(uuid,uuid,uuid[]) FROM PUBLIC;"+wrapper+'COMMIT;')
+        yield
+    finally:
+        query('BEGIN;'+original+';DROP FUNCTION IF EXISTS public.synthetic_calendar_visibility_source(uuid,uuid,uuid[]);COMMIT;')
+        assert query(f"SELECT pg_get_functiondef('{signature}'::regprocedure);")==original
+
+
+def run_checks(url,query=None,manifest=None,log=None):
+    client=PreviewClient(url);boot=client.bootstrap()
+    client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','timeZone':'UTC'},expected=403)
+    client.call('profile',{'profile':'viewer'})
+    offered=client.call('workspace')['frames']
+    assert {frame['close']['session'] for frame in offered}=={SESSION}, 'The calendar fixture records one built-in session'
+    client.call('market/dates',{'curve':None,'timeZone':'UTC'},expected=400)
+    client.call('market/dates',{'session':SESSION,'timeZone':'UTC'},expected=400)
+    client.call('market/dates',{'session':SESSION,'curve':None},expected=400)
+    monthly=client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','timeZone':'UTC'})
+    assert monthly['selectionPolicy']=='exact_snapshot_no_close_substitution_v1'
+    month_days={row['date']:row['frames'] for row in monthly['dates']}
+    assert '2020-12-11' in month_days
+    bridge=client.call('market/dates',{'session':SESSION,'curve':'bridge_basis','timeZone':'UTC'})
+    assert {row['date'] for row in bridge['dates']}=={'2020-12-15','2020-12-16','2020-12-17','2020-12-18'}
+    assert '2020-12-11' not in {row['date'] for row in bridge['dates']}
+    # Days are the session's business days in any display zone (D334); the zone formats their instants.
+    tokyo=client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','timeZone':'Asia/Tokyo'})
+    shifted=next(row for row in tokyo['dates'] if row['date']=='2020-12-11')['frames']
+    assert all(row['businessDate']=='2020-12-11' and row['at'].startswith('2020-12-11T16:00:00') for row in shifted)
+    assert [row['date'] for row in tokyo['dates']]==[row['date'] for row in monthly['dates']]
+    assert {row['id'] for day in monthly['dates'] for row in day['frames']}=={row['id'] for day in tokyo['dates'] for row in day['frames']}
+    known={row['id'] for row in offered}
+    workspace=client.call('market/dates',{'session':SESSION,'curve':None,'timeZone':'UTC'})
+    assert {row['id'] for day in workspace['dates'] for row in day['frames']}<=known
+    for body,full in [({'curve':None,'timeZone':'UTC'},workspace),({'curve':'ng_monthly','timeZone':'Asia/Tokyo'},tokyo),({'curve':'bridge_basis','timeZone':'UTC'},bridge)]:
+        latest=client.call('market/dates',{'session':SESSION,**body,'maximumDates':1})
+        assert latest['dates']==full['dates'][-1:] and latest['maxDate']==full['maxDate']
+        assert latest['hasMoreCandidates'] is True
+    for maximum in (0,129):
+        client.call('market/dates',{'session':SESSION,'curve':None,'timeZone':'UTC','maximumDates':maximum},expected=422)
+    if query and manifest:
+        newest={frame['id'] for frame in workspace['dates'][-1]['frames']}
+        latest_pins={pin for frame in offered if frame['id'] in newest for pin in frame['observationIds']}
+        old_pin=next(pin for frame in offered for pin in frame['observationIds'] if pin not in latest_pins)
+        signature='security.read_observation_pins(uuid,uuid,uuid[])'
+        original=query(f"SELECT pg_get_functiondef('{signature}'::regprocedure);")
+        assert original.count('\nBEGIN\n')==1
+        injected=original.replace('\nBEGIN\n',f"\nBEGIN\n IF '{old_pin}'::uuid=ANY(requested_pins) THEN RAISE EXCEPTION 'Synthetic older candidate read' USING ERRCODE='42501';END IF;\n",1)
+        try:
+            query(injected)
+            assert client.call('market/dates',{'session':SESSION,'curve':None,'timeZone':'UTC','maximumDates':1})['dates']==workspace['dates'][-1:]
+            client.call('market/dates',{'session':SESSION,'curve':None,'timeZone':'UTC'},expected=403)
+        finally:
+            query(original)
+            assert query(f"SELECT pg_get_functiondef('{signature}'::regprocedure);")==original
+        print('PASS latest-date availability never reads an older candidate after its newest date qualifies',flush=True)
+    client.call('market/dates',{'session':SESSION,'curve':'missing_curve','timeZone':'UTC'},expected=422)
+    client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','timeZone':'Not/AZone'},expected=422)
+    templates={row['code']:row for row in client.call('custom-curves')['templates']}
+    client.call('market/dates',{'session':SESSION,'definition':templates['ng_prompt']['definition'],'timeZone':'UTC'},expected=400)
+    average_request={'curve':None,'definition':templates['ng_average']['definition'],'timeZone':'UTC','session':SESSION}
+    if query and manifest:
+        # Count native visibility visits for one retained fact under a bound
+        # context. This detects repeated history visibility work; physical row
+        # work is measured separately by the regional-close checks.
+        def count_receipts():
+            return int(query("SELECT (to_regclass('market_data.temporal_contexts') IS NOT NULL)::integer;"))
+        before=count_receipts()
+        baseline_average=client.call('market/dates',average_request)
+        assert count_receipts()==before, 'Browsing custom-curve dates must not retain a financial context'
+        anchor=query(f"SELECT id FROM market_data.observations WHERE catalog_id='{manifest['catalogId']}' AND definition_revision_id='{manifest['revisionId']}' AND role='daily_settlement' ORDER BY observed_at,id LIMIT 1;")
+        query(f"""CREATE SEQUENCE public.synthetic_calendar_history_reads;
+          CREATE FUNCTION public.synthetic_calendar_history_read(observation uuid) RETURNS boolean
+          LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $$BEGIN
+           IF observation='{anchor}'::uuid AND EXISTS(SELECT 1 FROM security.request_contexts c
+             WHERE c.backend_pid=pg_backend_pid() AND c.transaction_id=pg_current_xact_id_if_assigned()
+              AND c.runtime_login=session_user AND c.market_context_id IS NOT NULL) THEN
+            PERFORM nextval('public.synthetic_calendar_history_reads');
+           END IF;
+          RETURN true;END$$;
+          REVOKE ALL ON FUNCTION public.synthetic_calendar_history_read(uuid) FROM PUBLIC;
+          GRANT EXECUTE ON FUNCTION public.synthetic_calendar_history_read(uuid) TO openetrm_security_owner;""")
+        query("""CREATE FUNCTION public.synthetic_observe_cut() RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE cut record;
+            BEGIN
+             SELECT * INTO STRICT cut FROM security.request_market_cut();
+             RAISE LOG 'synthetic_calendar_cut %|%', cut.effective_on, cut.known_at;
+             RETURN NEW;
+            END$$;
+            CREATE TRIGGER synthetic_observe_cut AFTER UPDATE OF market_context_id ON security.request_contexts
+            FOR EACH ROW WHEN (NEW.market_context_id IS NOT NULL) EXECUTE FUNCTION public.synthetic_observe_cut();""")
+        try:
+            offset=log.stat().st_size
+            with visibility_probe(query,'public.synthetic_calendar_history_read(v.observation)'):
+                average=client.call('market/dates',average_request)
+            assert average['dates']==baseline_average['dates'], 'Visibility instrumentation changed native calendar availability'
+            reads=query('SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM public.synthetic_calendar_history_reads;')
+            assert reads in ('1','2'), f'Custom date availability repeated history visibility beyond shared samples and one exact frame: {reads}'
+            with log.open('rb') as stream:
+                stream.seek(offset)
+                cuts=[line.split('synthetic_calendar_cut ',1)[1].split('|') for line in stream.read().decode().splitlines()
+                      if 'LOG:  synthetic_calendar_cut ' in line]
+            assert len({cut[0] for cut in cuts})>1 and len({cut[1] for cut in cuts})==1, cuts
+            assert count_receipts()==before, 'Rechecking a calendar must not retain temporary selections'
+            assert client.call('custom-curves')['context'] is None, 'Availability changed the working header context'
+        finally:
+            query('DROP TRIGGER synthetic_observe_cut ON security.request_contexts;DROP FUNCTION public.synthetic_observe_cut();')
+            query('DROP FUNCTION public.synthetic_calendar_history_read(uuid);DROP SEQUENCE public.synthetic_calendar_history_reads;')
+    else:
+        average=client.call('market/dates',average_request)
+    assert '2020-11-18' not in {row['date'] for row in average['dates']}
+    assert '2020-12-18' in {row['date'] for row in average['dates']}
+    latest_average=client.call('market/dates',{'session':SESSION,**average_request,'maximumDates':1})
+    assert latest_average['dates']==average['dates'][-1:]
+    if query and manifest:
+        business=deepcopy(templates['ng_average']['definition'])
+        calendar=client.call('custom-curves')['calendars'][0]['code']
+        next(node for node in business['nodes'] if node['kind']=='dates')['parameters'].update(mode='prior_business',calendar=calendar)
+        anchor_day=query(f"SELECT min(business_date) FROM ref_data.calendar_days WHERE catalog_id='{manifest['referenceCatalogId']}' AND revision_id='{manifest['referenceRevisionId']}' AND calendar_code='{calendar}';")
+        query(f"""CREATE SEQUENCE public.synthetic_calendar_materializations;
+          CREATE FUNCTION public.synthetic_calendar_materialization(code text,day date) RETURNS boolean
+          LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $$BEGIN
+           IF code='{calendar}' AND day='{anchor_day}'::date THEN PERFORM nextval('public.synthetic_calendar_materializations');END IF;
+           RETURN true;END$$;
+          CREATE POLICY synthetic_calendar_materialization ON ref_data.calendar_days AS RESTRICTIVE
+           FOR SELECT TO openetrm_runtime USING(public.synthetic_calendar_materialization(calendar_code,business_date));""")
+        try:
+            body={'curve':None,'definition':business,'timeZone':'UTC'}
+            first=client.call('market/dates',{'session':SESSION,**body})
+            reads=int(query('SELECT last_value FROM public.synthetic_calendar_materializations;'))
+            assert first['dates'] and 1<=reads<=3, f'Immutable calendar was reloaded per candidate: {reads}'
+            assert client.call('market/dates',{'session':SESSION,**body})['dates']==first['dates']
+            later=int(query('SELECT last_value FROM public.synthetic_calendar_materializations;'))
+            assert 1<=later-reads<=3, 'Calendar materialization must be local to each authorized operation'
+        finally:
+            query('DROP POLICY synthetic_calendar_materialization ON ref_data.calendar_days;DROP FUNCTION public.synthetic_calendar_materialization(text,date);DROP SEQUENCE public.synthetic_calendar_materializations;')
+        print('PASS custom availability shares immutable calendar materialization only within its authorized operation',flush=True)
+    # The materializer still prepares every upstream source sample even when a
+    # lookup consumes one maturity. Batching must preserve that exact boundary.
+    lookup=deepcopy(templates['ng_average']['definition'])
+    values=next(node['id'] for node in lookup['nodes'] if node['kind']=='mean')
+    lookup['nodes'] += [
+        {'id':'targets','kind':'dates','inputs':{},'parameters':{'mode':'delivery_range','from':'2021-01-01','to':'2021-01-02',
+            'sampling':'context_utc_time','corrections':'exact_context_frame_history_latest_visible'}},
+        {'id':'lookup','kind':'lookup','inputs':{'values':values,'dates':'targets'},'parameters':{
+            'axis':'delivery_start','method':'containing_delivery','maxGapDays':'62','leftBoundary':'reject','rightBoundary':'reject',
+            'implementation':'asset_curve_lookup_v1','output':'daily_delivery_v1'}}]
+    next(node for node in lookup['nodes'] if node['kind']=='output')['inputs']={'values':'lookup'}
+    lookup_dates=client.call('market/dates',{'session':SESSION,'curve':None,'definition':lookup,'timeZone':'UTC'})
+    assert '2020-12-18' in {day['date'] for day in lookup_dates['dates']}
+    assert '2020-12-11' not in {day['date'] for day in lookup_dates['dates']}
+    assert client.call('market/dates',{'session':SESSION,'curve':None,'definition':lookup,'timeZone':'UTC','maximumDates':1})['dates']==lookup_dates['dates'][-1:]
+    last=next(frame for frame in offered if frame['at'].startswith('2020-12-18T16:00:00'))
+    assert client.call('custom-curves/preview',{'snapshotId':last['id'],'definition':lookup})['rows']
+    earlier=next(frame for frame in offered if frame['at'].startswith('2020-12-11T16:00:00'))
+    assert client.call('custom-curves/preview',{'snapshotId':earlier['id'],'definition':lookup},expected=422)['code']=='curve_coverage'
+    frozen=deepcopy(templates['ng_prompt']['definition'])
+    next(node for node in frozen['nodes'] if node['kind']=='source')['parameters']['curve']='ng_fixed_location'
+    frozen_dates=client.call('market/dates',{'session':SESSION,'curve':None,'definition':frozen,'timeZone':'UTC'})
+    assert '2020-12-18' in {row['date'] for row in frozen_dates['dates']}
+    assert '2020-12-17' not in {row['date'] for row in frozen_dates['dates']}
+    incomplete_window=deepcopy(templates['ng_average']['definition'])
+    next(node for node in incomplete_window['nodes'] if node['kind']=='dates')['parameters']['count']='100'
+    no_dates=client.call('market/dates',{'session':SESSION,'curve':None,'definition':incomplete_window,'timeZone':'UTC'})
+    assert no_dates['dates']==[] and no_dates['minDate'] is None and no_dates['maxDate'] is None
+    invalid=deepcopy(templates['ng_average']['definition']);invalid['nodes'][-1]['inputs']={}
+    client.call('market/dates',{'session':SESSION,'curve':None,'definition':invalid,'timeZone':'UTC'},expected=422)
+    client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','definition':templates['ng_prompt']['definition'],'timeZone':'UTC'},expected=422)
+    # A retained knowledge view can only expose frames on its exact effective day.
+    captured=client.call('market/context',{'effectiveOn':'2020-12-18','knownAt':None,'mode':'current','selection':'latest_correction'})
+    historical=client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','timeZone':'UTC'})
+    assert historical['context']['contextId']==captured['context']['contextId']
+    assert {row['date'] for row in historical['dates']}=={'2020-12-18'}
+    assert all(row['businessDate']=='2020-12-18' for day in historical['dates'] for row in day['frames'])
+    if query and manifest:
+        scope=manifest['referenceCatalogId']
+        deleted=query(f"DELETE FROM security.reference_catalog_scopes WHERE catalog_id='{scope}' RETURNING tenant_id,workspace_id,access_mode;")
+        try:client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','timeZone':'UTC'},expected=403)
+        finally:
+            tenant,workspace,access=deleted.split('|')
+            query(f"INSERT INTO security.reference_catalog_scopes VALUES('{scope}','{tenant}','{workspace}','{access}');")
+    client.call('market/current',{})
+    client.call('profile',{'profile':'editor'})
+    frame=next(row for row in client.call('workspace')['frames'] if row['at'].startswith('2020-12-18T16:00:00'))
+    observations=client.call('workspace')['observations']
+    chosen=next(row for row in observations if row['id'] in frame['observationIds'] and row['role']=='daily_settlement')
+    changed=client.call('corrections',{'snapshotId':frame['id'],'observationId':chosen['id'],'value':chosen['value']})['frame']
+    duplicate=client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','timeZone':'UTC'})
+    closes=next(row for row in duplicate['dates'] if row['date']=='2020-12-18')['frames']
+    # A correction is a working snapshot until it is recorded (D334): the day still offers only its close in force.
+    assert [row['id'] for row in closes]==[frame['id']] and changed['id'] not in {row['id'] for day in duplicate['dates'] for row in day['frames']}
+    latest=client.call('market/dates',{'session':SESSION,'curve':'ng_monthly','timeZone':'UTC','maximumDates':1})
+    assert latest['dates']==duplicate['dates'][-1:], 'The latest-date read must name the close in force.'
+    if query and manifest:
+        # An observation outside every offered exact snapshot cannot affect a
+        # built-in calendar. Custom history intentionally has a broader read.
+        offered=client.call('workspace')['frames']
+        pins={identifier for saved in offered for identifier in saved['observationIds']}
+        selected=','.join("'"+str(identifier)+"'::uuid" for identifier in pins)
+        unused=query(f"SELECT id FROM market_data.observations WHERE catalog_id='{manifest['catalogId']}' AND definition_revision_id='{manifest['revisionId']}' AND series_id IN(SELECT series_id FROM market_data.rate_curve_tenors WHERE catalog_id='{manifest['catalogId']}' AND revision_id='{manifest['revisionId']}') AND NOT(id=ANY(ARRAY[{selected}])) ORDER BY id LIMIT 1;")
+        if not unused:
+            # Append a valid same-value correction without adding it to a session
+            # frame. Existing immutable observations and prices are unchanged.
+            unused=str(uuid4())
+            query(f"""INSERT INTO market_data.observations
+              (catalog_id,id,definition_revision_id,series_id,reference_catalog_id,reference_revision_id,source_code,
+               source_event_id,source_revision_id,role,publication_state,observed_at,received_at,value,corrects_id)
+              SELECT catalog_id,'{unused}',definition_revision_id,series_id,reference_catalog_id,reference_revision_id,source_code,
+               source_event_id,'{uuid4()}',role,publication_state,observed_at,clock_timestamp(),value,id
+              FROM market_data.observations o WHERE catalog_id='{manifest['catalogId']}' AND definition_revision_id='{manifest['revisionId']}'
+              AND series_id IN(SELECT series_id FROM market_data.rate_curve_tenors WHERE catalog_id='{manifest['catalogId']}' AND revision_id='{manifest['revisionId']}')
+              AND NOT EXISTS(SELECT 1 FROM market_data.observations child WHERE child.catalog_id=o.catalog_id AND child.corrects_id=o.id)
+              ORDER BY id LIMIT 1;""")
+        requests=[{'curve':code,'timeZone':'UTC'} for code in (None,'ng_monthly','interest_rates')]
+        before=[client.call('market/dates',{'session':SESSION,**body}) for body in requests]
+        query(f"""CREATE FUNCTION public.synthetic_unused_calendar_observation(id uuid) RETURNS boolean
+          LANGUAGE plpgsql VOLATILE AS $$BEGIN
+          IF id='{unused}'::uuid THEN RAISE EXCEPTION 'Synthetic unused calendar observation read' USING ERRCODE='42501';END IF;
+          RETURN true;END$$;
+          REVOKE ALL ON FUNCTION public.synthetic_unused_calendar_observation(uuid) FROM PUBLIC;
+          GRANT EXECUTE ON FUNCTION public.synthetic_unused_calendar_observation(uuid) TO openetrm_security_owner;""")
+        try:
+            with visibility_probe(query,'public.synthetic_unused_calendar_observation(v.observation)'):
+                for body,expected in zip(requests,before):
+                    assert client.call('market/dates',{'session':SESSION,**body})==expected, 'Built-in availability must use only all offered frame pins.'
+                # History still has a broader native visibility scope even when
+                # its returned observations are window-scoped. A refusal fails.
+                client.call('market/dates',{'session':SESSION,'curve':None,'definition':templates['ng_average']['definition'],'timeZone':'UTC'},expected=403)
+        finally:
+            query('DROP FUNCTION public.synthetic_unused_calendar_observation(uuid);')
+        # A required pin for any offered frame cannot be silently substituted,
+        # including when the selected curve would not itself consume that fact.
+        anchor=query(f"SELECT id FROM market_data.observations WHERE catalog_id='{manifest['catalogId']}' AND id=ANY(ARRAY[{','.join(repr(identifier)+'::uuid' for identifier in frame['observationIds'])}]) AND series_id IN(SELECT series_id FROM market_data.rate_curve_tenors WHERE catalog_id='{manifest['catalogId']}' AND revision_id='{manifest['revisionId']}') ORDER BY id LIMIT 1;")
+        affected={saved['id'] for saved in offered if anchor in saved['observationIds']}
+        prompt_body={'curve':None,'definition':templates['ng_prompt']['definition'],'timeZone':'UTC','session':SESSION}
+        prompt_before=client.call('market/dates',prompt_body)
+        query(f"CREATE POLICY synthetic_hidden_calendar_observation ON market_data.observations AS RESTRICTIVE FOR SELECT TO openetrm_runtime USING(id<>'{anchor}'::uuid);")
+        try:
+            for body in [*requests,prompt_body]:
+                client.call('market/dates',{'session':SESSION,**body},expected=403)
+        finally:
+            query('DROP POLICY synthetic_hidden_calendar_observation ON market_data.observations;')
+        # A separate subtract-only visibility fault retains the endpoint's
+        # complete-pin check without asking it to accept an unknown policy.
+        with visibility_probe(query,f"v.observation<>'{anchor}'::uuid"):
+            for body,expected in [*zip(requests,before),(prompt_body,prompt_before)]:
+                actual=client.call('market/dates',{'session':SESSION,**body})
+                expected_ids={saved['id'] for day in expected['dates'] for saved in day['frames']}-affected
+                assert {saved['id'] for day in actual['dates'] for saved in day['frames']}==expected_ids
+        assert all(client.call('market/dates',{'session':SESSION,**body})==expected for body,expected in zip(requests,before))
+        print('PASS built-in calendar reads exact pins across all frames, rates and corrections; hidden pins never fall back and recipes read only their declared sample windows',flush=True)
+    # Every listed curve's last close is its own calendar's newest close, and a curve with no complete close names none.
+    client.call('market/last-closes',{},expected=400)
+    client.call('market/last-closes',{'session':SESSION,'extra':1},expected=400)
+    last=client.call('market/last-closes',{'session':SESSION})
+    assert last['session']==SESSION and last['context'] is None, last
+    named={entry['curve']:entry for entry in last['curves']}
+    for listed in client.call('workspace/navigation')['curves']:
+        calendar=client.call('market/dates',{'session':SESSION,'curve':listed['code'],'timeZone':'UTC'})
+        if calendar['dates']:
+            newest=max(calendar['dates'][-1]['frames'],key=lambda frame:frame['at'])
+            assert named[listed['code']]=={'curve':listed['code'],'id':newest['id'],'businessDate':calendar['maxDate'],'at':named[listed['code']]['at']} and named[listed['code']]['at']==newest['at'],(listed['code'],named.get(listed['code']),newest)
+        else: assert listed['code'] not in named, listed
+    print('PASS the last close of every listed curve is the newest close its own calendar offers',flush=True)
+    print('PASS market calendar availability: exact curve dependencies, complete recipe windows, session business days, one close per day, certified context and current reference authority',flush=True)

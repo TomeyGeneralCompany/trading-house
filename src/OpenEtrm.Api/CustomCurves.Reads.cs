@@ -1,0 +1,158 @@
+using System.Collections.Immutable;
+using Npgsql;
+using OpenEtrm.MarketData;
+using OpenEtrm.MarketData.Calculation;
+using OpenEtrm.MarketData.CustomCurves;
+using OpenEtrm.MarketData.Power;
+using System.Globalization;
+
+namespace OpenEtrm.Api;
+
+public static partial class CustomCurves
+{
+    internal sealed record CurveRead(object Value,int Rows,ImmutableArray<Guid> ReferenceCatalogs);
+    // Callers bind this pin once in their authorized request transaction.
+    internal static async Task<CurveRead> CatalogRead(NpgsqlConnection connection,PreviewDatabase database,PinnedContext pin,CancellationToken ct)
+    {
+        var store=new CustomCurvesStore(database);
+        var revision=await CurveVersionInputs.Resolve(database,connection,null,ct);
+        var data=await database.Read(connection,ct,selectedRevision:revision,observationIds:[],includeCalendarDays:false);
+        var schedules=new ScheduleStore(database.Manifest.CatalogId,data.ReferenceRevision.CatalogId,data.ReferenceRevision.RevisionId);
+        var versions=pin.Context is {} selected?await schedules.ReadAt(connection,selected,ct):await schedules.Read(connection,ct);
+        var calendars=await schedules.Calendars(connection,ct);
+        var recipes=await store.Read(connection,ct);
+        var powerProducts=await PowerIntervalCurves.Products(connection,data,ct);
+        var powerPublications=(await PricePublicationStore.Read(connection,data.DefinitionRevision.CatalogId,ct))
+            .Where(p=>p.Implementation==OpenEtrm.MarketData.Publications.HourlyPowerPublication.Implementation&&p.References==data.ReferenceRevision).ToArray();
+        var powerSources=await PowerHistory.Sources(connection,null,ct);
+        // New source choices are offered only in working mode. Historical
+        // recipes retain their exact series relationship without future choices.
+        var priceShapes=pin.Context is not null?ImmutableArray<System.Text.Json.JsonElement>.Empty:await PreviewDatabase.Rows(connection,
+            "SELECT jsonb_build_object('id',id,'name',name)::text FROM market_data.interval_series WHERE catalog_id=$1 AND reference_catalog_id=$2 AND reference_revision_id=$3 AND kind='additive_price_shape' AND interval_minutes=60 ORDER BY name,id",
+            [data.DefinitionRevision.CatalogId,data.ReferenceRevision.CatalogId,data.ReferenceRevision.RevisionId],ct);
+        // Raw exact-version metadata is authorized under its original read pin.
+        // Resolve UI choices afterward without narrowing those retained reads.
+        var referenceCatalogs=await ReferenceCatalogs(connection,data,recipes,versions.Where(v=>v.Calendar is not null).Select(v=>v.Calendar!.CatalogId).Concat(calendars.Select(c=>c.Reference.CatalogId)),ct);
+        var contextRecipes=ContextVersions.Latest(recipes,r=>r.Id,r=>r.Version);
+        var contextSchedules=ContextVersions.Latest(versions.Where(v=>v.State=="published"),v=>v.Id,v=>v.Version);
+        var publishedHeads=new HashSet<(Guid,int)>();
+        var contextSourceStatus=new List<object>();
+        if(pin.Frame is not null)
+        {
+            var contextPin=await SelectedClose.Pin(connection,database,pin,ct);
+            var certified=await store.Read(connection,ct);
+            contextRecipes=ContextVersions.Latest(certified.Concat(pin.Context is null?recipes.Where(r=>r.State=="draft"):[]),r=>r.Id,r=>r.Version);
+            contextSchedules=ContextVersions.Latest(await schedules.ReadAt(connection,contextPin.Context!,ct),v=>v.Id,v=>v.Version);
+            foreach(var recipe in ContextVersions.Latest(certified.Where(r=>r.State=="published"),r=>r.Id,r=>r.Version))
+                publishedHeads.Add((recipe.Id,recipe.Version));
+        }
+        var publishedSources=new List<object>();
+        var contextSources=new List<object>();
+        foreach(var recipe in recipes.Where(r=>r.State=="published"&&r.EngineVersion==RecipeEngine.Version&&RecipeEngine.PowerIntervalOutput(r.Definition) is null))
+        {
+            await using var eligible=ScheduleStore.Command(connection,"SELECT security.custom_curve_uses_revision($1,$2,$3,$4)",
+                data.DefinitionRevision.CatalogId,recipe.Id,recipe.Version,await CurveVersionInputs.Resolve(database,connection,recipe.MarketRevisionId,ct));
+            if(Equals(await eligible.ExecuteScalarAsync(ct),true)){var source=new{
+                label=$"{recipe.Definition.Name} ({recipe.Definition.Code}) · v{recipe.Version} · {recipe.Definition.Output}",kind=CurveKinds.Of(recipe.Definition),
+                reference=new PublishedRecipeReference(data.DefinitionRevision.CatalogId,recipe.Id,recipe.Version,recipe.Definition.Output)};
+                publishedSources.Add(source);if(publishedHeads.Contains((recipe.Id,recipe.Version)))contextSources.Add(source);}
+            else if(publishedHeads.Contains((recipe.Id,recipe.Version)))contextSourceStatus.Add(new{id=recipe.Id,available=false,reason="The published graph requires a different admitted source bundle."});
+        }
+        async Task<bool> Can(string permission)
+        {
+            await using var command=ScheduleStore.Command(connection,"SELECT security.has_permission($1)",permission);
+            return pin.Context is null&&Equals(await command.ExecuteScalarAsync(ct),true);
+        }
+        var nativeSources=new List<object>();
+        foreach(var source in await MarketInputSelection.ReadCatalogueTerms(database,connection,ct))
+        {
+            var sourceData=source.Data;var codes=source.Members.Where(c=>c.Kind=="curve").Select(c=>c.Code).ToHashSet(StringComparer.Ordinal);
+            nativeSources.AddRange(sourceData.Definitions["curves"].Where(row=>codes.Contains(row.Text("code"))).Select(row=>(object)new
+            {
+                code=row.Text("code"),name=row.Text("name"),kind=PreviewData.CurveKind(row.Text("rule"),row.OptionalText("direct_role")),
+                catalogId=sourceData.DefinitionRevision.CatalogId,revisionId=sourceData.DefinitionRevision.RevisionId,
+                contracts=sourceData.DefinitionRows("curve_members","curve_code",row.Text("code")).OrderBy(m=>m.GetProperty("ordinal").GetInt32())
+                    .Select(m=>sourceData.ContractRows(m.Id("contract_id")).Single()).Select(k=>new{id=k.Key.Id,label=k.DeliveryFrom.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture),k.DeliveryFrom,k.DeliveryTo,expiry=k.Expiry,markingStatus=CurveDisplay.ExpiryStatus(k,pin.CalculationFrame?.At)})
+            }));
+        }
+        var value=new{kindsVersion=CurveKinds.Version,context=pin.Context,canEdit=await Can("WriteMarketDefinitions"),canPublish=await Can("SealMarketDefinitions"),
+            sources=nativeSources,
+            calendars=calendars.Select(row=>new{code=row.Reference.Code,name=row.Reference.Code,row.Reference.CatalogId,row.Reference.RevisionId}),
+            schedules=versions.Where(v=>v.State=="published").Select(v=>new{value=v.Id.ToString("D")+":"+v.Version.ToString(CultureInfo.InvariantCulture),name=v.Definition.Name,v.Id,v.Version}),
+            contextSchedules=contextSchedules.Select(v=>new{value=v.Id.ToString("D")+":"+v.Version.ToString(CultureInfo.InvariantCulture),name=v.Definition.Name,v.Id,v.Version}),
+            powerProducts=powerProducts.Where(p=>p.State=="published"&&p.Calendar is not null&&p.HolidayTreatment==PublishedTouBinding.HolidayConvention).Select(p=>new{p.Id,p.Code,p.Name,p.Version,p.Clock,p.Calendar,p.HolidayTreatment}),
+            powerProfiles=data.References["delivery_profiles"].Where(p=>p.Text("interval_minutes")=="60").Select(p=>new{code=p.Text("code")}),
+            powerPublications=powerPublications.Select(p=>new{id=p.Key.Id,p.Name,p.Key.Version}),
+            powerSettlementIndices=powerPublications.SelectMany(p=>p.Indices).DistinctBy(i=>i.Key).Select(i=>new{code=i.Key.Code}),
+            powerPriceShapes=priceShapes,
+            powerSources=powerSources.Where(s=>s.Minutes==60&&s.Display.Text("provider")=="PJM"&&s.Display.Id("reference_catalog_id")==data.ReferenceRevision.CatalogId&&s.Display.Id("reference_revision_id")==data.ReferenceRevision.RevisionId).Select(s=>new{id=s.Display.Id("id"),name=s.Display.Text("name"),market=s.Display.Text("market")}),
+            operators=Operators(),templates=Templates(data),recipes,publishedSources,contextRecipes,contextSources,contextSourceStatus,formulaSupported=true,
+            componentHistory=new{policy=RecipeComponentHistory.Policy,label="Raw prices · contract roll jumps retained",kinds=new[]{"select","weighted_contracts","sample"},selectionModes=new[]{"positions"},sampleSelectionPort="selection",
+                sampling="context_utc_time",corrections="exact_context_frame_history_latest_visible",
+                description="Sample at the selected close's UTC time. Keep the component's contract-binding rule and read historical corrections visible at the selected knowledge cutoff. Every requested observation is required."}};
+        _=await new CatalogueStore(database.Manifest.CatalogId).ReadBound(connection,ct);
+        await using var authority=ScheduleStore.Command(connection,"SELECT security.market_access($1,'ReadMarketData') AND NOT EXISTS(SELECT 1 FROM unnest($2::uuid[]) r WHERE NOT security.reference_access(r,'ReadMarketData'))",database.Manifest.CatalogId,referenceCatalogs.ToArray());
+        if(!Equals(await authority.ExecuteScalarAsync(ct),true))throw new PreviewDeniedException();
+        return new(value,recipes.Length+publishedSources.Count+data.Definitions["curves"].Length+versions.Length+calendars.Length,referenceCatalogs);
+    }
+    internal static async Task<CurveRead> PreviewRead(NpgsqlConnection connection,PreviewDatabase database,PinnedContext pin,CustomCurvePreviewRequest body,CancellationToken ct,ComponentHistoryRequest? history=null)
+    {
+        var store=new CustomCurvesStore(database);
+        var context=pin.Context??throw Invalid("Recipe pricing requires its resolved financial context.");
+        var frame=pin.RequireFrame() with{ContextId=context.ContextId};
+        var versions=await store.Read(connection,ct);
+        var retained=body.Id is {} requested?versions.SingleOrDefault(v=>v.Id==requested&&v.Version==body.Version):null;
+        var revision=retained is null?await CurveVersionInputs.NewGraph(database,connection,body.Definition,pin.Frame?.Time.Date,ct):await CurveVersionInputs.Resolve(database,connection,retained.MarketRevisionId,ct);
+        if(retained?.MarketRevisionId is {} exact&&exact!=revision)throw Invalid("The saved graph requires its exact definition revision.");
+
+        var data=await database.Read(connection,ct,selectedRevision:revision,observationIds:[],includeCalendarDays:false);
+        Validate(body.Definition);
+        var references=await store.References(connection,body.Definition,data,ct);
+        if((body.Id is null)!=(body.Version is null))throw Invalid("Supply both the saved curve identity and exact version.");
+        if(body.Id.HasValue)
+        {
+            var saved=retained??throw Invalid("This exact curve version is unavailable in the selected knowledge context.");
+            if(saved.EngineVersion!=RecipeEngine.Version)throw Invalid("The selected retained curve engine is unavailable.");
+            if(!Equivalent(saved.Definition,body.Definition)||saved.Sources.Any(p=>!references.Sources.TryGetValue(p.Key,out var value)||value!=p.Value)||saved.Calendars.Any(p=>!references.Calendars.TryGetValue(p.Key,out var value)||value!=p.Value)||saved.Schedules.Any(p=>!references.Schedules.TryGetValue(p.Key,out var value)||value!=p.Value))throw Invalid("The selected graph or exact references differ from its retained version.");
+        }
+        if(RecipeEngine.PowerIntervalOutput(body.Definition) is not null)
+        {
+            if(history is not null)throw Invalid("Hourly outputs use the interval preview, without daily history sampling.");
+            return await PowerIntervalPreview(connection,database,pin,body,data,ct);
+        }
+        var inspected=body.Definition;
+        if(history is not null)
+        {
+            inspected=RecipeComponentHistory.Build(body.Definition,history.Node,history.Dates,history.Policy);
+            Validate(inspected);
+            references=await store.References(connection,inspected,data,ct);
+        }
+        var prepared=await PrepareDefinition(connection,database,inspected,data,frame,references.Sources,references.Calendars,references.Schedules,
+            context,ct,versions:versions);
+        var graph=prepared.Graph;
+        var value=Result(EvaluateGraph(graph,prepared.Context,database,ct),data,pin,inspected,body.Id,body.Version,history is not null);
+        if(history is not null)value=new{node=history.Node,policy=history.Policy,preview=value};
+        var referenceCatalogs=graph.Definitions.SelectMany(d=>d.Points).SelectMany(point=>point.Expression is ConnectedRecipeProjection projected?
+            projected.Declaration.References.Calendars.Select(c=>c.Reference.Revision.CatalogId).Concat(projected.Declaration.References.Schedules.Where(s=>s.Calendar is not null).Select(s=>s.Calendar!.Reference.Revision.CatalogId)):[]);
+        return new(value,graph.Outputs.Length,[..referenceCatalogs.Append(data.ReferenceRevision.CatalogId).Distinct()]);
+    }
+    static async Task<ImmutableArray<Guid>> ReferenceCatalogs(NpgsqlConnection connection,PreviewData data,
+        ImmutableArray<CustomCurveVersion> versions,IEnumerable<Guid> calendars,CancellationToken ct)
+    {
+        var result=calendars.Concat(versions.SelectMany(v=>v.Calendars.Values.Select(c=>c.CatalogId))).Append(data.ReferenceRevision.CatalogId).ToHashSet();
+        foreach(var schedule in versions.SelectMany(v=>v.Schedules.Values).Distinct())
+        {
+            await using var command=ScheduleStore.Command(connection,"SELECT calendar_catalog_id FROM market_data.date_schedule_versions WHERE(catalog_id,schedule_id,version)=($1,$2,$3)",schedule.CatalogId,schedule.Id,schedule.Version);
+            await using var reader=await command.ExecuteReaderAsync(ct);
+            if(!await reader.ReadAsync(ct))throw Invalid("A retained schedule version is unavailable.");
+            if(!reader.IsDBNull(0))result.Add(reader.GetGuid(0));
+        }
+        foreach(var source in versions.SelectMany(v=>v.Sources.Values).Select(s=>(s.CatalogId,s.RevisionId)).Distinct())
+        {
+            await using var command=ScheduleStore.Command(connection,"SELECT reference_catalog_id FROM market_data.revisions WHERE(catalog_id,id)=($1,$2)",source.CatalogId,source.RevisionId);
+            if(await command.ExecuteScalarAsync(ct) is Guid reference)result.Add(reference);
+            else throw Invalid("A retained native source revision is unavailable.");
+        }
+        return [..result.Order()];
+    }
+}

@@ -1,0 +1,85 @@
+// How the browser checks drive the physical gas deal ticket (docs/deal-ticket.md): its selectors, choices the backend lists, and the January
+// terms at a synthetic point the scenarios enter.
+import {idle} from './owned-browser.mjs';
+import {chooseCalendars} from './side-calendars.mjs';
+
+const ticketWaitMs=30000;
+export const q=JSON.stringify;
+export const newTicket='#gas-ticket .deal-ticket',bookedTicket='#position-details .deal-ticket[data-mode=booked]';
+
+export async function openBookedSchedules({wait,click}){
+ await wait("document.querySelector('#position-details-tabs-schedules')&&!document.querySelector('#position-details').hidden&&"+idle);
+ await click('#position-details-tabs-schedules');
+}
+
+export function gasTicket({evaluate,wait,set},ticket=newTicket){
+ const card=(code,root=ticket)=>`${root} .ticket-card[data-side="${code}"]`;
+ const field=(code,id)=>`${code===null?ticket+' :is(.ticket-strip,.ticket-ownership)':card(code)} .ticket-field[data-field="${id}"]`;
+ const control=(code,id)=>field(code,id)+' .ticket-control';
+ // Choices use the ticket settling window: an API request may outlast the ordinary action wait.
+ // A value is chosen only once the backend lists it, with field diagnostics if it never arrives.
+ const choose=async(code,id,value)=>{await until(`[...document.querySelectorAll(${q(control(code,id)+' option')})].some(o=>o.value===${q(value)})`);await set(control(code,id),value);};
+ const first=async(code,id)=>{await until(`document.querySelectorAll(${q(control(code,id)+' option')}).length>1`);await set(control(code,id),await evaluate(`document.querySelector(${q(control(code,id))}).options[1].value`));};
+ const status=(root=ticket)=>`document.querySelector(${q(root+' .ticket-status')})`;
+ const current=(root=ticket)=>`${status(root)}?.dataset.kind==='current'&&!!document.querySelector(${q(root+' .tabulator-row')})`;
+ const row=(key,root=ticket)=>`(document.querySelector(${q(root+' .tabulator-row[data-row-key="'+key+'"]')})?.textContent??'')`;
+ const month=(root=ticket)=>row('2021-01',root);
+ const observed=`({status:${status()}?.textContent,kind:${status()}?.dataset.kind,errors:[...document.querySelectorAll(${q(ticket+' .ticket-error')})].map(e=>e.closest('[data-field]').dataset.field+': '+e.textContent),month:${month()}})`;
+ // A wait that says, when it times out, what the ticket showed.
+ const until=(expression,detail=observed)=>wait(expression,ticketWaitMs).catch(async error=>{throw Error(error.message+' · observed '+JSON.stringify(await evaluate(detail)));});
+ const tradeTerms=async()=>{
+  for(const id of ['book','legal_entity','counterparty'])await first(null,id);
+  // A context that resolves a published gas setup lists it, and the person chooses it before the sides list their choices; none is chosen
+  // for them. Without one the sides list their choices at once.
+  const setups=`document.querySelectorAll(${q(control(null,'gas_setup')+' option')}).length>1`;
+  await until(`${setups}||[...document.querySelectorAll(${q(control('physical-1','product')+' option')})].some(o=>o.value==='test_gas')`);
+  if(await evaluate(setups))await first(null,'gas_setup');
+ };
+ // One January delivery per operating day at a synthetic point (A unless named); a quantity of null leaves it to the side's link.
+ const physicalTerms=async(code,direction,quantity,{zone='synthetic_gas_zone_a',point='synthetic_gas_point_a'}={})=>{
+  for(const [id,value] of [['delivery_from','2021-01-01'],['delivery_to','2021-02-01'],...quantity===null?[]:[['quantity',quantity]]])await set(control(code,id),value);
+  for(const [id,value] of [['direction',direction],['product','test_gas'],['quantity_basis','per_operating_day'],['pipeline','test_pipeline_a'],['zone',zone],['delivery_point',point]])
+   await choose(code,id,value);
+  await chooseCalendars({evaluate,set,wait},card(code),'test_utc_every_day');
+ };
+ // A payment or fee side charged on a physical side's delivery quantity at a manual price, paid on 5 February.
+ const cashTerms=async(code,kind,direction,source,price)=>{
+  for(const [id,value] of [['direction',direction],['source',source],['stage','delivery']])await choose(code,`${kind}_${id}`,value);
+  await set(control(code,`${kind}_price`),price);await setInstant(code,`${kind}_payment_at`,'2021-02-05T00:00:00Z');
+  await chooseCalendars({evaluate,set,wait},card(code),'test_utc_every_day');
+ };
+ // A date-time field takes a local time in the zone it names: the one the instant falls on there.
+ const setInstant=async(code,id,instant)=>{
+  if(await evaluate(`document.querySelector(${q(control(code,id))}).type==='date'`)){
+   await set(control(code,id),new Date(instant).toISOString().slice(0,10));return;
+  }
+  const local=await evaluate(`(()=>{const zone=document.querySelector(${q(control(code,id))}).getAttribute('aria-label').split(' · ').pop();
+   const p=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:zone,hourCycle:'h23',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).formatToParts(new Date(${q(instant)})).map(x=>[x.type,x.value]));
+   return p.year+'-'+p.month+'-'+p.day+'T'+p.hour+':'+p.minute;})()`);
+  await set(control(code,id),local);
+ };
+ const addSide=async(pill,code)=>{
+  await evaluate(`[...document.querySelectorAll(${q(ticket+' .ticket-add-kind')})].find(b=>b.textContent===${q(pill)}).click()`);
+  await wait(`!!document.querySelector(${q(card(code))})`);
+ };
+ return {ticket,card,field,control,choose,first,status,current,row,month,observed,until,tradeTerms,physicalTerms,cashTerms,setInstant,addSide};
+}
+
+/** The 18 December 2020 close of the seeded workspace, which every gas scenario prices at. */
+export const closeOn=(evaluate,day)=>evaluate(`(async()=>{const w=await(await window.workspaceFetch('/api/workspace')).json();const f=w.frames.find(f=>w.initialFrameIds.includes(f.id)&&f.at.startsWith(${q(day)}));return {id:f.id,session:f.close?.session??null};})()`);
+export const decemberClose=evaluate=>closeOn(evaluate,'2020-12-18');
+
+/** Opens the Blotter at the December close, under its own close session: the As of list offers only the chosen session's closes (D334). */
+export async function blotterAt({set,wait,click},{id,session}){
+ const controlsReady="document.body?.getAttribute('aria-busy')==='false'",snapshot="document.querySelector('#snapshot')";
+ const selected=`${snapshot}.value===${q(id)}`;
+ if(session){
+  await set('#close-session',session);
+  // The convention opens its newest close first. As soon as the controls accept the requested close, its prices can replace that intermediate read.
+  await wait(`${controlsReady}&&document.querySelector('#close-session').value===${q(session)}&&[...${snapshot}.options].some(option=>option.value===${q(id)})`,ticketWaitMs);
+ }
+ await set('#snapshot',id);await wait(`${controlsReady}&&${selected}`,ticketWaitMs);
+ await click('#nav-futures',ticketWaitMs);
+ const priced="document.querySelector('#futures-page').dataset.pricingState==='complete'";
+ await wait(`document.querySelector('#page-title').textContent==='Blotter'&&${selected}&&${priced}&&${idle}`,ticketWaitMs);
+}

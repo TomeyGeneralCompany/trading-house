@@ -1,0 +1,728 @@
+import {changedCells} from './grid-updates.js';
+import {TabulatorFull,type GridGroup,type GridRow,type GridColumn} from './vendor/tabulator.js';
+import {compareDecimalStrings} from './analytics-model.js';
+import {matchesTableRow,columnValues,validNumericFilter} from './regular-table.js';
+import {publicText} from './market-view.js';
+import {retainPlace,type Place} from './grid-place.js';
+import {menuKey,placeOf} from './context-menu.js';
+export type GridLayout={order:string[];widths:Record<string,number>;sort:{key:string;direction:'asc'|'desc'}[]};
+export const emptyGridLayout=():GridLayout=>({order:[],widths:{},sort:[]});
+/** Rows under headers, in the order given: each source row's group key and the header drawn for each key. */
+export type GridGroupOption={keys:string[];order:string[];header:(key:string,count:number)=>HTMLElement};
+type Cells=(string|HTMLElement)[][];
+// cells: rich content drawn for a cell instead of its display text; sorting and filtering still use the row's exact strings.
+// searchText: each source row's words that its rich cells draw, which the row search reads beside the row's exact strings.
+// visual: columns that only draw, such as a sparkline, and are neither sorted nor filtered.
+// group: rows under headers (GridGroupOption).
+// rowKeys: each source row's own identity, such as its trade and binding, which the selection, the open row and the place in the rows follow
+// through new data. A grid given none names its rows by their place in the rows it was given.
+// onRowOpen: the person opens a row (a click, Enter or the space bar); onRowSelect: they move the selection to the next or previous row (↓, ↑).
+// Each may answer false, as when the person keeps unsaved edits the consumer asked about: the selection then stays where it was.
+// onRowEscape: the person presses Escape on a row, as to collapse what the row opened.
+// onRowMenu: the person asks for a row's menu (a right-click, the context-menu key or Shift+F10), to be opened at `at`.
+// stretch: the last column fills the grid's remaining width.
+// toolbarHost: where the filter toolbar (search, column filters, row count) is drawn, when not above the table.
+// fill: the table takes the height its host gives it, such as a pane's, and its rows scroll within it; otherwise it is sized to its rows.
+// giveUp: columns, by index, that the grid gives up in this order, one at a time, only while the columns it shows do not fit its width. A grid
+// with room for all of them shows all.
+// tree: each source row's parent row key (null at the top), drawn as rows that open in place; `open` names the rows drawn open, and
+// onToggle hears the person opening or closing one.
+// totals: rows of one display string per column, drawn in order as lines of one row pinned below the rows (the total last, as below a
+// delivered and a remaining line); the grid never computes them.
+// headerGroups: column indices under a header in a colour token's colour (`--side-<colour>` in app.css).
+// decorate: a cell's value sources, whether it changed since the last read and whether its row is delivered; null for none.
+// soon: the hover text of each coming-soon column by index, drawn greyed with a Coming soon tag and holding no values.
+type Chosen=void|boolean|Promise<boolean>;
+export type GridOptions={displayRows?:string[][];cellTitles?:string[][];visible?:boolean[];initial?:{query:string;columns:(string|null)[]};retainMissingFilters?:boolean;keys:string[];columnGroups?:Record<string,{key:string;title:string;measureTitle:string}>;layout:GridLayout;onLayout:(value:GridLayout)=>void;onReady?:()=>void;onRowOpen?:(index:number)=>Chosen;onRowSelect?:(index:number)=>Chosen;onRowEscape?:()=>void;onRowMenu?:(index:number,at:{x:number;y:number})=>void;onRowDoubleOpen?:(index:number)=>void;onMultiSelection?:(keys:string[])=>void;onCellPick?:(row:number,column:number)=>void;
+  patchValues?:boolean;cells?:(index:number,column:number)=>Node|null;searchText?:string[];visual?:number[];group?:GridGroupOption;rowKeys?:readonly string[];rowHeight?:number;pageSize?:number;stretch?:boolean;toolbarHost?:HTMLElement;fill?:boolean;giveUp?:readonly number[];
+  tree?:{parents:(string|null)[];open:ReadonlySet<string>;onToggle:(key:string,open:boolean)=>void};totals?:string[][];headerGroups?:{title:string;colour:string;columns:number[]}[];
+  decorate?:(index:number,column:number)=>{sources:string[];changed:boolean;delivered:boolean}|null;soon?:Readonly<Record<number,string>>};
+/**
+ * What a grid is built for and cannot change while it stands: its key, scope and columns. A later render with the same identity changes the
+ * standing grid's rows, grouping, column visibility, filters and layout in place, so the person keeps their place in it.
+ */
+export function gridIdentity(key:string,scope:string,headers:readonly string[],numeric:readonly number[],options:GridOptions){
+  return JSON.stringify([key,scope,headers,numeric,options.keys,options.visual??[],options.columnGroups??null,!!options.stretch,options.headerGroups??null,!!options.tree,!!options.totals,options.pageSize??null]);
+}
+import {sideColour} from './side-colour.js';
+export {sideColour};
+const frame=()=>new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
+export function renderDataGrid(host:HTMLElement,key:string,scope:string,headers:string[],rows:Cells,numeric:number[],isBusy:()=>boolean,options:GridOptions){
+  const el=<K extends keyof HTMLElementTagNameMap>(tag:K,value?:string)=>{const n=document.createElement(tag);if(value!==undefined)n.textContent=publicText(value);return n;};
+  const texts=(source:Cells)=>source.map(row=>row.map(cell=>publicText(typeof cell==='string'?cell:cell.textContent??'')));
+  // Two rows with one key could not be told apart when the rows change, so the selection or the place could move to the wrong one.
+  const keysOf=(source:Cells,given:readonly string[]|undefined)=>{
+    const result=given?[...given]:source.map((_,index)=>String(index));
+    if(result.length!==source.length||new Set(result).size!==result.length)throw Error('Each row of this table needs a key of its own.');
+    return result;
+  };
+  let values=texts(rows),keys=keysOf(rows,options.rowKeys);
+  // The keys of the rows last given to the grid, which its changes apply one at a time: a consumer names a row by its index in what it
+  // gave last, also while that is still being drawn.
+  let requested=keys;
+  const state={query:options.initial?.query??'',columns:headers.map((_,i)=>options.initial?.columns[i]??null)};
+  const toolbar=el('div');toolbar.className='table-filters';
+  const search=el('input');search.type='search';search.placeholder='Filter rows…';search.className='table-search';search.value=state.query;search.maxLength=200;search.setAttribute('aria-label','Filter table rows');
+  const toggle=el('button','Column filters');toggle.type='button';toggle.className='secondary column-filter-toggle';toggle.setAttribute('aria-expanded','false');
+  const clear=el('button','Clear filters');clear.type='button';clear.className='text-button table-filter-clear';
+  const count=el('span');count.className='table-row-count';count.setAttribute('aria-live','polite');toolbar.append(search,toggle,clear,count);
+  // The open row, when the filters hide it, is said so with the way to show it: the position a panel is opened on by a booking or by the assistant is
+  // not one the person pressed in the rows, which they could not have pressed had its row been hidden. A selection an update leaves without
+  // its row is cleared and said so here too.
+  const hiddenNote=el('p');hiddenNote.className='table-open-note';hiddenNote.setAttribute('role','status');hiddenNote.hidden=true;
+  const noteText=el('span'),showHidden=el('button','Clear filters');showHidden.type='button';showHidden.className='text-button';hiddenNote.append(noteText,showHidden);
+  // Rows kept on screen while they no longer state the current read, with the reason.
+  const staleNote=el('p');staleNote.className='table-stale-note';staleNote.setAttribute('role','status');staleNote.hidden=true;
+  const filterPanel=el('div');filterPanel.className='grid-column-filters';filterPanel.hidden=true;filterPanel.id='column-filters-'+key;toggle.setAttribute('aria-controls',filterPanel.id);
+  let selects=new Map<number,HTMLSelectElement|HTMLInputElement>();
+  // The column filters offer the values of the rows the grid holds, so they are drawn again whenever its rows or visible columns change.
+  function drawFilters(){
+    selects.clear();
+    filterPanel.replaceChildren();
+    headers.forEach((header,i)=>{
+      if(options.visual?.includes(i))return;
+      if(numeric.includes(i)){
+        const label=el('label',header+(options.visible?.[i]===false?' (hidden)':'')),input=el('input');input.type='text';input.maxLength=200;input.placeholder='e.g. >= 100';input.setAttribute('aria-label','Filter '+header);input.title='Use =, !=, <, <=, > or >= with an exact number.';input.value=state.columns[i]??'';
+        const mark=()=>{input.setCustomValidity(validNumericFilter(input.value.trim())?'':'Enter a number with =, !=, <, <=, > or >=.');input.setAttribute('aria-invalid',String(!validNumericFilter(input.value.trim())));};
+        if(input.value)mark();
+        input.oninput=()=>{if(!current())return;state.columns[i]=input.value.trim()?input.value:null;mark();apply();};label.append(input);filterPanel.append(label);selects.set(i,input);return;
+      }
+      const label=el('label',header+(options.visible?.[i]===false?' (hidden)':'')),select=el('select');select.setAttribute('aria-label','Filter '+header);select.append(new Option('All values',''));
+      const choices=columnValues(values.map(row=>row[i]));if(state.columns[i]!==null&&!choices.includes(state.columns[i]!))choices.push(state.columns[i]!);
+      choices.forEach((value,index)=>select.append(new Option(value||'(Blank)',String(index))));select.value=state.columns[i]===null?'':String(choices.indexOf(state.columns[i]!));
+      select.onchange=()=>{if(!current())return;state.columns[i]=select.value===''?null:choices[Number(select.value)];apply();};label.append(select);filterPanel.append(label);selects.set(i,select);
+    });
+  }
+  drawFilters();
+  // A selection can remove its hidden-row notice between native clicks. Keep
+  // the notices below the grid so that change cannot move a row under the pointer.
+  const container=el('div');container.className='standard-data-grid';host.replaceChildren(...(options.toolbarHost?[]:[toolbar]),filterPanel,container,staleNote,hiddenNote);options.toolbarHost?.replaceChildren(toolbar);
+  let alive=true,ready=false,markBuilt=()=>{},focusRequest=0;
+  // Resolves once the table is built, so work asked for earlier waits for it instead of being skipped.
+  const built=new Promise<void>(resolve=>{markBuilt=resolve;});
+  const current=()=>alive&&host.isConnected&&container.parentElement===host&&!isBusy();
+  // A pointer gesture belongs to one row. Selection, dragging and scrolling
+  // must not become an accidental edit when the pointer is released.
+  let gesture:{row:Element|null;x:number;y:number;cancelled:boolean}|undefined;
+  const pointerDown=(event:PointerEvent)=>{const selection=window.getSelection();gesture={row:(event.target as Element).closest('.tabulator-row'),x:event.clientX,y:event.clientY,cancelled:event.button!==0||!!(selection&&!selection.isCollapsed&&container.contains(selection.anchorNode))};};
+  const pointerMove=(event:PointerEvent)=>{if(gesture&&Math.hypot(event.clientX-gesture.x,event.clientY-gesture.y)>5)gesture.cancelled=true;};
+  const cancelGesture=()=>{if(gesture)gesture.cancelled=true;};
+  container.addEventListener('pointerdown',pointerDown,true);
+  document.addEventListener('pointermove',pointerMove,true);
+  document.addEventListener('pointercancel',cancelGesture,true);
+  document.addEventListener('scroll',cancelGesture,true);
+  const field=(i:number)=>'c'+i;
+  const ordered=(layout:GridLayout)=>[...layout.order.filter(k=>options.keys.includes(k)),...options.keys.filter(k=>!layout.order.includes(k))];
+  // The columns the grid gives up in this order while they do not fit it, and those it has given up now.
+  let order:readonly number[]=options.giveUp??[],given=new Set<number>();
+  const shown=(i:number)=>options.visible?.[i]!==false&&!given.has(i);
+  const definitions:Record<string,unknown>[]=[],groups=new Map<string,{columns:Record<string,unknown>[]} >();
+  // A column's header group: a pivot's, by column key, or a coloured one, by column index.
+  const columnGroupOf=(key:string,i:number)=>{
+    const pivot=options.columnGroups?.[key];if(pivot)return {key:pivot.key,title:pivot.title,measureTitle:pivot.measureTitle,colour:null};
+    const at=options.headerGroups?.findIndex(g=>g.columns.includes(i))??-1;
+    return at<0?undefined:{key:'header-group-'+at,title:options.headerGroups![at].title,measureTitle:undefined,colour:options.headerGroups![at].colour};
+  };
+  const groupTitle=(title:string,colour:string|null)=>{
+    if(colour===null)return document.createTextNode(title);
+    const span=el('span',title);span.className='grid-group-title';span.style.setProperty('--group-colour',sideColour(colour));return span;
+  };
+  // A cell's sources and change marker, drawn before its content; its row's delivered state marks the row (rowFormatter).
+  const decorated=(content:Node,index:number,i:number)=>{
+    const mark=options.decorate?.(index,i);
+    if(!mark||!mark.changed&&!mark.sources.length)return content;
+    const wrap=el('span');wrap.className='grid-decorated';
+    if(mark.changed){const dot=el('span');dot.className='grid-changed';dot.title='Changed by the last edit';dot.setAttribute('role','img');dot.setAttribute('aria-label','Changed by the last edit');wrap.append(dot);}
+    for(const source of mark.sources){const tag=el('span',source);tag.className='grid-source';wrap.append(tag);}
+    wrap.append(content);return wrap;
+  };
+  function cellContent(index:number,column:number,value:string):Node{
+    const rich=options.cells?.(index,column);if(rich)return decorated(rich,index,column);
+    const span=document.createElement('span');span.textContent=publicText(options.displayRows?.[index]?.[column]??value);
+    if(numeric.includes(column)&&value.startsWith('-'))span.className='grid-negative';
+    if(options.cellTitles?.[index]?.[column]!==undefined)span.title=publicText(options.cellTitles[index][column]);
+    else if(options.displayRows?.[index]?.[column]!==undefined)span.title=value;
+    return decorated(span,index,column);
+  }
+  for(const key of ordered(options.layout)){
+    const i=options.keys.indexOf(key),group=columnGroupOf(key,i),title=publicText(group?.measureTitle??headers[i]);
+    const definition={title,titleFormatter:()=>document.createTextNode(title),field:field(i),visible:shown(i),minWidth:100,width:options.layout.widths[key],resizable:true,headerSort:!options.visual?.includes(i),hozAlign:numeric.includes(i)?'right':'left',cssClass:numeric.includes(i)?'grid-number':'',formatter:(cell:any)=>{const index=Number(cell.getRow().getData().__sourceIndex);if(options.onCellPick){const target=cell.getElement() as HTMLElement;target.tabIndex=0;target.onkeydown=event=>{if(event.target!==target||!current())return;if(['Enter',' '].includes(event.key)||menuKey(event)){event.preventDefault();pickCell(cell);if(menuKey(event))options.onRowMenu?.(index,placeOf(target));}};}return cellContent(index,i,String(cell.getValue()));},headerWordWrap:true,
+      sorter:numeric.includes(i)?(a:string,b:string)=>a===''?(b===''?0:-1):b===''?1:compareDecimalStrings(a,b):'string',
+      ...(options.totals?{bottomCalc:()=>options.totals!.map(row=>row[i]),bottomCalcFormatter:(cell:any)=>{const lines=el('span');lines.className='grid-total-lines';
+        for(const value of cell.getValue() as string[]){const line=el('span',value);line.className=numeric.includes(i)&&value.startsWith('-')?'grid-total-line grid-negative':'grid-total-line';lines.append(line);}
+        return lines;}}:{})};
+    const later=options.soon?.[i];
+    if(later)Object.assign(definition,{cssClass:'grid-soon',tooltip:later,titleFormatter:()=>{
+      const head=el('span',title),tag=el('span','Coming soon');tag.className='grid-soon-tag';head.title=later;head.append(tag);return head;}});
+    if(!group){definitions.push(definition);continue;}
+    let parent=groups.get(group.key);if(!parent){const title=publicText(group.title);parent={columns:[]};groups.set(group.key,parent);definitions.push({...parent,title,titleFormatter:()=>groupTitle(title,group.colour),headerHozAlign:'center',cssClass:group.colour===null?'pivot-column-group':'grid-header-group'});}
+    parent.columns.push(definition);
+  }
+  // Whether the columns the table shows are wider than the room it has: it would scroll sideways.
+  const overflows=()=>{const holder=container.querySelector<HTMLElement>('.tabulator-tableholder');return holder!==null&&holder.scrollWidth>holder.clientWidth+1;};
+  // Draws the table again with the columns of its view that are not given up, and measures against what it draws.
+  function lay(left:ReadonlySet<number>){
+    given=new Set(left);
+    for(let i=0;i<headers.length;i++){const column=table.getColumn(field(i));if(column){if(shown(i))column.show();else column.hide();}}
+    redraw();
+  }
+  // Shows every column, then gives up those of `order`, from its first, for as long as the table still overflows. A table that
+  // fits shows them all, and one that fits only without them shows as many as it can.
+  function fit(){
+    if(!ready||!alive||!order.length&&!given.size)return;
+    const left=new Set<number>();lay(left);
+    for(const i of order){if(!overflows())break;left.add(i);lay(left);}
+  }
+  // The room a table has changes with its container's width, which is not the window's: it is fitted again when that changes, at the place
+  // the person last left it.
+  const visible=()=>container.clientWidth>0&&container.clientHeight>0&&container.getClientRects().length>0&&getComputedStyle(container).visibility==='visible';
+  let width=0,viewportHeight=0;
+  const resizing=new ResizeObserver(()=>{
+    if(!alive||!visible()||container.clientWidth===width&&container.clientHeight===viewportHeight)return;
+    width=container.clientWidth;viewportHeight=container.clientHeight;
+    const at=restoring?.version===placing?restoring.place:lastPlace;
+    void change(()=>{redraw(false);fit();},at&&(()=>at));
+  });
+  resizing.observe(container);
+  // The row the consumer has open, and the row selected, by key: marked whenever their elements are drawn.
+  let opened:string|null=null,selected:string|null=null,selectionLost=false,selectionChanged:((key:string|null)=>void)|undefined;
+  let multiSelected=new Set<string>(),multiAnchor:string|undefined,selectionGeneration=0;
+  const sourceIndex=(row:GridRow)=>Number(row.getData().__sourceIndex);
+  const keyOf=(row:GridRow)=>row.getData().__key;
+  const keyAt=(index:number|null)=>index===null?null:requested[index]??null;
+  function markRow(row:GridRow){
+    const target=row.getElement(),key=keyOf(row),isOpen=key===opened;target.dataset.rowKey=key;
+    target.classList.toggle('open-row',isOpen);if(isOpen)target.setAttribute('aria-current','true');else target.removeAttribute('aria-current');
+    const chosen=options.onMultiSelection?multiSelected.has(key):key===selected;
+    target.classList.toggle('selected-row',chosen);target.setAttribute('aria-selected',String(chosen));
+  }
+  // Marks again only the rows whose marks changed, the ones that were and are selected or open: a grid of many thousands of rows is not
+  // walked for each selection. Rows drawn later are marked as they are drawn.
+  let marked:{selected:string|null;opened:string|null}={selected:null,opened:null},markedMulti=new Set<string>();
+  function markRows(){
+    if(selected===null)delete container.dataset.selectedRow;else container.dataset.selectedRow=selected;
+    if(!ready||!alive)return;
+    for(const key of new Set([marked.selected,marked.opened,selected,opened,...markedMulti,...multiSelected]))if(key!==null){const row=table.getRow(key);if(row)markRow(row);}
+    marked={selected,opened};markedMulti=new Set(multiSelected);
+  }
+  // Grouped rows start in the order of their groups, which Tabulator keeps as it meets them; a group the filters empty disappears.
+  const groupOf=(data:Record<string,string>)=>options.group!.keys[Number(data.__sourceIndex)];
+  // A tree's rows are given to Tabulator nested under their parents (dataTree's _children), in the order given.
+  function nested(flat:Record<string,string>[]){
+    const tree=options.tree!;
+    if(tree.parents.length!==flat.length)throw Error('Each row of this tree needs its parent, or null at the top.');
+    const top:Record<string,unknown>[]=[],byKey=new Map<string,Record<string,unknown>>(flat.map(row=>[row.__key,row]));
+    flat.forEach((row,index)=>{
+      const parentKey=tree.parents[index];if(parentKey===null){top.push(row);return;}
+      const parent=byKey.get(parentKey);if(!parent)throw Error(`Row ${row.__key} names the parent row ${parentKey}, which this tree does not have.`);
+      ((parent._children??=[]) as Record<string,unknown>[]).push(row);
+    });
+    return top as Record<string,string>[];
+  }
+  const rowData=()=>{
+    if(options.totals?.some(row=>row.length!==headers.length))throw Error('Each totals row needs one value for each column.');
+    const flat=values.map((row,index)=>({...Object.fromEntries(row.map((cell,i)=>[field(i),cell])),__sourceIndex:String(index),__key:keys[index]}))
+      .sort((a,b)=>options.group?options.group.order.indexOf(groupOf(a))-options.group.order.indexOf(groupOf(b)):0);
+    return options.tree?nested(flat):flat;
+  };
+  const height=()=>options.fill?'100%':Math.min(560,Math.max(140,Math.min(values.length,options.pageSize??values.length)*(options.rowHeight??35)+(options.group?.order.length??0)*36+(groups.size?82:46)+(options.totals?options.totals.length*24+14:0)+(options.pageSize?44:0)))+'px';
+  function groupHeading(key:string,count:number,group:GridGroup){
+      // A group header opens and closes its rows from the keyboard as well as the arrow, and says whether its rows show.
+      const header=options.group!.header(key,count);header.tabIndex=0;header.setAttribute('role','button');header.setAttribute('aria-expanded',String(group.isVisible()));
+      header.onkeydown=event=>{
+        if(event.target!==header||!['Enter',' '].includes(event.key))return;
+        event.preventDefault();group.toggle();
+        // Toggling draws every group header again, so the focus follows to the new header of this group.
+        const redrawn=table.getGroups().find(other=>other.getKey()===key)?.getElement();if(redrawn)redrawn.querySelector<HTMLElement>('[role=button]')?.focus();
+      };
+      return header;
+  }
+  let drawnHeight=height();
+  const table=new TabulatorFull(container,{
+    index:'__key',
+    data:rowData(),
+    rowFormatter:(row:any)=>{
+      // The pinned totals row is Tabulator's calculation row, not one of the source rows.
+      if(row.getData().__key===undefined)return;
+      const target=row.getElement() as HTMLElement;
+      if(options.onRowOpen){target.tabIndex=0;target.classList.add('openable-row');target.setAttribute('aria-label','Open row details');target.onkeydown=event=>{
+        if(event.target!==target)return;
+        if(options.onMultiSelection&&(event.ctrlKey||event.metaKey)&&event.key===' '){event.preventDefault();toggleMulti(keyOf(row));}
+        else if(['Enter',' '].includes(event.key)){event.preventDefault();openRow(row);}
+        else if(event.key==='ArrowDown'||event.key==='ArrowUp'){event.preventDefault();step(keyOf(row),event.key==='ArrowDown'?1:-1,event.shiftKey);}
+        else if(event.key==='Escape'&&options.onRowEscape&&current()){event.preventDefault();options.onRowEscape();}
+        else if(menuKey(event)&&options.onRowMenu){event.preventDefault();openMenu(target,placeOf(target));}
+      };}
+      if(options.decorate){const index=sourceIndex(row);target.classList.toggle('delivered-row',headers.some((_,i)=>options.decorate!(index,i)?.delivered));}
+      markRow(row);
+    },
+    columns:definitions,
+    layout:options.stretch?'fitDataStretch':'fitDataFill',height:drawnHeight,movableColumns:true,columnDefaults:{tooltip:false},placeholder:'No rows match this selection.',
+    ...(options.pageSize?{pagination:true,paginationMode:'local',paginationSize:options.pageSize,paginationButtonCount:3}:{}),
+    groupHeader:(key:string,count:number,_rows:unknown,group:GridGroup)=>groupHeading(key,count,group),
+    ...(options.group?{groupBy:groupOf}:{}),
+    ...(options.tree?{dataTree:true,dataTreeStartExpanded:(row:GridRow)=>options.tree?.open.has(keyOf(row))??false}:{}),
+    initialSort:options.layout.sort.filter(s=>options.keys.includes(s.key)).map(s=>({column:field(options.keys.indexOf(s.key)),dir:s.direction})),
+  });
+  // The person's place: every change of the rows, their grouping, sorting, filters or columns, and of the grid's width, keeps the first row
+  // in view where it was and the selected row selected (grid-place). Changes run one at a time, each from the place the last one left.
+  const holder=()=>container.querySelector<HTMLElement>('.tabulator-tableholder');
+  function capture():Place{
+    const view=holder();
+    if(view&&ready&&alive){
+      const top=view.getBoundingClientRect().top;
+      for(const row of view.querySelectorAll<HTMLElement>('.tabulator-row[data-row-key]')){const box=row.getBoundingClientRect();if(box.height>0&&box.top>=top-0.5)return {anchor:row.dataset.rowKey!,offset:box.top-top,selected,left:view.scrollLeft};}
+    }
+    return {anchor:null,offset:0,selected};
+  }
+  // The rows the filters let through, in order: the rows a place can be kept on.
+  const shownKeys=()=>table.getData('active').filter(matches).map(row=>row.__key);
+  // A later change or an explicit scroll supersedes a place still being restored; a later change starts from the place being restored.
+  // Changes wait for the table to be built: Tabulator refuses data before then, and run one at a time; restoring a place does not hold them up.
+  let placing=0,updating=false,lastPlace:Place|undefined,restoring:{version:number;place:Place}|undefined,watching=0,queue:Promise<void>=built;
+  async function restore(place:Place){
+    if(!visible()){lastPlace=place;return;}
+    const version=++placing,view=holder(),row=place.anchor===null?false:table.getRow(place.anchor);
+    restoring={version,place};
+    try{await settle(version,place,view,row);}finally{if(restoring?.version===version)restoring=undefined;}
+  }
+  // Whether a row is drawn whole within the grid's viewport.
+  function inView(row:GridRow,view:HTMLElement){const target=row.getElement();if(!target.isConnected)return false;const box=target.getBoundingClientRect(),port=view.getBoundingClientRect();return box.top>=port.top-0.5&&box.bottom<=port.bottom+0.5;}
+  async function settle(version:number,place:Place,view:HTMLElement|null,row:GridRow|false){
+    if(!view)return;
+    if(place.left!==undefined)view.scrollLeft=place.left;
+    if(!row)return;
+    const away=()=>{const target=row.getElement();return target.isConnected?target.getBoundingClientRect().top-view.getBoundingClientRect().top-place.offset:undefined;};
+    // A row already where it was is left alone: scrolling to it would draw the rows again for nothing. The virtual renderer can still
+    // move the rows on the frame after a change, as it does in a short pane, so the row is measured again then.
+    if(Math.abs(away()??Infinity)<1){
+      await frame();if(version!==placing||!alive)return;
+      if(Math.abs(away()??Infinity)<1){if(place.left!==undefined)view.scrollLeft=place.left;lastPlace=capture();return;}
+    }
+    // Scrolling to the row draws the rows again: what in the grid has focus keeps it (refocus), and an entry is not to take that for the
+    // person entering its text (redrawing).
+    const held=focusedInGrid();redrawing=true;
+    try{await row.scrollTo('top',false);}catch{return;}finally{redrawEnded();}
+    refocus(held);
+    // The virtual renderer estimates the heights of rows it has not drawn, so the row is measured where it lands and moved again until it holds.
+    for(let tries=0;tries<4&&version===placing&&alive;tries++){
+      // A short viewport's rows are drawn again on the frame after a scroll: the anchor is measured once it is drawn.
+      let delta=away();if(delta===undefined){await frame();if(version!==placing||!alive)return;delta=away();}
+      if(delta===undefined)return;
+      if(Math.abs(delta)<1)break;
+      view.scrollTop+=delta;await frame();
+    }
+    if(version===placing&&alive){if(place.left!==undefined)view.scrollLeft=place.left;lastPlace=capture();}
+  }
+  // A full redraw rebuilds the virtual renderer's estimates and scrolls to the top: it is drawn at the scroll offsets it had, and the change it
+  // is part of then restores the first row in view.
+  function redraw(force=true){
+    const view=holder(),top=view?.scrollTop??0,left=view?.scrollLeft??0;
+    table.redraw(force);
+    if(view){view.scrollTop=top;view.scrollLeft=left;}
+  }
+  // The place a change starts from: the one still being restored, or where the rows are now.
+  const aimedPlace=()=>restoring&&restoring.version===placing?restoring.place:!visible()&&lastPlace?lastPlace:capture();
+  async function keepPlace(work:()=>void|Promise<void>,from?:()=>Place){
+    // A grid destroyed while a change waited has nothing left to change.
+    if(!alive)return;
+    if(!ready){await work();return;}
+    const before={...(from?.()??aimedPlace()),selected},previous=shownKeys();
+    updating=true;try{await work();}finally{updating=false;}
+    if(!alive)return;
+    if(options.onMultiSelection&&[...multiSelected].some(key=>!keys.includes(key)))setMulti([...multiSelected]);
+    const kept=retainPlace(before,previous,shownKeys());
+    if(kept.selectionLost){selected=null;selectionLost=true;markRows();report();selectionChanged?.(null);}
+    void restore(kept.place);
+  }
+  // The place is taken when the change is asked for, unless earlier changes are still to run: the place they leave is the one kept.
+  let waiting=0,updateError:unknown;
+  function change(work:()=>void|Promise<void>,from?:()=>Place){
+    const asked=from??(waiting===0&&ready&&alive?(place=>()=>place)(aimedPlace()):undefined);
+    waiting++;
+    const run=queue.then(()=>keepPlace(work,asked)).finally(()=>{waiting--;});queue=run.catch(()=>undefined);return run;
+  }
+  // Where the person scrolls to is the place a change of width keeps: by then the rows have already moved.
+  const watchPlace=(event:Event)=>{if(event.target!==holder()||watching||!alive||!visible()||updating||restoring?.version===placing)return;watching=requestAnimationFrame(()=>{watching=0;if(alive&&ready&&!updating&&visible()&&restoring?.version!==placing)lastPlace=capture();});};
+  container.addEventListener('scroll',watchPlace,true);
+  // The person scrolling the rows themselves, by wheel, touch, the scrollbar or a paging key, supersedes a place still being restored:
+  // where they scroll to stands.
+  const personScrolls=()=>{placing++;};
+  const scrollbarPress=(event:PointerEvent)=>{if(event.target===holder())personScrolls();};
+  const pagingKey=(event:KeyboardEvent)=>{if(['PageUp','PageDown','Home','End'].includes(event.key))personScrolls();};
+  container.addEventListener('wheel',personScrolls,{passive:true,capture:true});container.addEventListener('touchmove',personScrolls,{passive:true,capture:true});
+  container.addEventListener('pointerdown',scrollbarPress,true);container.addEventListener('keydown',pagingKey,true);
+  // A header sort is the grid's own: its place is taken before it sorts and restored once it has drawn.
+  let sortPlace:Place|undefined;
+  table.on('dataSorting',()=>{if(ready&&alive&&!updating&&!sortPlace)sortPlace=capture();});
+  table.on('dataSorted',()=>{const place=sortPlace;sortPlace=undefined;if(place)requestAnimationFrame(()=>void change(()=>{},()=>place));});
+
+  // The person selects a row by opening it, unless the consumer answers that it stays where it was; a row pressed supersedes a place still
+  // being restored, which would move it from under the pointer. The height on screen of the press that opened it is kept while the consumer
+  // opens it, for revealRow.
+  let pressedOpen:{key:string;y:number}|undefined;
+  function openRow(row:GridRow,pressY?:number){
+    if(!current()||!options.onRowOpen)return;
+    placing++;const index=sourceIndex(row),key=keyOf(row);
+    if(!Number.isInteger(index)||index<0||index>=values.length)return;
+    const action=++selectionGeneration,press=pressY===undefined?undefined:{key,y:pressY};pressedOpen=press;
+    void Promise.resolve(options.onRowOpen(index)).then(chosen=>{if(pressedOpen===press)pressedOpen=undefined;if(chosen!==false&&alive&&action===selectionGeneration)choose(key);});
+  }
+  // A selection the consumer makes is not reported back to it.
+  function choose(key:string){if(options.onMultiSelection){multiAnchor=key;setMulti([key]);}if(key===selected)return;selected=key;selectionLost=false;markRows();report();selectionChanged?.(key);}
+  // The row the filters show after or before a row, in the order on screen: a collapsed group's rows are not on screen.
+  function neighbour(key:string,direction:-1|1):GridRow|undefined{
+    const rows=table.getRows('display'),at=rows.findIndex(row=>keyOf(row)===key);
+    return at<0?undefined:rows[at+direction];
+  }
+  // ↓ and ↑ select the next or previous row and give it focus, brought into view only when it is not already whole in view.
+  function step(key:string,direction:-1|1,extend=false){
+    if(!current())return;
+    const next=neighbour(key,direction);if(!next)return;
+    const action=++selectionGeneration,nextKey=keyOf(next);
+    if(extend&&options.onMultiSelection){multiAnchor??=key;selectRange(nextKey);selected=nextKey;markRows();next.getElement().focus({preventScroll:true});return;}
+    void Promise.resolve(options.onRowSelect?.(sourceIndex(next))).then(async chosen=>{
+      if(chosen===false||!alive||action!==selectionGeneration)return;
+      choose(nextKey);
+      const row=table.getRow(nextKey),view=holder();if(!row)return;
+      if(view&&!inView(row,view)){placing++;await row.scrollTo('nearest',false).catch(()=>undefined);}
+      if(alive)row.getElement().focus({preventScroll:true});
+    });
+  }
+  const focusLost=()=>{const active=document.activeElement;return active===null||active===document.body||active===document.documentElement;};
+  // The browser tells an entry of text typed in it once, by a `change`, when the entry loses focus or Enter is pressed in it. A redraw takes
+  // the entry's row out of the page, so the browser tells it then, as if the person had entered text they are still typing. What an entry is
+  // told while the rows are drawn again (by a redraw Tabulator reports, or by the scroll to a row in settle) is kept from it, and as the
+  // browser will not repeat it, the grid tells it when the person does enter that same text, by Enter or by leaving the entry, or as the
+  // redraw ends when the entry will not have its focus back: it is gone, or something else has focus. Text typed on is the browser's to tell.
+  let redrawing=false,unreported:{entry:HTMLInputElement;text:string}|undefined;
+  const reportChange=()=>{const entry=unreported?.entry;unreported=undefined;entry?.dispatchEvent(new Event('change',{bubbles:true}));};
+  const redrawEnded=()=>{redrawing=false;if(unreported&&(!unreported.entry.isConnected||!focusLost()&&document.activeElement!==unreported.entry))reportChange();};
+  const entryChanged=(event:Event)=>{
+    const entry=event.target;
+    if(redrawing&&entry instanceof HTMLInputElement){event.stopPropagation();unreported={entry,text:entry.value};}
+    else if(entry===unreported?.entry)unreported=undefined;
+  };
+  const entryLeft=(event:FocusEvent)=>{if(event.target===unreported?.entry)reportChange();};
+  const entryKeyed=(event:KeyboardEvent)=>{if(event.key==='Enter'&&event.target===unreported?.entry&&unreported.entry.value===unreported.text)reportChange();};
+  container.addEventListener('change',entryChanged,true);container.addEventListener('focusout',entryLeft,true);container.addEventListener('keydown',entryKeyed,true);
+  table.on('renderStarted',()=>{redrawing=true;});table.on('renderComplete',redrawEnded);
+  // Drawing the rows again, whether by the grid's own changes, its scrolling or a resize, detaches them, which drops keyboard focus from a
+  // row or its editable control without the person moving it: the same element has it back once drawn. A press outside the grid moves
+  // focus on purpose, and that stands; a
+  // press on a row is the person choosing it, whose focus the redraw it causes must not take. A press or a key outside the grid is the person
+  // moving on, which ends a wait for the row (`givingBack`), however long after it comes.
+  let pressedAt=-Infinity,givingBack=0;
+  const pressed=(event:PointerEvent)=>{if(container.contains(event.target as Node))pressedAt=-Infinity;else{pressedAt=performance.now();givingBack++;}};
+  const keyed=(event:KeyboardEvent)=>{if(!container.contains(event.target as Node))givingBack++;};
+  const rowBlurred=(event:FocusEvent)=>{
+    const target=event.target;
+    if(event.relatedTarget!==null||!(target instanceof HTMLElement)||performance.now()-pressedAt<500)return;
+    const owner=target.closest<HTMLElement>('.tabulator-row');
+    if(!owner||!container.contains(owner))return;
+    const key=owner.dataset.rowKey,control=target===owner?undefined:target,wait=++givingBack;
+    // The row can be drawn again some frames later, as after a scroll, or be out of reach while the page is busy (inert): it is waited for,
+    // for as long as focus stays lost and the person has not moved on, up to about ten seconds.
+    const giveBack=(frames:number)=>requestAnimationFrame(()=>{
+      if(key===undefined||!alive||wait!==givingBack||!focusLost())return;
+      const row=table.getRow(key),owner=row?row.getElement():undefined;
+      const target=control?(owner?.contains(control)?control:undefined):owner;
+      if(target?.isConnected&&!target.closest('[inert]'))target.focus({preventScroll:true});else if(row&&frames>0)giveBack(frames-1);
+    });
+    giveBack(600);
+  };
+  const focusMoved=()=>{givingBack++;};
+  container.addEventListener('focusout',rowBlurred,true);document.addEventListener('focusin',focusMoved,true);document.addEventListener('pointerdown',pressed,true);document.addEventListener('keydown',keyed,true);
+  // That wait starts when the browser reports the loss (focusout), which it does only in a window that has focus. A redraw takes the rows
+  // out of the page and puts the same rows back in one step, so what in the grid had focus before that step has it back as the step ends,
+  // in a window behind another too and before the person can press or key anything, unless something else took focus meanwhile, it was
+  // not drawn again (it is then waited for, rowBlurred) or the page is busy (inert).
+  // Tabulator reports the redraws it makes; scrolling to a row (settle) draws the rows again without a report.
+  const focusedInGrid=()=>{const active=document.activeElement;return active instanceof HTMLElement&&container.contains(active)?active:null;};
+  const refocus=(held:HTMLElement|null)=>{if(held?.isConnected&&!held.closest('[inert]')&&focusLost())held.focus({preventScroll:true});};
+  let redrawHeld:HTMLElement|null=null;
+  table.on('renderStarted',()=>{redrawHeld=focusedInGrid();});
+  table.on('renderComplete',()=>{refocus(redrawHeld);redrawHeld=null;});
+  function safeRowGesture(event:MouseEvent,targetRow:HTMLElement){
+    const selection=window.getSelection(),target=event.target as Element;
+    return current()&&event.button===0&&!event.ctrlKey&&!event.metaKey&&!event.shiftKey&&!event.altKey&&
+      !target.closest('a,button,input,select,textarea,[contenteditable=true]')&&
+      !(selection&&!selection.isCollapsed&&container.contains(selection.anchorNode))&&
+      !(event.detail>0&&gesture&&(gesture.cancelled||gesture.row!==targetRow));
+  }
+  // Virtual redraws can replace a row element between the two clicks. The
+  // row key identifies the same position within this grid.
+  let doubleCandidate:string|undefined,completedDouble=false;
+  const keyAtElement=(element:HTMLElement)=>{const row=table.getRows().find(row=>row.getElement()===element);return row?keyOf(row):undefined;};
+  // A second native mousedown selects a word before dblclick. Keep text
+  // selection available for drags and existing selections; suppress only that
+  // automatic selection for a second click on the same eligible row.
+  const secondMouseDown=(event:MouseEvent)=>{
+    completedDouble=false;
+    const row=(event.target as Element).closest<HTMLElement>('.tabulator-row');
+    if(options.onRowDoubleOpen&&event.detail===2&&row&&doubleCandidate!==undefined&&keyAtElement(row)===doubleCandidate&&safeRowGesture(event,row))event.preventDefault();
+  };
+  container.addEventListener('mousedown',secondMouseDown,true);
+  function setMulti(chosen:readonly string[]){
+    selectionGeneration++;multiSelected=new Set(chosen.filter(key=>requested.includes(key)));markRows();
+    options.onMultiSelection?.([...multiSelected]);
+  }
+  function toggleMulti(key:string){multiAnchor=key;const chosen=new Set(multiSelected);if(chosen.has(key))chosen.delete(key);else chosen.add(key);setMulti([...chosen]);}
+  function selectRange(key:string){
+    const shown=table.getRows('display').map(keyOf),a=shown.indexOf(multiAnchor??key),b=shown.indexOf(key);
+    setMulti(a<0||b<0?[key]:shown.slice(Math.min(a,b),Math.max(a,b)+1));
+  }
+  const multipleClick=(event:MouseEvent)=>{
+    if(!options.onMultiSelection||!current()||event.button!==0||event.altKey||!(event.ctrlKey||event.metaKey||event.shiftKey))return;
+    const target=(event.target as Element).closest<HTMLElement>('.tabulator-row[data-row-key]');
+    if(!target||(event.target as Element).closest('a,button,input,select,textarea,[contenteditable=true]'))return;
+    const key=target.dataset.rowKey!;event.preventDefault();event.stopPropagation();
+    if(event.shiftKey)selectRange(key);else toggleMulti(key);
+    selected=key;markRows();target.focus({preventScroll:true});
+  };
+  container.addEventListener('click',multipleClick,true);
+  let pickedCell:HTMLElement|undefined;
+  function pickCell(cell:{getRow():GridRow;getColumn():GridColumn;getElement():HTMLElement}){if(!current()||!options.onCellPick)return;pickedCell?.classList.remove('selected-cell');pickedCell=cell.getElement();pickedCell.classList.add('selected-cell');options.onCellPick(sourceIndex(cell.getRow()),Number(cell.getColumn().getField().slice(1)));}
+  table.on('cellClick',(_event:MouseEvent,cell:any)=>pickCell(cell));
+  table.on('cellContextMenu',(event:MouseEvent,cell:any)=>{if(!current()||!options.onCellPick)return;event.preventDefault();pickCell(cell);options.onRowMenu?.(sourceIndex(cell.getRow()),{x:event.clientX,y:event.clientY});});
+  table.on('rowClick',(event:MouseEvent,row:GridRow)=>{
+    const target=row.getElement();
+    if(!safeRowGesture(event,target)){doubleCandidate=undefined;return;}
+    if(options.onRowDoubleOpen&&event.detail>1)return;
+    doubleCandidate=options.onRowDoubleOpen&&event.detail===1?keyOf(row):undefined;
+    // A click with no press (element.click(), detail 0) has no point on screen to keep.
+    openRow(row,event.detail>0?event.clientY:undefined);
+  });
+  // Handle the eligible double click before the grid's cell handler, which
+  // otherwise selects the whole cell even when mousedown was prevented. The row the first press chose is opened too.
+  const doubleClick=(event:MouseEvent)=>{
+    if(event.type==='mouseup'&&event.detail!==2)return;
+    if(event.type==='dblclick'&&completedDouble){event.preventDefault();event.stopPropagation();completedDouble=false;return;}
+    const target=(event.target as Element).closest<HTMLElement>('.tabulator-row'),candidate=doubleCandidate;doubleCandidate=undefined;
+    if(!options.onRowDoubleOpen||!target||candidate===undefined||!safeRowGesture(event,target))return;
+    if(keyAtElement(target)!==candidate)return;
+    const index=keys.indexOf(candidate);if(index<0)return;
+    event.preventDefault();event.stopPropagation();completedDouble=true;options.onRowDoubleOpen(index);
+  };
+  // Cell formatting can replace the pressed descendant before release, so
+  // Chrome may omit dblclick. Complete the same safe row gesture on mouseup.
+  container.addEventListener('mouseup',doubleClick,true);
+  container.addEventListener('dblclick',doubleClick,true);
+  // A row's menu opens where it was asked for: at the pointer, or under the row when the keyboard asked (the context-menu key's own event).
+  function openMenu(target:HTMLElement,at:{x:number;y:number}){if(options.onCellPick){options.onCellPick(-1,-1);return;}const index=keys.indexOf(target.dataset.rowKey??'');if(index>=0)options.onRowMenu?.(index,at);}
+  const rowMenu=(event:MouseEvent)=>{
+    if(options.onCellPick&&(event.target as Element).closest('.tabulator-cell'))return;
+    const target=(event.target as Element).closest<HTMLElement>('.tabulator-row[data-row-key]');
+    if(!options.onRowMenu||!target||(event.target as Element).closest('a,input,select,textarea,[contenteditable=true]'))return;
+    event.preventDefault();openMenu(target,event.button===2?{x:event.clientX,y:event.clientY}:placeOf(target));
+  };
+  container.addEventListener('contextmenu',rowMenu,true);
+  const searched=(cells:string[],index:number)=>options.searchText?[...cells,options.searchText[index]]:cells;
+  function matches(row:Record<string,string>){return matchesTableRow(searched(headers.map((_,i)=>row[field(i)]),Number(row.__sourceIndex)),state.query,state.columns,options.visible,numeric);}
+  const matchesSource=(index:number)=>matchesTableRow(searched(values[index],index),state.query,state.columns,options.visible,numeric);
+  function report(){
+    const shown=values.filter((_,index)=>matchesSource(index)).length;count.textContent=`${shown} of ${values.length} rows`;clear.hidden=!state.query&&!state.columns.some(v=>v!==null);
+    const at=opened===null?-1:keys.indexOf(opened),hidden=at>=0&&!matchesSource(at);
+    noteText.textContent=hidden?(selectionLost?'The selected position is no longer shown: it is hidden by this table’s row search or column filters. ':'The selected row is hidden by this table’s row search or column filters. ')
+      :selectionLost?'The selected row is no longer shown, so no row is selected.':'';
+    showHidden.hidden=!hidden;hiddenNote.hidden=!hidden&&!selectionLost;
+  }
+  function apply(){report();if(ready&&alive)void change(()=>table.setFilter(matches));}
+  function layout():GridLayout{return {order:table.getColumns().map(c=>options.keys[Number(c.getField().slice(1))]),widths:Object.fromEntries(table.getColumns().map(c=>[options.keys[Number(c.getField().slice(1))],Math.max(40,Math.min(3000,Math.round(c.getWidth()||120)))])),sort:table.getSorters().map(s=>({key:options.keys[Number(s.field.slice(1))],direction:s.dir}))};}
+  // Brings the standing columns to a layout a later render asks for, such as a saved view's: their order, widths and sort.
+  function applyLayout(next:GridLayout){
+    const wanted=ordered(next);
+    if(!options.columnGroups&&!options.headerGroups&&layout().order.join('\u0000')!==wanted.join('\u0000'))
+      wanted.forEach((key,at)=>{const column=table.getColumn(field(options.keys.indexOf(key)));if(at>0&&column)column.move(field(options.keys.indexOf(wanted[at-1])),true);});
+    for(const [key,width] of Object.entries(next.widths)){const column=options.keys.includes(key)?table.getColumn(field(options.keys.indexOf(key))):false;if(column&&Math.abs(column.getWidth()-width)>1)column.setWidth(width);}
+    const sort=next.sort.filter(s=>options.keys.includes(s.key)).map(s=>({column:field(options.keys.indexOf(s.key)),dir:s.direction}));
+    if(JSON.stringify(sort)!==JSON.stringify(table.getSorters().map(s=>({column:s.field,dir:s.dir}))))table.setSort(sort);
+  }
+  function fitHeight(){const next=height();if(next!==drawnHeight){drawnHeight=next;table.setHeight(next);}}
+  async function replaceAll(){fitHeight();await table.replaceData(rowData());}
+  // Replaces the rows under the grouping now asked for. A grouping given up is dropped before the rows, whose groups no longer exist; one
+  // taken up is applied after them, once they are in its order.
+  async function regroup(grouped:boolean){
+    if(grouped&&!options.group)table.setGroupBy(false);
+    await replaceAll();
+    if(options.group&&!grouped)table.setGroupBy(groupOf);
+  }
+  // fitDataFill refits every column without a definition width whenever the
+  // grid is redrawn for a new size, so a user's resize becomes that width.
+  table.on('columnResized',(column:any)=>{column.getDefinition().width=column.getWidth();});
+  if(options.tree)for(const [event,open] of [['dataTreeRowExpanded',true],['dataTreeRowCollapsed',false]] as const)table.on(event,(row:GridRow)=>{if(current())options.tree?.onToggle(keyOf(row),open);});
+  table.on('tableBuilt',()=>{if(!alive){table.destroy();return;}ready=true;if(options.onMultiSelection)container.setAttribute('aria-multiselectable','true');markBuilt();fit();apply();options.onReady?.();});
+  for(const event of ['columnMoved','columnResized','dataSorted'])table.on(event,()=>{if(ready&&!updating&&current())options.onLayout(layout());});
+  search.oninput=()=>{if(!current())return;state.query=search.value;apply();};
+  toggle.onclick=()=>{if(!current())return;filterPanel.hidden=!filterPanel.hidden;toggle.setAttribute('aria-expanded',String(!filterPanel.hidden));};
+  function clearFilters(){state.query='';state.columns=state.columns.map(()=>null);search.value='';selects.forEach(s=>{s.value='';if(s instanceof HTMLInputElement){s.setCustomValidity('');s.removeAttribute('aria-invalid');}});apply();}
+  clear.onclick=()=>{if(!current())return;clearFilters();};
+  // Showing the hidden row clears the filters, and brings the row into view with focus on it once the grid has drawn it.
+  showHidden.onclick=()=>{
+    if(!current())return;
+    const key=opened;clearFilters();
+    if(key!==null)whenDrawn(key,row=>{choose(key);row.getElement().scrollIntoView({block:'nearest'});row.getElement().focus({preventScroll:true});},()=>current()&&opened===key);
+  };
+  report();
+  const visibleIndices=()=>table.getColumns().map(c=>Number(c.getField().slice(1))).filter(i=>options.visible?.[i]!==false);
+  // Once the grid has drawn, which a grid that has only just been made, or is being changed, has not when it is asked, the row of a key is
+  // scrolled to within the grid and then `use`d. It supersedes a place still being restored.
+  function whenDrawn(key:string,use:(row:GridRow)=>void,stillCurrent=()=>true,stays:(row:GridRow,view:HTMLElement)=>boolean=inView){
+    if(!alive)return;
+    void built.then(()=>queue).then(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve())))).then(()=>{
+      if(!stillCurrent())return;
+      const row=alive&&ready?table.getRow(key)||undefined:undefined,view=holder();
+      if(!row)return;
+      // A row already where it is wanted, by default whole in view, is used where it is: the place the person has in the rows stands.
+      if(view&&stays(row,view)){use(row);return;}
+      placing++;
+      return (options.pageSize?row.pageTo():Promise.resolve()).then(()=>{if(alive&&stillCurrent())return row.scrollTo('nearest',false);}).catch(()=>undefined).then(()=>{if(alive&&stillCurrent())use(row);});
+    });
+  }
+  /** Marks the rows as no longer stating the current read, with the reason, or clears the mark (null). */
+  function markStale(reason:string|null){container.classList.toggle('stale',reason!==null);staleNote.textContent=reason===null?'':publicText(reason);staleNote.hidden=reason===null;}
+  return {
+    ready:()=>ready&&alive,
+    /** Restore native pager boundaries after the application's global busy pass. */
+    syncPagination(){
+      if(!options.pageSize||!ready||!alive)return;
+      const page=table.getPage(),last=table.getPageMax();
+      for(const button of container.querySelectorAll<HTMLButtonElement>('.tabulator-page')){
+        const target=button.dataset.page;
+        button.disabled=isBusy()||((target==='first'||target==='prev')&&page<=1)||((target==='next'||target==='last')&&page>=last);
+      }
+    },
+    state:()=>({query:state.query,columns:state.columns.slice()}),layout,
+    headers:()=>visibleIndices().map(i=>headers[i]),numeric:()=>visibleIndices().flatMap((original,i)=>numeric.includes(original)?[i]:[]),
+    visibleRows:()=>{if(!current()||!ready)throw Error('Refresh this table before exporting.');return table.getData('display').filter(matches).map(row=>visibleIndices().map(i=>row[field(i)]));},
+    /** The source rows the filters show, in display order. */
+    shownRows:()=>{if(!current()||!ready)throw Error('Refresh this table before exporting.');return table.getData('display').filter(matches).map(row=>Number(row.__sourceIndex));},
+    /**
+     * Draws one column's rich cells again, for content that arrived after the grid; the rest of each row stays as it was.
+     * It relies on Tabulator 6.6.1 running a cell's formatter again when the cell is set to the value it already has
+     * (Cell.setValue); a Tabulator upgrade has to keep that behavior, or this has to change with it.
+     */
+    redrawCells(column:number,where?:(index:number)=>boolean){if(ready&&alive)for(const row of table.getRows()){if(where&&!where(sourceIndex(row)))continue;const cell=row.getCell(field(column)),element=row.getElement().querySelector(`[tabulator-field="${field(column)}"]`);if(cell&&element&&!element.firstChild?.isEqualNode(cellContent(sourceIndex(row),column,row.getData()[field(column)])))cell.setValue(row.getData()[field(column)]);}},
+    /**
+     * Draws the rows again for the room the grid now has, at the place the person last left them: for a grid whose element was moved,
+     * which loses its scroll offset, or whose room changed while it was out of view.
+     */
+    relayout(){if(!ready||!alive||!visible())return;const at=restoring?.version===placing?restoring.place:lastPlace;void change(()=>{width=container.clientWidth;viewportHeight=container.clientHeight;redraw(false);fit();},at&&(()=>at));},
+    /** Replaces every row with these, by key, keeping the person's place. */
+    replaceRows(next:Cells,displayRows:string[][]|undefined,rowKeys:readonly string[]){
+      const nextKeys=keysOf(next,rowKeys);requested=nextKeys;
+      return change(async()=>{values=texts(next);keys=nextKeys;options={...options,displayRows};drawFilters();report();await replaceAll();});
+    },
+    /** Adds these rows after the others; the rows on screen stay where they are. A grouped grid's rows are replaced, never appended to. */
+    appendRows(more:Cells,displayRows:string[][]|undefined,rowKeys:readonly string[]){
+      const added=keysOf(more,rowKeys),asked=requested=[...requested,...added];
+      return change(async()=>{
+        if(options.group)throw Error('Rows cannot be added to a grouped table; replace its rows.');
+        if(!!options.displayRows!==!!displayRows)throw Error('Added rows must state display text exactly when the table does.');
+        const nextKeys=[...keys,...added],from=values.length;
+        if(new Set(nextKeys).size!==nextKeys.length)throw Error('Each row of this table needs a key of its own.');
+        values=[...values,...texts(more)];keys=nextKeys;options={...options,displayRows:displayRows&&[...options.displayRows!,...displayRows]};
+        drawFilters();report();fitHeight();
+        await table.addData(texts(more).map((row,at)=>({...Object.fromEntries(row.map((cell,i)=>[field(i),cell])),__sourceIndex:String(from+at),__key:added[at]})),false);
+      }).catch(error=>{if(requested===asked)requested=keys;throw error;});
+    },
+    /** Groups the rows under these headers, or not at all, keeping the person's place. */
+    setGrouping(group:GridGroupOption|undefined){
+      void change(async()=>{const grouped=!!options.group;options={...options,group};await regroup(grouped);});
+    },
+    /** Shows the columns marked true and hides the others, keeping the person's place; filters on hidden columns stay. */
+    setVisible(visible:boolean[]){void change(()=>{options={...options,visible};drawFilters();report();lay(given);fit();});},
+    /**
+     * Takes a later render's rows and options for the grid it already is (gridIdentity): its rows, grouping, visible columns, filters and
+     * layout change in place, and only once the new rows are in do they stop being marked stale. An update that fails puts the rows it
+     * replaced back and keeps them marked stale with the reason; it never rejects.
+     */
+    updated:async()=>{await queue;if(updateError)throw updateError;},
+    reconfigure(next:Cells,nextOptions:GridOptions){
+      const nextKeys=keysOf(next,nextOptions.rowKeys);requested=nextKeys;
+      return change(async()=>{
+        updateError=undefined;const before={values,keys,options,order,query:state.query,columns:state.columns.slice()},grouped=!!options.group;
+        try{
+          values=texts(next);keys=nextKeys;options=nextOptions;order=options.giveUp??[];
+          if(options.initial){state.query=options.initial.query;state.columns=headers.map((_,i)=>options.initial!.columns[i]??null);search.value=state.query;}
+          const changes=options.patchValues&&!options.tree&&!options.totals&&JSON.stringify(before.options.group?.keys??null)===JSON.stringify(options.group?.keys??null)
+            ?changedCells(before.keys,before.values,keys,values):null;
+          if(changes!==null){
+            report();
+            const patches=new Map<number,Record<string,string>>();
+            for(const cell of changes){let patch=patches.get(cell.row);if(!patch)patches.set(cell.row,patch={__key:keys[cell.row]});patch[field(cell.column)]=values[cell.row][cell.column];}
+            if(patches.size)await table.updateData([...patches.values()]);
+            if(patches.size||state.query!==before.query||JSON.stringify(state.columns)!==JSON.stringify(before.columns)||
+              JSON.stringify(before.options.searchText)!==JSON.stringify(options.searchText)||JSON.stringify(before.options.visible)!==JSON.stringify(options.visible)){
+              table.setFilter(matches);const sort=table.getSorters().map(s=>({column:s.field,dir:s.dir}));if(sort.length)table.setSort(sort);}
+            for(let column=0;column<headers.length;column++)if(before.options.visible?.[column]!==options.visible?.[column]){
+              const native=table.getColumn(field(column));if(native){if(shown(column))native.show();else native.hide();}}
+
+            // Precision/labels can change even if an exact amount is identical.
+            for(const row of table.getRows()){
+              const index=Number(row.getData().__sourceIndex),element=row.getElement();if(!element.isConnected)continue;
+              for(let column=0;column<headers.length;column++){
+                const cell=element.querySelector<HTMLElement>(`[tabulator-field="${field(column)}"]`);if(!cell)continue;
+                const content=cellContent(index,column,values[index][column]);
+                if(cell.childNodes.length!==1||!cell.firstChild?.isEqualNode(content)){const component=row.getCell(field(column));if(component)component.setValue(values[index][column]);if(!changes.some(c=>c.row===index&&c.column===column))changes.push({row:index,column});}
+              }
+            }
+            for(const group of table.getGroups()){
+              const element=group.getElement();if(!element||!options.group)continue;
+              const old=element.querySelector<HTMLElement>('[role=button]'),next=groupHeading(group.getKey(),group.getRows().length,group);
+              if(old&&old.innerHTML!==next.innerHTML){const focused=old.contains(document.activeElement);old.replaceWith(next);if(focused)next.focus({preventScroll:true});}
+            }
+            for(const cell of changes){const row=table.getRow(keys[cell.row]);const element=row?row.getElement().querySelector<HTMLElement>(`[tabulator-field="${field(cell.column)}"]`):null;
+              if(element?.isConnected){const animation=element.animate([{backgroundColor:'var(--warn-border)'},{backgroundColor:'transparent'}],{duration:1600});animation.id='value-update';}}
+          }else{drawFilters();report();await regroup(grouped);lay(given);applyLayout(options.layout);fit();}
+          markStale(null);
+        }catch(error){
+          updateError=error;({values,keys,options,order}=before);if(requested===nextKeys)requested=keys;state.query=before.query;state.columns=before.columns;search.value=state.query;drawFilters();report();
+          await regroup(!!nextOptions.group).catch(()=>undefined);
+          markStale(`These rows could not be updated: ${error instanceof Error&&error.message?error.message:'the update failed'}`);
+        }
+      });
+    },
+    /** Selects the row of a key, or none, without reporting it back as the person's selection. */
+    select(key:string|null){if(options.onMultiSelection)setMulti(key?[key]:[]);selected=key;selectionLost=false;markRows();report();},
+    presentationFilter(key:string){
+      if(!current()||!ready)return null;if(key==='query')return search;
+      const control=selects.get(options.keys.indexOf(key));if(!control)return null;
+      filterPanel.hidden=false;toggle.setAttribute('aria-expanded','true');return control;
+    },
+    presentationColumn(key:string){const index=options.keys.indexOf(key);if(index<0)return null;const column=table.getColumn(field(index));return column?column.getElement():null;},
+    presentationRow(key:string){const row=table.getRow(key);return row?row.getElement():null;},
+    presentationCell(row:number,column:number){const key=keyAt(row),record=key===null?false:table.getRow(key),cell=record&&record.getCell(field(column));return cell?cell.getElement():null;},
+    selectCell(row:number,column:number){if(!current()||!options.onCellPick)throw Error('This grid has no selectable cells.');const key=keyAt(row),record=key===null?false:table.getRow(key),cell=record&&record.getCell(field(column));if(!cell)throw Error('The selected cell is unavailable.');pickCell(cell);return cell.getElement();},
+    selected:()=>selected,
+    selectedKeys:()=>options.onMultiSelection?[...multiSelected]:selected?[selected]:[],
+    selectKeys(chosen:string[]){if(chosen.some(key=>!requested.includes(key)))throw Error('A selected row is unavailable.');setMulti(chosen);},
+    /** Hears the selection the person makes, and its clearing when an update leaves it without its row. */
+    onSelect(handler:(key:string|null)=>void){selectionChanged=handler;},
+    markStale,
+    /** Marks the row of a source index as the open one (null: none), and keeps it marked as the grid draws its rows again; says so when the filters hide it. It is also the selected row. */
+    selectRow(index:number|null){opened=keyAt(index);if(opened!==null){selected=opened;selectionLost=false;}report();markRows();},
+    /** The source index of the row the filters show after (1) or before (-1) the row of a source index, in the order on screen; null at an end. */
+    rowAfter(index:number,direction:-1|1):number|null{const key=keyAt(index),next=key===null||!ready?undefined:neighbour(key,direction);return next?sourceIndex(next):null;},
+    /**
+     * Moves focus to the row of a source index, scrolling it into view first, once the grid has drawn again: a change of the
+     * grid's width, such as a closing panel's, redraws its rows in the frame after it, which would take focus from a row focused sooner.
+     */
+    focusRow(index:number){const at=keyAt(index),version=++focusRequest,focused=document.activeElement,openedAt=opened,selectedAt=selected;if(at!==null)whenDrawn(at,row=>row.getElement().focus({preventScroll:true}),()=>version===focusRequest&&opened===openedAt&&selected===selectedAt&&(document.activeElement===focused||!!focused&&!focused.isConnected&&focusLost()));},
+    /**
+     * Scrolls the row of a source index into view, in the grid and in the page, as far as it takes to show it, once the grid has drawn again.
+     * A row being opened by a press stays where it is while the point pressed is still in the grid's view, whatever room the opening took:
+     * the rows above the grid's new foot keep their place on screen, so the row is still under the pointer for the second press of a
+     * double click. It is brought into view only when that point is no longer in the grid's view.
+     */
+    revealRow(index:number){
+      const at=keyAt(index);if(at===null)return;
+      const press=pressedOpen?.key===at?pressedOpen.y:undefined;
+      if(press===undefined){whenDrawn(at,row=>row.getElement().scrollIntoView({block:'nearest'}));return;}
+      // The grid that was pressed is on the page already: only its rows are scrolled.
+      whenDrawn(at,()=>undefined,undefined,(_row,view)=>{const top=view.getBoundingClientRect().top;return press>=top&&press<top+view.clientHeight;});
+    },
+    destroy(){if(!alive)return;alive=false;placing++;if(watching)cancelAnimationFrame(watching);resizing.disconnect();gesture=undefined;doubleCandidate=undefined;container.removeEventListener('mousedown',secondMouseDown,true);container.removeEventListener('click',multipleClick,true);container.removeEventListener('dblclick',doubleClick,true);container.removeEventListener('mouseup',doubleClick,true);container.removeEventListener('contextmenu',rowMenu,true);container.removeEventListener('focusout',rowBlurred,true);container.removeEventListener('change',entryChanged,true);container.removeEventListener('focusout',entryLeft,true);container.removeEventListener('keydown',entryKeyed,true);document.removeEventListener('focusin',focusMoved,true);document.removeEventListener('pointerdown',pressed,true);document.removeEventListener('keydown',keyed,true);container.removeEventListener('pointerdown',pointerDown,true);container.removeEventListener('scroll',watchPlace,true);container.removeEventListener('wheel',personScrolls,true);container.removeEventListener('touchmove',personScrolls,true);container.removeEventListener('pointerdown',scrollbarPress,true);container.removeEventListener('keydown',pagingKey,true);document.removeEventListener('pointermove',pointerMove,true);document.removeEventListener('pointercancel',cancelGesture,true);document.removeEventListener('scroll',cancelGesture,true);if(ready)table.destroy();host.replaceChildren();toolbar.remove();},
+  };
+}
+export type GridHandle=ReturnType<typeof renderDataGrid>;

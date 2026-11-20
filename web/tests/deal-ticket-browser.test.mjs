@@ -1,0 +1,554 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {browserAvailable,withBrowserPage,browserTestTimeout,pressKey} from './browser-page.mjs';
+
+test('a managed profile with trade fields and no editable sides does not offer an empty side composer',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {renderTicket}=await import('/deal-ticket.js'),{newTicket}=await import('/ticket-model.js');
+   const field={id:'return_rule',label:'Return quantity rule',meaning:'An explicit saved contract selection.',type:'choice',unit:null,state:'editable',required:true,band:null,choices:'return_rules',dependsOn:[],lookup:null,soon:null,rule:null};
+   const description={product:'synthetic_service',version:1,rowShape:'flow',tradeFields:[field],sideLimits:[],levels:['term'],modes:['new','booked'],tabs:[],tradeColumns:[],sides:[]};
+   window.ticket=renderTicket(document.querySelector('#host'),{state:newTicket(description),mode:'new',actions:null,schedule:null,quantityUnit:null,instant:at=>at,zone:'UTC',previous:null,summaries:[],links:[],entry:null,status:{kind:'current',text:'Choose the contract terms.'},fieldErrors:{},choices:{return_rule:[{value:'equal_quantity',label:'Equal quantity'}]},selectedSide:null,tab:'instrument',level:'term',closed:new Set(),on:new Proxy({},{get:()=>()=>{}})});
+  })()`);
+  assert.equal(await evaluate("document.querySelector('[data-field=return_rule] select').value"),'','a contract selection stays explicit');
+  assert.equal(await evaluate("document.querySelector('.ticket-deck')===null"),true);
+  assert.equal(await evaluate("document.querySelector('.ticket-chips')===null"),true);
+  assert.equal(await evaluate("document.querySelector('.ticket-book').textContent"),'Book');
+ });
+});
+
+test('grouped Side terms retain one accessible status through review, updates and refusal',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {renderTicket}=await import('/deal-ticket.js'),{newTicket}=await import('/ticket-model.js');
+   const field={id:'reference',label:'Agreement reference',meaning:'An explicit agreement reference.',type:'text',unit:null,state:'editable',required:true,band:null,choices:null,dependsOn:[],lookup:null,soon:null,rule:null};
+   const description={product:'synthetic_service',version:1,rowShape:'flow',tradeFields:[field],fieldGroups:[{id:'agreement',label:'Agreement terms',kind:'agreement',fields:['reference']}],sideLimits:[],levels:['term'],modes:['new','booked'],tabs:[],tradeColumns:[],sides:[]};
+   window.drawStatus=(status,presentation)=>renderTicket(document.querySelector('#host'),{state:newTicket(description),mode:'new',presentation,actions:null,schedule:null,quantityUnit:null,instant:at=>at,zone:'UTC',previous:null,summaries:[],links:[],entry:null,status,fieldErrors:{},choices:{},selectedSide:null,tab:'instrument',level:'term',closed:new Set(),on:new Proxy({},{get:()=>()=>{}})});
+  })()`);
+  for(const [kind,text] of [['current','Reviewed terms are current.'],['updating','Reviewing the selected terms.'],['stale','The displayed review is stale.'],['refused','Review refused; inspect the agreement terms.']]){
+   await evaluate(`drawStatus(${JSON.stringify({kind,text})})`);
+   assert.deepEqual(await evaluate("[...document.querySelectorAll('.ticket-status')].map(line=>({kind:line.dataset.kind,text:line.textContent,role:line.getAttribute('role')}))"),[{kind,text,role:'status'}]);
+   assert.equal(await evaluate("document.querySelectorAll('[data-ticket-field-group=agreement] [data-field=reference]').length"),1,'grouped terms remain rendered once');
+  }
+  await evaluate("drawStatus({kind:'current',text:'Selected terms remain current.'},'terms')");
+  assert.equal(await evaluate("document.querySelectorAll('.ticket-status[role=status]').length"),1,'a terms-only grouped view retains the same status');
+ });
+});
+
+test('retained terms presentation preserves backend labels and values without placing lifecycle commands or a second schedule on Terms',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {renderTicket}=await import('/deal-ticket.js'),{ticketOf}=await import('/ticket-model.js');
+   const field={id:'perspective',label:'Principal perspective',meaning:'The party giving or receiving the principal.',type:'choice',unit:null,state:'editable',required:true,band:null,choices:'perspectives',dependsOn:[],lookup:null,soon:null,rule:null};
+   const d={product:'synthetic_service',version:1,rowShape:'flow',tradeFields:[field],sideLimits:[],levels:['term'],modes:['new','booked'],tabs:[],tradeColumns:[],sides:[]};
+   const state=ticketOf(d,{product:d.product,version:1,trade:{perspective:'principal_receiver'},sides:[]});
+   window.ticket=renderTicket(document.querySelector('#host'),{state,mode:'booked',presentation:'terms',actions:{amend:{allowed:false,reason:'Unavailable'},closeOut:{allowed:false,reason:'Unavailable'},record:{allowed:false,reason:'Use the native lifecycle actions.'}},schedule:null,quantityUnit:'MMBtu',instant:at=>at,zone:'UTC',previous:null,summaries:[],links:[],entry:null,status:{kind:'current',text:'Retained contract terms.'},fieldErrors:{},choices:{perspective:[{value:'principal_receiver',label:'Principal receiver'}]},selectedSide:null,tab:'instrument',level:'term',closed:new Set(),on:new Proxy({},{get:()=>()=>{}})});
+  })()`);
+  assert.equal(await evaluate("document.querySelector('[data-field=perspective] .ticket-value').textContent"),'Principal receiver');
+  assert.equal(await evaluate("document.querySelectorAll('input,select,button,.ticket-schedule').length"),0);
+ });
+});
+
+// The ticket draws a synthetic in-delivery schedule view in the real grid dependency: the backend's delivered, remaining and total rows,
+// pinned in that order, and the strip's delivered count.
+test('a ticket in delivery shows the delivered count and the delivered, remaining and total rows above the pinned total',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<link rel="stylesheet" href="/vendor/tabulator.css"><link rel="stylesheet" href="/app.css"><div id="host" style="width:1200px"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {renderTicket}=await import('/deal-ticket.js'),{newTicket}=await import('/ticket-model.js');
+   const col=(id,label,unit,measure)=>({id,label,unit,measure,input:[]});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[],sideLimits:[],levels:['month','day'],modes:['new','booked'],tabs:[],
+    sides:[{kind:'physical',pill:'Physical',colour:'gas',min:1,initial:1,max:1,fields:[],columns:[col('quantity','Quantity','quantity','quantity')]}],tradeColumns:[col('net_cash','Net cash',null,'money')]};
+   const cells=(q,net)=>({'physical-1.quantity':{value:q,sources:['contract']},'trade.net_cash':{value:net,sources:[]}});
+   const row=(key,parent,level,c,delivered)=>({key,parent,level,start:'',end:'',operatingDate:null,cells:c,delivered});
+   const schedule={levels:['month','day'],valuationAt:'2026-11-02T00:00:00+00:00',deliveredLeaves:1,leaves:2,
+    totals:cells('-2000','6500'),delivered:cells('-1000','3250'),remaining:cells('-1000','3250'),
+    rows:[row('2026-11',null,'month',cells('-2000','6500'),false),row('2026-11-01','2026-11','day',cells('-1000','3250'),true),row('2026-11-02','2026-11','day',cells('-1000','3250'),false)]};
+   const on=new Proxy({},{get:()=>()=>{}});
+   window.ticket=renderTicket(document.querySelector('#host'),{state:newTicket(d),mode:'booked',actions:{amend:{allowed:false,reason:'No amendment.'},closeOut:{allowed:false,reason:'No close-out.'},record:{allowed:true,reason:'Recorded.'}},
+    schedule,quantityUnit:'MMBtu',instant:at=>'at '+at,previous:null,summaries:[],links:[],entry:null,status:{kind:'current',text:'Up to date'},fieldErrors:{},choices:{},selectedSide:null,tab:'instrument',level:'day',closed:new Set(),on});
+   for(let i=0;i<250&&!document.querySelector('.tabulator-calcs-holder .tabulator-cell');i++)await new Promise(r=>setTimeout(r,20));
+   await new Promise(r=>setTimeout(r,100));
+  })()`);
+  assert.equal(await evaluate("document.querySelector('.ticket-progress-text').textContent"),'1 of 2 delivered');
+  assert.equal(await evaluate("document.querySelector('.ticket-valuation').textContent"),'Valued at at 2026-11-02T00:00:00+00:00');
+  assert.equal(await evaluate("document.querySelector('.ticket-state').textContent"),'Booked · in delivery');
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.tabulator-calcs-holder .tabulator-cell')].map(c=>[...c.querySelectorAll('.grid-total-line')].map(l=>l.textContent))"),
+   [['Delivered','Remaining','Total'],['-1,000','-1,000','-2,000'],['3,250','3,250','6,500']]);
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.tabulator-tableholder .delivered-row')].map(r=>r.dataset.rowKey)"),['2026-11-01']);
+  await evaluate('ticket.destroy()');
+  assert.equal(await evaluate("document.querySelector('#host').children.length"),0);
+ });
+});
+
+// The ticket keeps the rows the person opened or closed across a redraw, and draws a side added since the last preview only once a
+// preview holds it: until then the instrument grid shows the sides the schedule has and the new side's tab says it is not previewed.
+test('a redraw keeps the person\'s open and closed rows and leaves out a side the schedule does not hold yet',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<link rel="stylesheet" href="/vendor/tabulator.css"><link rel="stylesheet" href="/app.css"><div id="host" style="width:1200px"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {renderTicket}=await import('/deal-ticket.js'),{newTicket,addSide}=await import('/ticket-model.js');
+   const col=(id,label,unit,measure)=>({id,label,unit,measure,input:[]});
+   const kind=(k,colour,min)=>({kind:k,pill:k,colour,min,initial:min,max:2,fields:[],columns:[col('quantity','Quantity','quantity','quantity')]});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[],sideLimits:[],levels:['month','day'],modes:['new','booked'],tabs:[],sides:[kind('physical','gas',1),kind('fee','fee',0)],tradeColumns:[]};
+   const cells=q=>({'physical-1.quantity':{value:q,sources:[]}});
+   const row=(key,parent,level,q)=>({key,parent,level,start:'',end:'',operatingDate:null,cells:cells(q),delivered:false});
+   const schedule={levels:['month','day'],valuationAt:'2026-10-30T00:00:00Z',deliveredLeaves:0,leaves:3,delivered:null,remaining:null,totals:cells('3'),
+    rows:[row('2026-11',null,'month','2'),row('2026-11-01','2026-11','day','1'),row('2026-11-02','2026-11','day','1'),row('2026-12',null,'month','1'),row('2026-12-01','2026-12','day','1')]};
+   window.toggles=[];
+   const on=new Proxy({},{get:(_,name)=>name==='toggle'?(key,open)=>toggles.push([key,open]):()=>{}});
+   const view=(tab)=>({state:addSide(newTicket(d),'fee'),mode:'new',actions:null,schedule,quantityUnit:'MMBtu',instant:at=>at,previous:null,summaries:[],links:[],entry:null,status:{kind:'stale',text:'Preview refused'},fieldErrors:{},choices:{},
+    selectedSide:null,tab,level:'day',closed:new Set(['2026-11']),on});
+   window.draw=tab=>{window.ticket?.destroy();window.ticket=renderTicket(document.querySelector('#host'),view(tab));};
+   window.draw('instrument');
+   for(let i=0;i<250&&!document.querySelector('.tabulator-row[data-row-key]');i++)await new Promise(r=>setTimeout(r,20));
+   await new Promise(r=>setTimeout(r,100));
+  })()`);
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.tabulator-row[data-row-key]')].map(r=>r.dataset.rowKey)"),['2026-11','2026-12','2026-12-01']);
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.grid-group-title')].map(t=>t.textContent)"),['physical · physical-1']);
+  await evaluate("document.querySelector('.tabulator-row[data-row-key=\"2026-12\"] .tabulator-data-tree-control').click()");
+  assert.deepEqual(await evaluate('toggles'),[['2026-12',false]]);
+  await evaluate("draw('fee-1')");
+  assert.equal(await evaluate("document.querySelector('.ticket-grid').textContent"),'fee · fee-1 is not in the last preview yet.');
+ });
+});
+
+// In booked mode a side's tab makes the day cells of a column the description enters in that mode inputs; a change opens that day's
+// record. The Quantity links tab draws each link's receipt, delivery and fuel from the backend's exact text.
+test('a booked side tab enters day quantities and the links tab draws the backend links',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<link rel="stylesheet" href="/vendor/tabulator.css"><link rel="stylesheet" href="/app.css"><div id="host" style="width:1200px"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {renderTicket}=await import('/deal-ticket.js'),{newTicket}=await import('/ticket-model.js');
+   const col=(id,label,unit,measure,input)=>({id,label,unit,measure,input});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[],sideLimits:[],levels:['month','day'],modes:['new','booked'],tabs:[{id:'links',label:'Quantity links'}],
+    sides:[{kind:'physical',pill:'Physical',colour:'gas',min:1,initial:1,max:1,fields:[],columns:[col('quantity','Quantity','quantity','quantity',['booked']),col('amount','Amount',null,'money',[])]}],tradeColumns:[]};
+   const cells=q=>({'physical-1.quantity':{value:q,sources:['contract']},'physical-1.amount':{value:'5',sources:['contract']}});
+   const row=(key,parent,level,q)=>({key,parent,level,start:'',end:'',operatingDate:null,cells:cells(q),delivered:false});
+   const schedule={levels:['month','day'],valuationAt:'2026-10-30T00:00:00Z',deliveredLeaves:0,leaves:2,delivered:null,remaining:null,totals:cells('-2000'),
+    rows:[row('2026-11',null,'month','-2000'),row('2026-11-01','2026-11','day','-1000'),row('2026-11-02','2026-11','day','-1000')]};
+   window.entered=[];
+   const on=new Proxy({},{get:(_,name)=>name==='enter'?(...args)=>entered.push(args):()=>{}});
+   const field=(id,type,choices)=>({id,label:id,meaning:'',type,unit:id==='quantity'?'quantity':null,state:'editable',required:true,band:null,choices,dependsOn:[],lookup:null,soon:null,rule:null});
+   const links=[{source:'physical-1',target:'physical-2',formula:'gross_divided_by_one_plus_fraction',fraction:'0.02',receipt:'310000',delivery:'15500000/51',fuel:'310000/51'}];
+   window.draw=(tab,mode,entry,record=true)=>{window.ticket?.destroy();window.ticket=renderTicket(document.querySelector('#host'),{state:newTicket(d),mode,actions:{amend:{allowed:false,reason:'No.'},closeOut:{allowed:false,reason:'No.'},record:{allowed:record,reason:'No.'}},
+    schedule,quantityUnit:'MMBtu',instant:at=>at,previous:null,summaries:[],links,entry,status:{kind:'current',text:'Up to date'},fieldErrors:{},choices:{},selectedSide:null,tab,level:'day',closed:new Set(),on});};
+   window.settled=async()=>{for(let i=0;i<250&&!document.querySelector('.tabulator-row[data-row-key]');i++)await new Promise(r=>setTimeout(r,20));await new Promise(r=>setTimeout(r,100));};
+   window.entry={side:'physical-1',day:'2026-11-02',fields:[field('quantity','decimal',null),field('kind','choice','kinds')],values:{quantity:'900'},choices:{kind:[{value:'nominated',label:'Nominated'}]},pending:false,sending:false,text:''};
+   draw('physical-1','booked',null);await settled();
+  })()`);
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.tabulator-row[data-row-key]')].map(r=>[r.dataset.rowKey,r.querySelectorAll('.ticket-cell-input').length])"),[['2026-11',0],['2026-11-01',1],['2026-11-02',1]]);
+  // An entry opens empty, showing the drawn quantity, grouped and signed, only as its placeholder: the record takes a plain unsigned decimal.
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.ticket-cell-input')].map(i=>[i.value,i.placeholder])"),[['','-1,000'],['','-1,000']]);
+  await evaluate("(()=>{const input=document.querySelector('.tabulator-row[data-row-key=\"2026-11-02\"] .ticket-cell-input');input.value='900';input.dispatchEvent(new Event('change'));})()");
+  assert.deepEqual(await evaluate('entered'),[['physical-1','2026-11-02','900']]);
+  await evaluate("(async()=>{draw('physical-1','booked',entry);await settled();})()");
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.ticket-record [data-field] .ticket-control')].map(c=>c.value)"),['900','']);
+  assert.equal(await evaluate("document.querySelector('.ticket-record .ticket-unit').textContent"),'MMBtu');
+  await evaluate("(async()=>{draw('instrument','booked',null);await settled();})()");
+  assert.equal(await evaluate("document.querySelectorAll('.ticket-cell-input').length"),0);
+  await evaluate("(async()=>{draw('physical-1','new',null);await settled();})()");
+  assert.equal(await evaluate("document.querySelectorAll('.ticket-cell-input').length"),0);
+  // A booked trade that records no day quantities takes no entries.
+  await evaluate("(async()=>{draw('physical-1','booked',null,false);await settled();})()");
+  assert.equal(await evaluate("document.querySelectorAll('.ticket-cell-input').length"),0);
+  await evaluate("(async()=>{draw('links','booked',null);await settled();})()");
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.tabulator-row[data-row-key] .tabulator-cell')].map(c=>c.textContent)"),
+   ['physical-1','physical-2','gross_divided_by_one_plus_fraction','0.02','310,000','15,500,000/51','310,000/51']);
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.tabulator-col-title')].map(c=>c.textContent).slice(4)"),['Receipt (MMBtu)','Delivery (MMBtu)','Fuel (MMBtu)']);
+ });
+});
+
+// A late answer that changes nothing on screen leaves the drawn ticket standing, so the person keeps their place in its schedule.
+test('a lookup answer that changes nothing leaves the drawn schedule standing',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<link rel="stylesheet" href="/vendor/tabulator.css"><link rel="stylesheet" href="/app.css"><div id="host" style="width:1200px"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {setupTicket}=await import('/ticket-controller.js');
+   const f=(id,over)=>({id,label:id,meaning:'',type:'decimal',unit:null,state:'editable',required:true,band:null,choices:null,dependsOn:[],lookup:null,soon:null,rule:null,...over});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[],sideLimits:[],levels:['month'],modes:['new'],tabs:[],tradeColumns:[],
+    sides:[{kind:'leg',pill:'Leg',colour:'gas',min:1,initial:1,max:1,soon:null,fields:[f('q',{band:'quantity'}),f('price',{state:'info',type:'text',required:false,lookup:'market_price'})],
+     columns:[{id:'quantity',label:'Quantity',unit:null,measure:'quantity',input:[],soon:null}]}]};
+   const cells=q=>({'leg-1.quantity':{value:q,sources:[]}});
+   window.held=[];
+   const api=async(path,body)=>{
+    if(path==='tickets/description')return d;
+    if(path==='tickets/choices')return {choices:[]};
+    if(path==='tickets/lookup')return await new Promise(answer=>held.push(()=>answer({value:'3.25',source:{kind:'market',label:'Hub · close 2041-01-02'}})));
+    if(path==='tickets/preview'){const q=body.draft.sides[0].values.q;return {source:{definitionRevisionId:'definition-a',referenceCatalogId:'reference-catalog',referenceRevisionId:'reference-a'},schedule:{levels:['month'],valuationAt:'',deliveredLeaves:0,leaves:1,delivered:null,remaining:null,totals:cells(q),
+     rows:[{key:'2041-02',parent:null,level:'month',start:'',end:'',operatingDate:null,cells:cells(q),delivered:false}]},summaries:[],scheduleRefusal:null,quantityUnit:'MMBtu',links:[]};}
+    throw Error('unexpected '+path);
+   };
+   setupTicket(document.querySelector('#host'),{api,context:()=>({}),product:'synthetic_flow',instant:at=>at,zone:()=>'UTC',actor:()=>'synthetic',booked:()=>{}});
+   const until=async test=>{for(let i=0;i<250&&!test();i++)await new Promise(r=>setTimeout(r,20));if(!test())throw Error('timed out');};
+   const edit=async value=>{await until(()=>!!document.querySelector('[data-field=q] input'));const input=document.querySelector('[data-field=q] input');input.value=value;input.onchange();};
+   const drawn=q=>document.querySelector('.ticket-status')?.dataset.kind==='current'&&document.querySelector('.tabulator-row[data-row-key="2041-02"]')?.textContent.includes(q);
+   await edit('5');await until(()=>drawn('5')&&held.length===1);held.shift()();
+   await until(()=>!!document.querySelector('[data-field=price] .ticket-chip'));
+   await edit('6');await until(()=>drawn('6')&&held.length===1);
+   window.holder=document.querySelector('.ticket-grid .tabulator-tableholder');
+   held.shift()();await new Promise(r=>setTimeout(r,200));
+  })()`);
+  assert.equal(await evaluate("holder.isConnected&&holder===document.querySelector('.ticket-grid .tabulator-tableholder')"),true);
+ });
+});
+
+// Lookup answers dropped because the draft changed leave that draft unread, so returning to it reads its lookups again.
+test('a draft whose lookup answers were dropped reads them again when the person returns to it',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<link rel="stylesheet" href="/vendor/tabulator.css"><link rel="stylesheet" href="/app.css"><div id="host" style="width:1200px"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {setupTicket}=await import('/ticket-controller.js');
+   const f=(id,over)=>({id,label:id,meaning:'',type:'decimal',unit:null,state:'editable',required:true,band:null,choices:null,dependsOn:[],lookup:null,soon:null,rule:null,...over});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[],sideLimits:[],levels:['month'],modes:['new'],tabs:[],tradeColumns:[],
+    sides:[{kind:'leg',pill:'Leg',colour:'gas',min:1,initial:1,max:1,soon:null,fields:[f('q',{band:'quantity'}),f('price',{state:'info',type:'text',required:false,lookup:'market_price'})],
+     columns:[{id:'quantity',label:'Quantity',unit:null,measure:'quantity',input:[],soon:null}]}]};
+   window.held=[];
+   const api=async(path,body)=>{
+    if(path==='tickets/description')return d;
+    if(path==='tickets/choices')return {choices:[]};
+    if(path==='tickets/lookup')return await new Promise(answer=>held.push(()=>answer({value:'3.'+body.draft.sides[0].values.q,source:{kind:'market',label:'Hub · close 2041-01-02'}})));
+    if(path==='tickets/preview')return {schedule:null,summaries:null,scheduleRefusal:{code:'schedule_view',message:'Not drawn here.'},quantityUnit:'MMBtu',links:[]};
+    throw Error('unexpected '+path);
+   };
+   setupTicket(document.querySelector('#host'),{api,context:()=>({}),product:'synthetic_flow',instant:at=>at,zone:()=>'UTC',actor:()=>'synthetic',booked:()=>{}});
+   window.until=async test=>{for(let i=0;i<250&&!test();i++)await new Promise(r=>setTimeout(r,20));if(!test())throw Error('timed out');};
+   const edit=async value=>{await until(()=>!!document.querySelector('[data-field=q] input'));const input=document.querySelector('[data-field=q] input');input.value=value;input.onchange();};
+   await edit('5');await until(()=>held.length===1);
+   // The draft changes, so the answers for 5 are dropped, and changes back before the next preview reads anything.
+   await edit('6');held.shift()();await new Promise(r=>setTimeout(r,20));await edit('5');
+   await until(()=>held.length===1);held.shift()();
+   await until(()=>!!document.querySelector('[data-field=price] .ticket-chip'));
+  })()`);
+  assert.equal(await evaluate("document.querySelector('[data-field=price] .ticket-value').textContent"),'3.5');
+ });
+});
+
+// A slow field read must not send every other field into the server's session
+// lock, and edits/closing must release obsolete reads.
+test('ticket field reads are bounded and superseded or closed reads are cancelled',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {setupTicket}=await import('/ticket-controller.js');
+   const field=(id,choices=null)=>({id,label:id,meaning:'',type:choices?'choice':'text',unit:null,state:'editable',required:false,band:null,choices,dependsOn:[],lookup:null,soon:null,rule:null});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[field('reference'),field('book','books'),field('party','parties'),field('venue','venues')],
+    sideLimits:[],levels:['month'],modes:['new'],tabs:[],tradeColumns:[],sides:[]};
+   window.calls=[];window.active=0;window.maximum=0;
+   const api=async(path,body,signal)=>{
+    if(path==='tickets/description')return d;
+    if(path==='tickets/choices')return new Promise((_,reject)=>{
+     calls.push({body,signal});active++;maximum=Math.max(maximum,active);
+     const abort=()=>{active--;reject(Error('response_unknown'));};
+     signal?.addEventListener('abort',abort,{once:true});
+    });
+    throw Error('Unexpected request '+path);
+   };
+   window.ticket=setupTicket(document.querySelector('#host'),{api,context:()=>({snapshotId:'synthetic'}),product:'synthetic_flow',instant:at=>at,zone:()=>'UTC',actor:()=>'bounded-reader',booked:()=>{}});
+   window.until=async test=>{for(let i=0;i<250&&!test();i++)await new Promise(r=>setTimeout(r,10));if(!test())throw Error('timed out');};
+   await until(()=>calls.length>0);
+  })()`);
+  assert.equal(await evaluate('maximum'),1);
+  await evaluate(`(async()=>{
+   const input=document.querySelector('[data-field=reference] input');input.value='latest';input.onchange();
+   await until(()=>calls.length===2);
+  })()`);
+  assert.equal(await evaluate('calls[0].signal.aborted'),true);
+  assert.equal(await evaluate('calls[1].body.draft.trade.reference'),'latest');
+  assert.equal(await evaluate('maximum'),1);
+  await evaluate("ticket.destroy()");
+  assert.equal(await evaluate('calls[1].signal.aborted'),true);
+  await evaluate('new Promise(r=>setTimeout(r,30))');
+  assert.equal(await evaluate('calls.length'),2);
+  assert.equal(await evaluate("document.querySelector('#host').children.length"),0);
+ });
+});
+
+// Cancellation is an optimization as well as a lifetime boundary: a transport
+// that still delivers an old answer must not win after A -> B -> A edits.
+test('cancelled lookup and preview answers cannot return through the same draft',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {setupTicket}=await import('/ticket-controller.js');
+   const f=(id,over={})=>({id,label:id,meaning:'',type:'text',unit:null,state:'editable',required:false,band:null,choices:null,dependsOn:[],lookup:null,soon:null,rule:null,...over});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[f('reference'),f('price',{state:'info',lookup:'price'})],
+    sideLimits:[],levels:['month'],modes:['new'],tabs:[],tradeColumns:[],sides:[]};
+   window.lookups=[];window.previews=[];
+   const api=async(path,body,signal)=>{
+    if(path==='tickets/description')return d;
+    if(path==='tickets/lookup')return new Promise(resolve=>lookups.push({resolve,signal}));
+    if(path==='tickets/preview')return new Promise(resolve=>previews.push({resolve,signal}));
+    throw Error('Unexpected '+path);
+   };
+   window.ticket=setupTicket(document.querySelector('#host'),{api,context:()=>({}),product:'synthetic_flow',instant:at=>at,zone:()=>'UTC',actor:()=>'late-reader',booked:()=>{}});
+   window.until=async test=>{for(let i=0;i<250&&!test();i++)await new Promise(r=>setTimeout(r,10));if(!test())throw Error('timed out');};
+   window.edit=value=>{const input=document.querySelector('[data-field=reference] input');input.value=value;input.onchange();};
+   await until(()=>!!document.querySelector('[data-field=reference] input'));
+   edit('A');await until(()=>lookups.length===1&&previews.length===1);
+   edit('B');edit('A');await until(()=>previews.length===2);
+  })()`);
+  assert.equal(await evaluate('lookups[0].signal.aborted&&previews[0].signal.aborted'),true);
+  await evaluate(`(async()=>{
+   lookups[0].resolve({value:'obsolete',source:{kind:'market',label:'Old answer'}});
+   previews[0].resolve({schedule:null,summaries:[],scheduleRefusal:{code:'old',message:'Old preview'},quantityUnit:'MMBtu',links:[]});
+   await until(()=>lookups.length===2);
+  })()`);
+  assert.equal(await evaluate("!!document.querySelector('[data-field=price] .ticket-chip')"),false);
+  assert.equal(await evaluate("document.querySelector('.ticket-status').textContent.includes('Old preview')"),false);
+  await evaluate(`(async()=>{
+   lookups[1].resolve({value:'current',source:{kind:'market',label:'Current answer'}});
+   await until(()=>!!document.querySelector('[data-field=price] .ticket-chip'));
+  })()`);
+  assert.equal(await evaluate("document.querySelector('[data-field=price] .ticket-value').textContent"),'current');
+  await evaluate('ticket.destroy()');
+  assert.equal(await evaluate('previews[1].signal.aborted'),true);
+ });
+});
+
+// Slow reference reads must not accumulate a request for every intermediate ticket shape.
+test('ticket reference reads are bounded and queued choices follow only the latest sides',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {setupTicket}=await import('/ticket-controller.js');
+   const field=id=>({id,label:id,meaning:'',type:'choice',unit:null,state:'editable',required:false,band:null,choices:id,dependsOn:[],lookup:null,soon:null,rule:null});
+   const side=(kind,initial)=>({kind,pill:kind,colour:'gas',min:0,initial,max:3,soon:null,fields:[field('source')],columns:[]});
+   const d={product:'synthetic_queue',version:1,rowShape:'flow',tradeFields:[...['book','party','third','fourth','fifth','sixth'].map(field),...Array.from({length:6},(_,i)=>({...field('derived'+i),state:'info',choices:null,lookup:'derived'}))],sideLimits:[],levels:['month'],modes:['new'],tabs:[],tradeColumns:[],sides:[side('physical',1),side('cash',1),side('fee',0)]};
+   window.calls=[];window.active=0;window.peak=0;window.held=[];
+   window.tick=()=>new Promise(r=>setTimeout(r,30));
+   const api=async(path,body)=>{
+    if(path==='tickets/description')return d;
+    if(path==='tickets/preview')throw Error('Incomplete draft');
+    if(path==='tickets/choices'||path==='tickets/lookup'){
+     active++;peak=Math.max(peak,active);calls.push({...body,path});
+     return new Promise((resolve,reject)=>held.push({body,path,finish:(fail=false)=>{active--;fail||path==='tickets/lookup'?reject(Error('Reference unavailable')):resolve({choices:[{value:body.draft.sides.map(s=>s.code).join(','),label:'Current sides'}]});}}));
+    }
+    throw Error(path);
+   };
+   window.ticket=setupTicket(document.querySelector('#host'),{api,context:()=>({}),product:d.product,instant:at=>at,zone:()=>'UTC',actor:()=>'synthetic',booked:()=>{}});
+   await tick();
+   document.querySelector('[data-side="cash-1"] .ticket-remove').click();
+   for(const kind of ['physical','fee'])[...document.querySelectorAll('.ticket-add-kind')].find(b=>b.textContent===kind).click();
+   await new Promise(r=>setTimeout(r,350));
+  })()`);
+  assert.ok(await evaluate('peak<=1'),'at most one reference read may be outstanding across edits');
+  await evaluate('(async()=>{window.initial=calls.length;held.splice(0).forEach(h=>h.finish());await tick();})()');
+  assert.equal(await evaluate("calls.slice(initial).every(c=>c.draft.sides.map(s=>s.code).join(',')==='physical-1,physical-2,fee-1')"),true,'obsolete queued drafts are never sent');
+  await evaluate("(async()=>{for(let i=0;i<15&&held.length;i++){held.splice(0).forEach(h=>h.finish(h.body.field==='party'));await tick();}})()");
+  assert.equal(await evaluate("document.querySelector('[data-field=book] select').options[1].value"),'physical-1,physical-2,fee-1');
+  assert.equal(await evaluate("document.querySelector('[data-field=party] .ticket-error').textContent"),'Reference unavailable');
+  assert.equal(await evaluate("calls.some(c=>c.path==='tickets/lookup')&&peak<=1"),true,'lookups share the bound and refusals release it');
+  assert.equal(await evaluate("calls.slice(initial).some(c=>c.side==='cash-1')"),false,'removed sides are never read from the queue');
+  // A new edit queues fresh lists. Destroying the ticket stops the queue even when outstanding reads complete.
+  await evaluate(`(async()=>{document.querySelector('.ticket-add-kind').click();await tick();window.beforeDestroy=calls.length;ticket.destroy();held.splice(0).forEach(h=>h.finish());await tick();})()`);
+  assert.equal(await evaluate('calls.length'),await evaluate('beforeDestroy'));
+ });
+});
+
+test('returning to an earlier draft cannot apply a partially superseded lookup batch',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {setupTicket}=await import('/ticket-controller.js');
+   const field=(id,lookup=null)=>({id,label:id,meaning:'',type:'text',unit:null,state:lookup?'info':'editable',required:false,band:null,choices:null,dependsOn:[],lookup,soon:null,rule:null});
+   const d={product:'synthetic_aba',version:1,rowShape:'flow',tradeFields:[field('input'),...Array.from({length:6},(_,i)=>field('looked'+i,'derived'))],sideLimits:[],levels:['month'],modes:['new'],tabs:[],tradeColumns:[],sides:[]};
+   window.held=[];window.requests=[];window.delay=ms=>new Promise(r=>setTimeout(r,ms));
+   const api=async(path,body)=>{
+    if(path==='tickets/description')return d;
+    if(path==='tickets/preview')throw Error('Incomplete draft');
+    if(path==='tickets/lookup'){
+     requests.push(body);
+     if(body.draft.trade.input==='base')return {value:'stable',source:{kind:'reference',label:'Retained lookup'}};
+     return new Promise(resolve=>held.push({body,finish:()=>resolve({value:'obsolete',source:{kind:'reference',label:'Old lookup'}})}));
+    }
+    throw Error(path);
+   };
+   window.ticket=setupTicket(document.querySelector('#host'),{api,context:()=>({}),product:d.product,instant:at=>at,zone:()=>'UTC',actor:()=>'synthetic',booked:()=>{}});
+   await delay(30);
+   window.edit=value=>{const input=document.querySelector('[data-field=input] input');input.value=value;input.onchange();};
+   edit('base');await delay(700);
+   if(document.querySelectorAll('[data-field^=looked] .ticket-chip').length!==6)throw Error('Initial lookup batch did not fill all fields');
+   edit('A');await delay(350);
+   edit('B');await delay(350);
+   edit('A');held.splice(0).forEach(h=>h.finish());await delay(30);
+  })()`);
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-field^=looked] .ticket-chip')].map(e=>e.textContent)"),Array(6).fill('Retained lookup'));
+  await evaluate('ticket.destroy();held.splice(0).forEach(h=>h.finish())');
+ });
+});
+
+// A booked synthetic trade opened in the ticket, on its side's tab at day level, where the day's quantity is an entry: `cell`. The book's
+// choice labels stay unanswered until `held` is released.
+const bookedDayCell=`
+   const {setupTicket}=await import('/ticket-controller.js');
+   const field={id:'book',label:'Book',meaning:'',type:'choice',unit:null,state:'editable',required:true,band:null,choices:'books',dependsOn:[],lookup:null,soon:null,rule:null};
+   const d={product:'synthetic_booked',version:1,rowShape:'flow',tradeFields:[field,{...field,id:'party',label:'Party'}],sideLimits:[],levels:['month','day'],modes:['booked'],tabs:[],tradeColumns:[],
+    sides:[{kind:'physical',pill:'Physical',colour:'gas',min:1,initial:1,max:1,soon:null,fields:[],columns:[{id:'quantity',label:'Quantity',unit:'quantity',measure:'quantity',input:['booked']}]}]};
+   const cells={'physical-1.quantity':{value:'1000',sources:['contract']}};
+   const row=(key,parent,level)=>({key,parent,level,start:'',end:'',operatingDate:null,cells,delivered:false});
+   const trade={draft:{product:d.product,version:1,trade:{book:'book-1',party:'party-1'},sides:[{kind:'physical',code:'physical-1',values:{}}]},
+    schedule:{levels:['month','day'],valuationAt:'2041-01-01T00:00:00Z',deliveredLeaves:0,leaves:1,delivered:null,remaining:null,totals:cells,rows:[row('2041-02',null,'month'),row('2041-02-01','2041-02','day')]},
+    summaries:[],links:[],scheduleRefusal:null,quantityUnit:'MMBtu',quantityPolicy:'synthetic_quantity',actions:{amend:{allowed:false,reason:'No'},closeOut:{allowed:false,reason:'No'},record:{allowed:true,reason:'Record day'}}};
+   window.held=[];
+   const api=async(path,body)=>{
+    if(path==='tickets/description')return d;
+    if(path==='tickets/trade')return trade;
+    if(path==='tickets/choices')return new Promise((resolve,reject)=>{if(body.field==='book')held.push(()=>resolve({choices:[{value:'book-1',label:'Resolved book'}]}));else window.refuseChoice=()=>reject(Error('Reference unavailable'));});
+    throw Error(path);
+   };
+   window.until=async test=>{for(let i=0;i<250&&!test();i++)await new Promise(r=>setTimeout(r,20));if(!test())throw Error('Condition not ready');};
+   window.painted=()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+   window.ticket=setupTicket(document.querySelector('#host'),{api,context:()=>({}),product:d.product,instant:at=>at,zone:()=>'UTC',actor:()=>'synthetic-reader',opened:{tradeId:'synthetic',bindingId:'synthetic',revision:1}});
+   await until(()=>held.length===1);
+   const level=document.querySelector('.ticket-level');level.value='day';level.onchange();
+   document.querySelector('.ticket-tab[data-tab="physical-1"]').click();
+   await until(()=>!!document.querySelector('.ticket-cell-input'));
+   // A grid draws its rows again within a frame of first drawing them, which detaches a cell and drops its focus: the person is in the
+   // cell once the grid has settled.
+   await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+   window.cell=document.querySelector('.ticket-cell-input');`;
+
+test('late booked choice labels preserve an editable day cell and its unsent quantity',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{${bookedDayCell}
+   cell.value='990';cell.focus();
+   if(document.activeElement!==cell)throw Error('The editable day cell did not receive focus before its label read.');
+   held.shift()();await until(()=>document.querySelector('[data-field=book] .ticket-value')?.textContent==='Resolved book');
+   // A label can resize the grid; its redraw restores the retained control on the next frame.
+   await painted();await until(()=>document.activeElement===cell);
+  })()`);
+  assert.deepEqual(await evaluate("({same:cell.isConnected&&cell===document.querySelector('.ticket-cell-input'),value:cell.value,focused:document.activeElement===cell})"),{same:true,value:'990',focused:true});
+  await evaluate('(async()=>{await until(()=>!!window.refuseChoice);refuseChoice();await painted();await until(()=>document.activeElement===cell);})()');
+  assert.deepEqual(await evaluate("({same:cell.isConnected&&cell===document.querySelector('.ticket-cell-input'),value:cell.value,focused:document.activeElement===cell,party:document.querySelector('[data-field=party] .ticket-value').textContent})"),{same:true,value:'990',focused:true,party:'party-1'});
+  await evaluate("cell.dispatchEvent(new Event('change'))");
+  assert.equal(await evaluate("document.querySelector('.ticket-record [data-field=quantity] .ticket-control').value"),'990');
+  await evaluate('ticket.destroy()');
+ });
+});
+
+// The checks below type in the day's entry as a person does: the browser reports a change of typed text once, when the entry loses focus
+// or Enter is pressed in it, and never of text a script set. The page behaves as a person's focused window; `behind` starts it as a window
+// behind another, which the typing then brings forward.
+const ticketPage='<link rel="stylesheet" href="/vendor/tabulator.css"><link rel="stylesheet" href="/app.css"><div id="host" style="width:1200px"></div>';
+const typedDayCell=async(evaluate,command,behind,text)=>{
+ if(behind)await command('Emulation.setFocusEmulationEnabled',{enabled:false});
+ await evaluate(`(async()=>{${bookedDayCell}cell.focus();})()`);await command('Input.insertText',{text});
+ assert.equal(await evaluate('cell.value'),text);
+};
+// The ticket's width changes, which draws the grid's rows again: the entry's row is taken out of the page and the same row is put back.
+const narrowed=`(async()=>{
+  const row=cell.closest('.tabulator-row');let redrawn=false;new MutationObserver(records=>{if(records.some(record=>[...record.removedNodes].includes(row)))redrawn=true;}).observe(row.parentElement,{childList:true});
+  document.querySelector('#host').style.width='420px';for(let i=0;i<300&&!redrawn;i++)await new Promise(r=>setTimeout(r,10));
+  for(let i=0;i<5;i++)await painted();
+  return redrawn;
+ })()`;
+// What became of the entry the person typed in, and the quantity the day's record holds once it is open.
+const dayEntry="({same:cell.isConnected&&cell===document.querySelector('.ticket-cell-input'),value:cell.value,focused:document.activeElement===cell,record:document.querySelector('.ticket-record [data-field=quantity] .ticket-control')?.value??null})";
+
+// The person enters what the entry holds by Enter in it, or by moving focus on, as Tab does.
+for(const behind of [false,true])for(const key of ['Enter','Tab']){
+ const where=behind?', in a window that was behind another':'';
+ test(`${key} enters a typed day quantity${where}`,{skip:!browserAvailable,timeout:browserTestTimeout},()=>withBrowserPage(ticketPage,async(evaluate,command)=>{
+  await typedDayCell(evaluate,command,behind,'99');
+  await pressKey(command,key);
+  assert.equal((await evaluate(dayEntry)).record,'99');
+ }));
+ // The redraw is not the person entering the quantity: it stays in its entry, with focus, until they do.
+ test(`a day quantity typed before a change of width stays in its entry until ${key} enters it${where}`,{skip:!browserAvailable,timeout:browserTestTimeout},()=>withBrowserPage(ticketPage,async(evaluate,command)=>{
+  await typedDayCell(evaluate,command,behind,'99');
+  assert.equal(await evaluate(narrowed),true);
+  assert.deepEqual(await evaluate(dayEntry),{same:true,value:'99',focused:true,record:null});
+  await pressKey(command,key);
+  assert.equal((await evaluate(dayEntry)).record,'99');
+ }));
+}
+
+for(const behind of [false,true])
+ test(`a day quantity typed across a change of width is entered whole${behind?', in a window that was behind another':''}`,{skip:!browserAvailable,timeout:browserTestTimeout},()=>withBrowserPage(ticketPage,async(evaluate,command)=>{
+  await typedDayCell(evaluate,command,behind,'99');
+  assert.equal(await evaluate(narrowed),true);
+  await command('Input.insertText',{text:'0'});
+  assert.deepEqual(await evaluate(dayEntry),{same:true,value:'990',focused:true,record:null});
+  await pressKey(command,'Enter');
+  assert.equal((await evaluate(dayEntry)).record,'990');
+ }));
+
+// A local date-time is booked only as the instant it resolved to: while its resolution is out, or after the clock refused it, the earlier
+// instant is not booked in its place; and an earlier entry's late answer never replaces a later one's.
+test('a local time still resolving or refused blocks booking, and a late answer for an earlier entry is ignored',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {setupTicket}=await import('/ticket-controller.js');
+   const f=(id,over={})=>({id,label:id,meaning:'',type:'text',unit:null,state:'editable',required:false,band:null,choices:null,dependsOn:[],lookup:null,soon:null,rule:null,...over});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[f('pay',{type:'datetime'})],sideLimits:[],levels:['month'],modes:['new'],tabs:[],tradeColumns:[],sides:[]};
+   window.inspections=[];window.bookings=[];window.previewed=[];
+   const api=async(path,body)=>{
+    if(path==='tickets/description')return d;
+    if(path==='time/inspect')return new Promise(resolve=>inspections.push({resolve,body}));
+    if(path==='tickets/preview'){previewed.push(body.draft);return {schedule:null,summaries:[],scheduleRefusal:{code:'schedule_view',message:'Not drawn here.'},quantityUnit:'MMBtu',links:[]};}
+    if(path==='tickets/book'){bookings.push(body);return new Promise(()=>{});}
+    throw Error('Unexpected '+path);
+   };
+   window.ticket=setupTicket(document.querySelector('#host'),{api,context:()=>({}),product:'synthetic_flow',instant:at=>at,zone:()=>'America/Chicago',actor:()=>'local-time',booked:()=>{}});
+   window.until=async test=>{for(let i=0;i<300&&!test();i++)await new Promise(r=>setTimeout(r,10));if(!test())throw Error('timed out');};
+   window.enter=value=>{const input=document.querySelector('[data-field=pay] input');input.value=value;input.onchange();};
+   window.pay=()=>JSON.stringify(previewed.at(-1)??null);
+   await until(()=>!!document.querySelector('[data-field=pay] input'));
+   enter('2026-03-07T04:00');await until(()=>inspections.length===1);
+   inspections[0].resolve({candidates:[{instant:'2026-03-07T10:00:00Z'}]});await until(()=>pay().includes('2026-03-07T10:00:00Z'));
+   await new Promise(r=>setTimeout(r,400));
+   enter('2026-03-08T02:30');await until(()=>inspections.length===2);
+   document.querySelector('.ticket-book').click();await new Promise(r=>setTimeout(r,50));
+   window.whilePending=bookings.length;
+   inspections[1].resolve({candidates:[]});await new Promise(r=>setTimeout(r,400));
+   document.querySelector('.ticket-book').click();await new Promise(r=>setTimeout(r,50));
+   window.afterRefusal=bookings.length;
+   enter('2026-03-09T04:00');enter('2026-03-10T04:00');await until(()=>inspections.length===4);
+   inspections[3].resolve({candidates:[{instant:'2026-03-10T09:00:00Z'}]});await until(()=>pay().includes('2026-03-10T09:00:00Z'));
+   inspections[2].resolve({candidates:[{instant:'2026-03-09T09:00:00Z'}]});await new Promise(r=>setTimeout(r,400));
+  })()`);
+  assert.equal(await evaluate('whilePending'),0);
+  assert.equal(await evaluate('afterRefusal'),0);
+  assert.equal(await evaluate("pay().includes('2026-03-10T09:00:00Z')&&!pay().includes('2026-03-09T09:00:00Z')"),true);
+  await evaluate('ticket.destroy()');
+ });
+});
+
+
+test('unfinished features start collapsed and expanding them performs no ticket action',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<link rel="stylesheet" href="/app.css"><div id="host" style="width:1100px"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {renderTicket}=await import('/deal-ticket.js'),{newTicket}=await import('/ticket-model.js');
+   const field=(id,over={})=>({id,label:id,meaning:id,type:'text',unit:null,state:'editable',required:false,band:null,choices:null,dependsOn:[],lookup:null,soon:null,rule:null,...over});
+   const planned=id=>field(id,{state:'soon',soon:'Not implemented.'});
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[...['book','entity','counterparty','setup','trade_date'].map(id=>field(id)),planned('force_majeure'),planned('credit_terms')],sideLimits:[],levels:['month'],modes:['new'],tradeColumns:[],tabs:[{id:'imbalance',label:'Imbalance',soon:'Not implemented.'}],
+    sides:[{kind:'physical',pill:'Physical',colour:'gas',min:1,initial:1,max:2,soon:null,fields:[field('quantity',{band:'quantity'}),planned('quality')],columns:[{id:'volume',label:'Volume',unit:null,measure:'quantity',input:[],soon:'Not implemented.'}]},
+     {kind:'floating',pill:'Floating',colour:'neutral',min:0,initial:0,max:0,soon:'Not implemented.',fields:[],columns:[]}]};
+   window.actions=[];const on=new Proxy({},{get:(_,name)=>(...args)=>actions.push([name,...args])});
+   renderTicket(document.querySelector('#host'),{state:newTicket(d),mode:'new',actions:null,schedule:null,quantityUnit:'MMBtu',instant:at=>at,zone:'UTC',previous:null,summaries:[],links:[],entry:null,status:{kind:'current',text:'Ready'},fieldErrors:{},choices:{},selectedSide:null,tab:'instrument',level:'month',closed:new Set(),on});
+  })()`);
+  assert.equal(await evaluate("document.querySelector('.ticket-upcoming').open"),false);
+  assert.equal(await evaluate("document.querySelector('[data-field=force_majeure]').getBoundingClientRect().height"),0);
+  assert.equal(await evaluate("document.querySelectorAll('.ticket-strip .ticket-soon,.ticket-deck .ticket-soon,.ticket-tabs .ticket-soon').length"),0);
+  assert.equal(await evaluate("[...document.querySelectorAll('.ticket-trade-fields')].every(group=>new Set([...group.querySelectorAll(':scope>.ticket-field')].map(n=>n.getBoundingClientRect().top)).size<=1)"),true,'each instrument or ownership group uses one row in a wide ticket');
+  await evaluate("document.querySelector('.ticket-upcoming>summary').click()");
+  assert.equal(await evaluate("document.querySelector('[data-field=force_majeure]').getBoundingClientRect().height>0"),true);
+  assert.equal(await evaluate("[...document.querySelectorAll('.ticket-upcoming input,.ticket-upcoming button')].every(n=>n.disabled)"),true);
+  assert.deepEqual(await evaluate('actions'),[],'expansion performs no read, edit or booking event');
+  assert.match(await evaluate("document.querySelector('.ticket-upcoming').textContent"),/Volume/);
+  await evaluate("document.querySelector('.ticket-upcoming>summary').click();document.querySelector('#host').style.width='320px'");
+  assert.equal(await evaluate("document.querySelector('.ticket-trade-fields').scrollWidth<=document.querySelector('.ticket-trade-fields').clientWidth+1"),true);
+ });
+});
+
+test('a native booked Side renderer replaces the old Side grid and keeps the ordinary quantity entry operation',{skip:!browserAvailable,timeout:browserTestTimeout},async()=>{
+ await withBrowserPage('<div id="host"></div>',async evaluate=>{
+  await evaluate(`(async()=>{
+   const {renderTicket}=await import('/deal-ticket.js'),{newTicket}=await import('/ticket-model.js');
+   const d={product:'synthetic_flow',version:1,rowShape:'flow',tradeFields:[],sideLimits:[],levels:['month','day'],modes:['booked'],tabs:[],tradeColumns:[],
+    sides:[{kind:'physical',pill:'Physical',colour:'gas',min:1,initial:1,max:1,fields:[],columns:[{id:'quantity',label:'Quantity',unit:'quantity',measure:'quantity',input:['booked']}]}]};
+   window.rendered=[];window.disposed=0;window.entered=[];
+   const on=new Proxy({},{get:(_,name)=>name==='enter'?(...args)=>entered.push(args):()=>{}});
+   window.ticket=renderTicket(document.querySelector('#host'),{state:newTicket(d),mode:'booked',actions:{amend:{allowed:false,reason:''},closeOut:{allowed:false,reason:''},record:{allowed:true,reason:''}},
+    schedule:null,quantityUnit:'MMBtu',instant:at=>at,zone:'UTC',previous:null,summaries:[],links:[],entry:null,status:{kind:'current',text:'Current'},fieldErrors:{},choices:{},selectedSide:'physical-1',tab:'physical-1',level:'day',closed:new Set(),on,
+    sideSchedule:(host,side)=>{rendered.push(side.code);const table=document.createElement('table');table.className='native-side-grid';table.textContent='Delivery · Payment · DF · PV · Lifecycle';host.append(table);return()=>{disposed++;table.remove();};}});
+  })()`);
+  assert.equal(await evaluate("document.querySelectorAll('.ticket-grid table').length"),1);
+  assert.equal(await evaluate("document.querySelectorAll('.ticket-grid .tabulator').length"),0);
+  assert.equal(await evaluate("document.querySelectorAll('.ticket-level').length"),0);
+  assert.deepEqual(await evaluate('rendered'),['physical-1']);
+  await evaluate('ticket.destroy()');assert.equal(await evaluate('disposed'),1);
+ });
+});
